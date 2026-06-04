@@ -59,7 +59,8 @@ TMC2130 B  → NEMA17 B (coil 2+)
 TMC2130 B~ → NEMA17 B~ (coil 2-)
 ```
 
-### LCD Display (ST7735/ST7789)
+### LCD Display (ST7789V3 — 1.69" 240x280)
+// This project targets a 1.69" ST7789V3 SPI display (240x280, rounded corners). Use the Adafruit_ST7789 library and initialize with the 240x280 dimensions. Ensure the module is powered at 3.3V.
 
 ```
 RP2040 Pico         Display Module
@@ -69,8 +70,12 @@ GPIO 10 ────────── DC   (Data/Command)
 GPIO 11 ────────── RST  (Reset)
 GPIO 18 ────────── SCK  (SPI Clock, shared with TMC2130)
 GPIO 19 ────────── SDA  (SPI Data, shared with TMC2130)
-3V3     ────────── VCC
+3V3     ────────── VCC (Required)
 GND     ────────── GND
+
+Notes:
+- Use 3.3V logic only. Do not connect display VCC to 5V.
+- Example software init (see SETUP.md): `tft.init(240, 280);` and adjust rotation/offsets as needed.
 ```
 
 ### Rotary Encoder

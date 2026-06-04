@@ -96,6 +96,9 @@ handleState();                // Execute state action
 
 // Display
 updateDisplay();              // Serial output
+
+// Display module used in this project:
+// ST7789V3 1.69" (240x280). Use the `Adafruit_ST7789` library and initialize with `tft.init(240, 280);` in `initDisplay()`.
 ```
 
 ## Motion Parameters

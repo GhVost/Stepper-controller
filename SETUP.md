@@ -390,19 +390,24 @@ void initTMC2130() {
 ```cpp
 #include <Adafruit_ST7789.h>
 
+// For the ST7789V3 1.69" (240x280) display use the Adafruit_ST7789 constructor
+// and initialize with the correct width/height.
 Adafruit_ST7789 tft = Adafruit_ST7789(LCD_CS, LCD_DC, LCD_RST);
 
 void initDisplay() {
-    tft.init(128, 160);  // For ST7735
-    tft.fillScreen(ST7789_BLACK);
+  // Initialize with 240x280 for the ST7789V3 module
+  tft.init(240, 280);
+  tft.fillScreen(ST7789_BLACK);
+  // Optional: adjust rotation if the display appears rotated or clipped
+  // tft.setRotation(1);
 }
 
 void updateDisplay() {
-    tft.setCursor(0, 0);
-    tft.setTextColor(ST7789_WHITE, ST7789_BLACK);
-    tft.print("State: ");
-    tft.println(state_names[current_state]);
-    // ... more display updates
+  tft.setCursor(0, 0);
+  tft.setTextColor(ST7789_WHITE, ST7789_BLACK);
+  tft.print("State: ");
+  tft.println(state_names[current_state]);
+  // ... more display updates
 }
 ```
 

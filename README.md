@@ -6,7 +6,8 @@ RP2040-based stepper motor controller featuring TMC2130 driver, SPI LCD display,
 
 - **RP2040 Microcontroller** – Dual-core ARM, 133 MHz, 264 KB RAM
 - **TMC2130 Stepper Driver** – SPI-controlled stepper with current limiting and stall detection
-- **SPI LCD Display** – ST7735/ST7789 compatible (128x160 or 320x240)
+ - **SPI LCD Display** – ST7789V3 SPI 1.69" (240x280) recommended.
+	 Product example: https://de.aliexpress.com/item/1005010739017597.html
 - **Rotary Encoder** – Quadrature input for menu navigation
 - **Sensor Integration** – Limit switch, spray valve, flow sensor
 - **Non-Blocking State Machine** – Smooth operation with millisecond-based timing
@@ -138,7 +139,7 @@ const unsigned long OSCILLATION_CYCLES = 20;    // Total oscillations
 
 - **TMCStepper** (teemuatlut) – TMC2130 SPI interface
 - **Adafruit GFX Library** – Graphics primitives
-- **Adafruit ST7735/ST7789** – LCD driver
+- **Adafruit ST7735/ST7789** – LCD driver (for ST7789V3 use `Adafruit_ST7789`)
 - Arduino Framework for RP2040
 
 ## Development Status
