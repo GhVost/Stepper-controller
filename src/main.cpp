@@ -25,7 +25,7 @@ const int LIMIT_SWITCH = 28; // End position limit
 const int SPRAY_VALVE = 2;   // Spray developer valve
 const int FLOW_SENSOR = 3;   // Flow sensor input
 const int LED_GREEN = 8;     // Status LED (green)
-const int LED_YELLOW = 9;    // Status LED (yellow)
+const int LED_YELLOW = 7;    // Status LED (yellow) - changed from 9 to avoid conflict
 const int FAN_PWM = 12;      // Fan PWM control
 const int ULTRASONIC = 4;    // Ultrasonic generator remote
 
@@ -68,6 +68,40 @@ const unsigned long MOTOR_UPDATE_INTERVAL = 50;
 const unsigned long DISPLAY_UPDATE_INTERVAL = 100;
 const unsigned long ENCODER_READ_INTERVAL = 20;
 
+// ============= TMC2130 COMMUNICATION =============
+void tmcWriteReg(uint8_t addr, uint32_t datagram) {
+  digitalWrite(TMC_CS, LOW);
+  delayMicroseconds(2);
+  SPI.transfer((addr | 0x80)); // Write bit
+  SPI.transfer((datagram >> 24) & 0xFF);
+  SPI.transfer((datagram >> 16) & 0xFF);
+  SPI.transfer((datagram >> 8) & 0xFF);
+  SPI.transfer(datagram & 0xFF);
+  delayMicroseconds(2);
+  digitalWrite(TMC_CS, HIGH);
+}
+
+uint32_t tmcReadReg(uint8_t addr) {
+  uint32_t datagram = 0;
+  digitalWrite(TMC_CS, LOW);
+  delayMicroseconds(2);
+  SPI.transfer(addr & 0x7F); // Read bit
+  delayMicroseconds(2);
+  digitalWrite(TMC_CS, HIGH);
+  delayMicroseconds(5);
+  
+  digitalWrite(TMC_CS, LOW);
+  delayMicroseconds(2);
+  SPI.transfer(addr & 0x7F);
+  datagram |= ((uint32_t)SPI.transfer(0) << 24);
+  datagram |= ((uint32_t)SPI.transfer(0) << 16);
+  datagram |= ((uint32_t)SPI.transfer(0) << 8);
+  datagram |= SPI.transfer(0);
+  delayMicroseconds(2);
+  digitalWrite(TMC_CS, HIGH);
+  return datagram;
+}
+
 // ============= FUNCTION DECLARATIONS =============
 void initHardware();
 void initSPI();
@@ -93,6 +127,7 @@ void setup() {
   initHardware();
   initSPI();
   initEncoder();
+  initTMC2130();
   
   Serial.println("Initialization complete!");
   currentState = STATE_IDLE;
@@ -154,20 +189,41 @@ void initHardware() {
 
 void initSPI() {
   // Configure SPI for TMC2130
-  SPI.begin(TMC_SCK, TMC_MISO, TMC_MOSI, TMC_CS);
-  SPI.setFrequency(1000000); // 1 MHz for TMC2130
+  // RP2040 uses default SPI0: SCK=18, MOSI=19, MISO=16
+  // Verify these pins match your TMC2130 connections
+  SPI.begin();
+  SPI.setClockDivider(SPI_CLOCK_DIV32); // ~1 MHz for RP2040 @ 125 MHz
+  SPI.setDataMode(SPI_MODE3); // TMC2130 requires SPI mode 3
   
   pinMode(TMC_CS, OUTPUT);
   digitalWrite(TMC_CS, HIGH);
   
-  Serial.println("SPI initialized");
+  Serial.print("SPI initialized: SCK=");
+  Serial.print(TMC_SCK);
+  Serial.print(" MOSI=");
+  Serial.print(TMC_MOSI);
+  Serial.print(" MISO=");
+  Serial.println(TMC_MISO);
 }
 
 void initEncoder() {
   pinMode(ENC_A, INPUT);
   pinMode(ENC_B, INPUT);
   // TODO: Configure interrupt-driven encoder reading if needed
-  Serial.println("Encoder initialized");
+  Serial.print("Encoder initialized: A=");
+  Serial.print(ENC_A);
+  Serial.print(" B=");
+  Serial.println(ENC_B);
+}
+
+void initTMC2130() {
+  // TODO: Configure TMC2130 via SPI
+  // Required registers:
+  //  - GCONF: General config (spreadCycle, stealthChop, etc.)
+  //  - IHOLD_IRUN: Current settings
+  //  - CHOPCONF: Chopper config
+  //  - PWMCONF: PWM config for stealthChop
+  Serial.println("TMC2130 driver: Configure via SPI - TODO");
 }
 
 // ============= SENSOR READING =============
