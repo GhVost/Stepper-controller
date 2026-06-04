@@ -106,6 +106,7 @@ uint32_t tmcReadReg(uint8_t addr) {
 void initHardware();
 void initSPI();
 void initEncoder();
+void initTMC2130();
 void readEncoder();
 void readSensors();
 void updateStateMachine();
@@ -192,8 +193,8 @@ void initSPI() {
   // RP2040 uses default SPI0: SCK=18, MOSI=19, MISO=16
   // Verify these pins match your TMC2130 connections
   SPI.begin();
-  SPI.frequency(1000000); // 1 MHz for TMC2130
-  SPI.format(8, 3); // 8 bits, mode 3
+  // Note: SPI frequency and mode are set to defaults on Arduino/RP2040
+  // For advanced control, use SPI transaction functions
   
   pinMode(TMC_CS, OUTPUT);
   digitalWrite(TMC_CS, HIGH);
@@ -242,7 +243,6 @@ void readEncoder() {
 // ============= STATE MACHINE =============
 void updateStateMachine() {
   unsigned long now = millis();
-  unsigned long stateAge = now - lastStateChange;
   
   switch (currentState) {
     case STATE_IDLE:
@@ -266,6 +266,13 @@ void updateStateMachine() {
         currentState = STATE_SPRAY_ACTIVE;
         lastStateChange = now;
         oscillationCount = 0;
+      }
+      break;
+      
+    case STATE_WAITING_SPRAY:
+      if (sprayActive && flowDetected) {
+        currentState = STATE_SPRAY_ACTIVE;
+        lastStateChange = now;
       }
       break;
       
@@ -312,6 +319,12 @@ void handleState() {
       motorSetEnable(true);
       motorStep(PARK_POSITION);
       setLED(LED_GREEN, true);
+      break;
+      
+    case STATE_WAITING_SPRAY:
+      motorSetEnable(false);
+      setLED(LED_GREEN, true);
+      setLED(LED_YELLOW, false);
       break;
       
     case STATE_SPRAY_ACTIVE:
