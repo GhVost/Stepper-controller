@@ -192,8 +192,8 @@ void initSPI() {
   // RP2040 uses default SPI0: SCK=18, MOSI=19, MISO=16
   // Verify these pins match your TMC2130 connections
   SPI.begin();
-  SPI.setClockDivider(SPI_CLOCK_DIV32); // ~1 MHz for RP2040 @ 125 MHz
-  SPI.setDataMode(SPI_MODE3); // TMC2130 requires SPI mode 3
+  SPI.setFrequency(1000000); // 1 MHz for TMC2130
+  SPI.setMode(3); // TMC2130 requires SPI mode 3
   
   pinMode(TMC_CS, OUTPUT);
   digitalWrite(TMC_CS, HIGH);
