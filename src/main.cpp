@@ -1,5 +1,8 @@
 ﻿#include <Arduino.h>
 #include <SPI.h>
+// Display libraries
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
 
 // ============= PIN DEFINITIONS =============
 // TMC2130 Stepper Driver
@@ -118,6 +121,16 @@ void setLED(int ledPin, bool state);
 void setFan(int speed);
 void setUltrasonic(bool active);
 
+// ============= DISPLAY / MENU =============
+Adafruit_ST7789 tft = Adafruit_ST7789(LCD_CS, LCD_DC, LCD_RST);
+
+const char* menuItems[] = { "START", "HOME", "SETTINGS", "ABOUT" };
+const int MENU_COUNT = sizeof(menuItems) / sizeof(menuItems[0]);
+int menuIndex = 0;
+int lastEncoderState = 0;
+void initDisplay();
+void drawMenu();
+
 // ============= SETUP =============
 void setup() {
   Serial.begin(115200);
@@ -129,6 +142,7 @@ void setup() {
   initSPI();
   initEncoder();
   initTMC2130();
+  initDisplay();
   
   Serial.println("Initialization complete!");
   currentState = STATE_IDLE;
@@ -227,6 +241,41 @@ void initTMC2130() {
   Serial.println("TMC2130 driver: Configure via SPI - TODO");
 }
 
+// ============= DISPLAY / MENU IMPLEMENTATION =============
+void initDisplay() {
+  // Initialize SPI already done; init the ST7789 with correct dimensions
+  tft.init(240, 280); // width, height for ST7789V3 module
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextWrap(false);
+  Serial.println("Display initialized (ST7789V3 240x280)");
+}
+
+void drawMenu() {
+  tft.fillScreen(ST77XX_BLACK);
+  // Title
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(8, 4);
+  tft.print("MEGASONIC");
+
+  // Menu entries — large letters
+  int y = 40;
+  for (int i = 0; i < MENU_COUNT; ++i) {
+    if (i == menuIndex) {
+      // highlight
+      tft.fillRect(6, y - 2, tft.width() - 12, 40, ST77XX_BLUE);
+      tft.setTextColor(ST77XX_WHITE, ST77XX_BLUE);
+    } else {
+      tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    }
+    tft.setTextSize(4); // big letters
+    tft.setCursor(12, y);
+    tft.print(menuItems[i]);
+    y += 48;
+  }
+}
+
 // ============= SENSOR READING =============
 void readSensors() {
   limitSwitchPressed = (digitalRead(LIMIT_SWITCH) == LOW);
@@ -235,9 +284,20 @@ void readSensors() {
 }
 
 void readEncoder() {
-  // TODO: Implement quadrature decoding
-  // For now, placeholder
-  encoderValue += 0; // Replace with actual delta from encoder
+  // Simple quadrature decoding (polled)
+  static int lastEncoded = 0;
+  int a = digitalRead(ENC_A);
+  int b = digitalRead(ENC_B);
+  int encoded = (a << 1) | b;
+  int sum = (lastEncoded << 2) | encoded;
+  int delta = 0;
+  // Detect rotation direction based on state transitions
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) delta = 1;
+  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) delta = -1;
+  if (delta != 0) {
+    menuIndex = (menuIndex + delta + MENU_COUNT) % MENU_COUNT;
+  }
+  lastEncoded = encoded;
 }
 
 // ============= STATE MACHINE =============
@@ -384,24 +444,24 @@ void setUltrasonic(bool active) {
 
 // ============= DISPLAY UPDATE =============
 void updateDisplay() {
-  // TODO: Implement SPI LCD display update
-  // For now, serial debug output
-  
-  Serial.print("State: ");
+  // Display menu and status on ST7789
+  drawMenu();
+
+  // Small status line at bottom
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+  tft.setCursor(6, tft.height() - 28);
+  tft.print("State:");
   switch (currentState) {
-    case STATE_IDLE: Serial.print("IDLE"); break;
-    case STATE_HOMING: Serial.print("HOMING"); break;
-    case STATE_PARKED: Serial.print("PARKED"); break;
-    case STATE_WAITING_SPRAY: Serial.print("WAITING"); break;
-    case STATE_SPRAY_ACTIVE: Serial.print("SPRAY_ACTIVE"); break;
-    case STATE_OSCILLATING: Serial.print("OSCILLATING"); break;
-    case STATE_ERROR: Serial.print("ERROR"); break;
+    case STATE_IDLE: tft.print("IDLE"); break;
+    case STATE_HOMING: tft.print("HOMING"); break;
+    case STATE_PARKED: tft.print("PARKED"); break;
+    case STATE_WAITING_SPRAY: tft.print("WAITING"); break;
+    case STATE_SPRAY_ACTIVE: tft.print("SPRAY_ACTIVE"); break;
+    case STATE_OSCILLATING: tft.print("OSCILLATING"); break;
+    case STATE_ERROR: tft.print("ERROR"); break;
   }
-  Serial.print(" | Pos: ");
-  Serial.print(motorPosition);
-  Serial.print(" | Spray: ");
-  Serial.print(sprayActive ? "ON" : "OFF");
-  Serial.print(" | Flow: ");
-  Serial.print(flowDetected ? "YES" : "NO");
-  Serial.println();
+  tft.print(" ");
+  tft.print("Pos:");
+  tft.print(motorPosition);
 }
