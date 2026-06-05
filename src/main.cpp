@@ -62,16 +62,29 @@ unsigned long lastStateChange = 0;
 // Formula: (motor steps/rev × microsteps) ÷ lead-screw pitch (mm/rev)
 // Example: 200 steps/rev, 16× microsteps, 2 mm pitch → (200 × 16) / 2 = 1600
 // Default 1 preserves original uncalibrated behaviour; change once mechanically verified.
-const int STEPS_PER_MM      = 1;
-const int PARK_MM           = 7;    // Park position: mm from limit switch
-const int CENTER_MM         = 26;   // Oscillation centre: mm from limit switch
-const int PARK_STEPS        = PARK_MM  * STEPS_PER_MM;
-const int CENTER_STEPS      = CENTER_MM * STEPS_PER_MM;
-const int OSCILLATION_STEPS = 16;   // Steps per directional sweep
-const unsigned long OSCILLATION_DELAY  = 10000; // ms between oscillation steps
-const unsigned long OSCILLATION_CYCLES = 20;    // Sweeps before stopping
-                                                 // Total: 20 × 16 × 10 s ≈ 53 min
-const unsigned long SPRAY_ACTIVE_WAIT  = 2000;  // ms to stabilise before oscillating
+const int STEPS_PER_MM = 1;
+// All parameters below are runtime-adjustable via the SETTINGS menu.
+int PARK_MM           = 7;     // Park position: mm from limit switch
+int CENTER_MM         = 26;    // Oscillation centre: mm from limit switch
+int OSCILLATION_STEPS = 16;    // Steps per directional sweep
+unsigned long OSCILLATION_DELAY  = 10000; // ms between oscillation steps
+unsigned long OSCILLATION_CYCLES = 20;    // Sweeps before stopping
+const unsigned long SPRAY_ACTIVE_WAIT = 2000;  // ms to stabilise before oscillating
+
+// ============= DRIVER PARAMETERS =============
+// Adjustable via SETTINGS menu. Applied to hardware when exiting settings.
+int driverCurrent    = 600;  // mA  — range 100–1500, step 50
+int driverMicrosteps = 16;   // valid: 1,2,4,8,16,32,64,128,256
+
+// Microstep lookup table — shared by settings editor and drawSettings().
+const int MICROSTEP_TABLE[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+const int MICROSTEP_COUNT   = 9;
+
+// Live driver status — written by Core 0 every 500 ms, read by Core 1 for display.
+volatile uint32_t driverDrvStatus = 0;
+volatile uint32_t driverGStat     = 0;
+unsigned long lastDriverPoll = 0;
+const unsigned long DRIVER_POLL_INTERVAL = 500;
 
 // Fan PWM levels
 const int FAN_OFF     = 0;
@@ -113,6 +126,13 @@ volatile bool menuButtonPressed = false;
 // Reset to -1 whenever the display switches back to DISP_MENU.
 int menuDrawState = -1;
 
+// Settings screen state.
+const int SETTINGS_COUNT = 8;  // 5 motion + 2 driver + Back
+volatile int  settingsIndex    = 0;
+volatile bool editingSettings  = false;
+volatile bool settingsNeedsRedraw = false;  // set on mode entry to force full redraw
+volatile bool aboutNeedsRedraw    = false;
+
 // Set to true by Core 0 once hardware is fully initialised.
 // Core 1 waits on this before touching the display.
 volatile bool core0_ready = false;
@@ -136,9 +156,13 @@ void motorStep(int direction);
 void motorSetEnable(bool enable);
 void motorMoveTo(int target);
 void handleMenuSelect();
+void adjustSettingsValue(int delta);
+void applyDriverSettings();
+void pollDriverStatus();
 void updateDisplay();
 void drawMenuRow(int i, int y, bool selected);
 void drawMenu();
+void drawSettingsRow(int i, int y, bool selected, bool editing);
 void drawSettings();
 void drawAbout();
 void setLED(int ledPin, bool state);
@@ -191,6 +215,7 @@ void loop() {
     readSensors();
     updateStateMachine();
     handleState();
+    pollDriverStatus();
     // Display is handled by Core 1 (loop1).
 }
 
@@ -311,9 +336,13 @@ void readEncoder() {
     if (abs(stepAccum) >= 4) {
         unsigned long now = millis();
         if (now - lastStepTime >= 50) {
-            // Only scroll menu when in menu mode
-            if (displayMode == DISP_MENU)
-                menuIndex = (menuIndex + (stepAccum > 0 ? 1 : -1) + MENU_COUNT) % MENU_COUNT;
+            int d = stepAccum > 0 ? 1 : -1;
+            if (displayMode == DISP_MENU) {
+                menuIndex = (menuIndex + d + MENU_COUNT) % MENU_COUNT;
+            } else if (displayMode == DISP_SETTINGS) {
+                if (editingSettings) adjustSettingsValue(d);
+                else settingsIndex = constrain(settingsIndex + d, 0, SETTINGS_COUNT - 1);
+            }
             lastStepTime = now;
         }
         stepAccum = 0;
@@ -357,7 +386,7 @@ void updateStateMachine() {
 
         case STATE_PARKED:
             // Only evaluate spray/flow transitions once at park position
-            if (motorPosition >= PARK_STEPS) {
+            if (motorPosition >= PARK_MM * STEPS_PER_MM) {
                 if (sprayActive && !flowDetected) {
                     currentState    = STATE_WAITING_SPRAY;
                     lastStateChange = now;
@@ -394,7 +423,7 @@ void updateStateMachine() {
                 lastStateChange = now;
                 Serial.println("→ IDLE (spray or flow lost)");
             } else if (now - lastStateChange >= SPRAY_ACTIVE_WAIT &&
-                       motorPosition >= CENTER_STEPS) {
+                       motorPosition >= CENTER_MM * STEPS_PER_MM) {
                 // System stabilised and motor at centre — begin oscillation
                 currentState    = STATE_OSCILLATING;
                 lastStateChange = now;
@@ -446,7 +475,7 @@ void handleState() {
 
         case STATE_PARKED:
             // Move forward to park position, then hold with motor disabled
-            if (motorPosition < PARK_STEPS) {
+            if (motorPosition < PARK_MM * STEPS_PER_MM) {
                 motorSetEnable(true);
                 if (now - lastMotorUpdate >= MOTOR_UPDATE_INTERVAL) {
                     motorStep(1);
@@ -477,7 +506,7 @@ void handleState() {
             setLED(LED_YELLOW, false);
             motorSetEnable(true);
             if (now - lastMotorUpdate >= MOTOR_UPDATE_INTERVAL) {
-                motorMoveTo(CENTER_STEPS);
+                motorMoveTo(CENTER_MM * STEPS_PER_MM);
                 lastMotorUpdate = now;
             }
             break;
@@ -518,13 +547,29 @@ void handleState() {
 
 // ============= MENU ACTIONS =============
 void handleMenuSelect() {
-    // From any sub-screen, any button press returns to the main menu.
-    if (displayMode != DISP_MENU) {
-        displayMode  = DISP_MENU;
-        menuDrawState = -1;  // force full menu redraw
+    // --- SETTINGS screen ---
+    if (displayMode == DISP_SETTINGS) {
+        if (editingSettings) {
+            editingSettings = false;  // confirm value, return to list
+        } else if (settingsIndex == SETTINGS_COUNT - 1) {  // < Back
+            applyDriverSettings();  // push current/microstep changes to driver
+            settingsIndex  = 0;
+            displayMode    = DISP_MENU;
+            menuDrawState  = -1;
+        } else {
+            editingSettings = true;  // enter edit mode for this row
+        }
         return;
     }
 
+    // --- ABOUT screen ---
+    if (displayMode == DISP_ABOUT) {
+        displayMode   = DISP_MENU;
+        menuDrawState = -1;
+        return;
+    }
+
+    // --- Main menu ---
     switch (menuIndex) {
         case 0:  // START / STOP toggle
             if (currentState == STATE_IDLE) {
@@ -547,12 +592,59 @@ void handleMenuSelect() {
             break;
 
         case 2:  // SETTINGS
-            displayMode = DISP_SETTINGS;
+            settingsNeedsRedraw = true;
+            editingSettings     = false;
+            settingsIndex       = 0;
+            displayMode         = DISP_SETTINGS;
             break;
 
         case 3:  // ABOUT
-            displayMode = DISP_ABOUT;
+            aboutNeedsRedraw = true;
+            displayMode      = DISP_ABOUT;
             break;
+    }
+}
+
+// Read TMC2130 status registers without blocking — skip if display holds the mutex.
+void pollDriverStatus() {
+    unsigned long now = millis();
+    if (now - lastDriverPoll < DRIVER_POLL_INTERVAL) return;
+    lastDriverPoll = now;
+    if (mutex_try_enter(&spi_mutex, nullptr)) {
+        driverDrvStatus = driver.DRV_STATUS();
+        driverGStat     = driver.GSTAT();
+        mutex_exit(&spi_mutex);
+    }
+}
+
+// Apply current driver settings over SPI. Called when leaving SETTINGS screen.
+void applyDriverSettings() {
+    mutex_enter_blocking(&spi_mutex);
+    driver.rms_current(driverCurrent);
+    driver.microsteps(driverMicrosteps);
+    mutex_exit(&spi_mutex);
+    Serial.print("Driver applied: ");
+    Serial.print(driverCurrent); Serial.print(" mA, ");
+    Serial.print(driverMicrosteps); Serial.println("x microsteps");
+}
+
+// Adjust the currently selected settings parameter by delta (±1 from encoder).
+void adjustSettingsValue(int delta) {
+    switch (settingsIndex) {
+        case 0: PARK_MM = constrain(PARK_MM + delta, 1, 50); break;
+        case 1: CENTER_MM = constrain(CENTER_MM + delta, 1, 150); break;
+        case 2: OSCILLATION_STEPS = constrain(OSCILLATION_STEPS + delta, 1, 200); break;
+        case 3: OSCILLATION_DELAY = constrain((long)OSCILLATION_DELAY + delta * 1000L, 1000, 60000); break;
+        case 4: OSCILLATION_CYCLES = constrain((long)OSCILLATION_CYCLES + delta, 1, 100); break;
+        case 5: driverCurrent = constrain(driverCurrent + delta * 50, 100, 1500); break;
+        case 6: {
+            int idx = 4;  // default index for 16x
+            for (int i = 0; i < MICROSTEP_COUNT; i++)
+                if (MICROSTEP_TABLE[i] == driverMicrosteps) { idx = i; break; }
+            idx = constrain(idx + delta, 0, MICROSTEP_COUNT - 1);
+            driverMicrosteps = MICROSTEP_TABLE[idx];
+            break;
+        }
     }
 }
 
@@ -615,7 +707,7 @@ void drawMenu() {
         tft.fillScreen(ST77XX_BLACK);
         tft.setTextSize(2);
         tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-        tft.setCursor(8, 2);
+        tft.setCursor(20, 2);
         tft.print("MEGASONIC");
         int y = 22;
         for (int i = 0; i < MENU_COUNT; ++i) {
@@ -631,46 +723,141 @@ void drawMenu() {
     menuDrawState = mi;
 }
 
-void drawSettings() {
-    static DisplayMode lastMode = DISP_MENU;
-    DisplayMode dm = displayMode;
-    if (lastMode == dm) return;
-    lastMode = dm;
-
-    tft.fillScreen(ST77XX_BLACK);
-    tft.setTextWrap(false);
-    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+// Row height=18, y_start=22. 8 rows: y = 22..148, well within 172px.
+void drawSettingsRow(int i, int y, bool selected, bool editing) {
+    const char* labels[] = {
+        "Park   ", "Centre ", "Steps  ", "Delay  ",
+        "Cycles ", "Current", "Mstep  ", "< Back "
+    };
+    uint16_t bg = editing  ? tft.color565(0, 140, 0) :
+                  selected ? ST77XX_BLUE : ST77XX_BLACK;
+    tft.fillRect(0, y - 2, tft.width(), 18, bg);
+    tft.setTextColor(ST77XX_WHITE, bg);
     tft.setTextSize(2);
-    tft.setCursor(8, 4);   tft.print("SETTINGS");
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setCursor(8, 28);  tft.print("Park  : "); tft.print(PARK_MM);    tft.print(" mm");
-    tft.setCursor(8, 48);  tft.print("Centre: "); tft.print(CENTER_MM);  tft.print(" mm");
-    tft.setCursor(8, 68);  tft.print("Steps : "); tft.print(OSCILLATION_STEPS);
-    tft.setCursor(8, 88);  tft.print("Delay : "); tft.print(OSCILLATION_DELAY / 1000); tft.print(" s");
-    tft.setCursor(8, 108); tft.print("Cycles: "); tft.print(OSCILLATION_CYCLES);
-    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-    tft.setCursor(8, 150); tft.print("Press to return");
+    tft.setCursor(6, y);
+    tft.print(labels[i]);
+    if (i < SETTINGS_COUNT - 1) {
+        tft.print(":");
+        switch (i) {
+            case 0: tft.print(PARK_MM);           tft.print("mm  "); break;
+            case 1: tft.print(CENTER_MM);          tft.print("mm  "); break;
+            case 2: tft.print(OSCILLATION_STEPS);  tft.print("     "); break;
+            case 3: tft.print(OSCILLATION_DELAY / 1000); tft.print("s   "); break;
+            case 4: tft.print(OSCILLATION_CYCLES); tft.print("     "); break;
+            case 5: tft.print(driverCurrent);      tft.print("mA  "); break;
+            case 6: tft.print(driverMicrosteps);   tft.print("x    "); break;
+        }
+    }
+}
+
+void drawSettings() {
+    static int  lastIdx   = -1;
+    static bool lastEdit  = false;
+    static int  lastVals[7] = {};
+
+    // Force full redraw when entering from main menu.
+    if (settingsNeedsRedraw) {
+        settingsNeedsRedraw = false;
+        lastIdx = -1;
+    }
+
+    int  si   = settingsIndex;
+    bool ed   = editingSettings;
+    int  vals[7] = {
+        PARK_MM, CENTER_MM, OSCILLATION_STEPS,
+        (int)(OSCILLATION_DELAY / 1000), (int)OSCILLATION_CYCLES,
+        driverCurrent, driverMicrosteps
+    };
+
+    bool changed = (lastIdx == -1);
+    if (!changed) {
+        changed = (si != lastIdx || ed != lastEdit);
+        for (int i = 0; i < 7 && !changed; i++)
+            if (vals[i] != lastVals[i]) changed = true;
+    }
+    if (!changed) return;
+
+    if (lastIdx == -1) {
+        tft.fillScreen(ST77XX_BLACK);
+        tft.setTextWrap(false);
+        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+        tft.setTextSize(2);
+        tft.setCursor(6, 3);
+        tft.print("SETTINGS");
+    }
+
+    for (int i = 0; i < SETTINGS_COUNT; i++)
+        drawSettingsRow(i, 22 + i * 18, i == si, i == si && ed && i < SETTINGS_COUNT - 1);
+
+    lastIdx  = si;
+    lastEdit = ed;
+    for (int i = 0; i < 7; i++) lastVals[i] = vals[i];
 }
 
 void drawAbout() {
-    static DisplayMode lastMode = DISP_MENU;
-    DisplayMode dm = displayMode;
-    if (lastMode == dm) return;
-    lastMode = dm;
+    // Static hardware info drawn once on entry; driver status updated each poll.
+    static bool     titleDrawn   = false;
+    static uint32_t lastDrvSt    = 0xFFFFFFFF;
+    static uint32_t lastGStat    = 0xFFFFFFFF;
 
-    tft.fillScreen(ST77XX_BLACK);
-    tft.setTextWrap(false);
-    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-    tft.setTextSize(2);
-    tft.setCursor(8, 4);   tft.print("MEGASONIC v1.0");
+    if (aboutNeedsRedraw) {
+        aboutNeedsRedraw = false;
+        titleDrawn       = false;
+        lastDrvSt        = 0xFFFFFFFF;
+        lastGStat        = 0xFFFFFFFF;
+    }
+
+    if (!titleDrawn) {
+        titleDrawn = true;
+        tft.fillScreen(ST77XX_BLACK);
+        tft.setTextWrap(false);
+        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+        tft.setTextSize(2);
+        tft.setCursor(8, 3);   tft.print("MEGASONIC v1.0");
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(8, 22);  tft.print("RP2040 earlephilhower");
+        tft.setCursor(8, 40);  tft.print("GMT147SPI 172x320");
+        tft.setCursor(8, 58);  tft.print("SPI 20MHz  ST7789");
+        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+        tft.setCursor(8, 78);  tft.print("Driver Status:");
+        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+        tft.setCursor(8, 154); tft.print("Press to return");
+    }
+
+    // Driver status — refresh only when values change.
+    uint32_t ds = driverDrvStatus;
+    uint32_t gs = driverGStat;
+    if (ds == lastDrvSt && gs == lastGStat) return;
+    lastDrvSt = ds; lastGStat = gs;
+
+    bool ot      = (ds >> 30) & 1;
+    bool otpw    = (ds >> 29) & 1;
+    bool stst    = (ds >> 24) & 1;
+    bool drverr  = (gs >> 1)  & 1;
+    uint8_t cs   = (ds >> 16) & 0x1F;
+    uint16_t sg  = ds & 0x3FF;
+
     tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setCursor(8, 28);  tft.print("RP2040 Pico");
-    tft.setCursor(8, 48);  tft.print("earlephilhower");
-    tft.setCursor(8, 68);  tft.print("GMT147SPI 1.47\"");
-    tft.setCursor(8, 88);  tft.print("172x320  ST7789");
-    tft.setCursor(8, 108); tft.print("SPI 20MHz");
-    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-    tft.setCursor(8, 150); tft.print("Press to return");
+    tft.setTextSize(2);
+
+    // Line 1: OT / OTPW / STST
+    tft.setCursor(8, 96);
+    tft.setTextColor(ot ? ST77XX_RED : ST77XX_WHITE, ST77XX_BLACK);
+    tft.print("OT:"); tft.print(ot ? "YES " : "NO  ");
+    tft.setTextColor(otpw ? ST77XX_YELLOW : ST77XX_WHITE, ST77XX_BLACK);
+    tft.print("OTPW:"); tft.print(otpw ? "YES " : "NO  ");
+
+    // Line 2: CS_ACTUAL / StallGuard / ERR
+    tft.setCursor(8, 116);
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.print("CS:"); tft.print(cs);  tft.print("  ");
+    tft.print("SG:"); tft.print(sg);  tft.print("  ");
+
+    // Line 3: standstill / driver error
+    tft.setCursor(8, 136);
+    tft.print("STST:"); tft.print(stst ? "YES " : "NO  ");
+    tft.setTextColor(drverr ? ST77XX_RED : ST77XX_WHITE, ST77XX_BLACK);
+    tft.print("ERR:"); tft.print(drverr ? "YES" : "NO ");
 }
 
 void updateDisplay() {
