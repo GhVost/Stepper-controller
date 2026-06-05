@@ -3,6 +3,7 @@
 #include <TMCStepper.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <pico/mutex.h>
 
 // ============= PIN DEFINITIONS =============
 // TMC2130 stepper driver (SPI0)
@@ -101,9 +102,25 @@ const char* menuItems[] = { "START", "HOME", "SETTINGS", "ABOUT" };
 const int   MENU_COUNT  = sizeof(menuItems) / sizeof(menuItems[0]);
 volatile int menuIndex = 0;
 
+// Display mode — controls what Core 1 renders.
+enum DisplayMode { DISP_MENU, DISP_SETTINGS, DISP_ABOUT };
+volatile DisplayMode displayMode = DISP_MENU;
+
+// Set when encoder button is pressed; cleared and acted on in loop().
+volatile bool menuButtonPressed = false;
+
+// Tracks whether drawMenu() needs a full redraw (title + all rows).
+// Reset to -1 whenever the display switches back to DISP_MENU.
+int menuDrawState = -1;
+
 // Set to true by Core 0 once hardware is fully initialised.
 // Core 1 waits on this before touching the display.
 volatile bool core0_ready = false;
+
+// SPI bus mutex: TMC2130 (Core 0) and display (Core 1) share SPI0.
+// All SPI transactions must be bracketed with mutex_enter/exit.
+// initTMC2130() runs before core0_ready=true so no mutex needed there.
+mutex_t spi_mutex;
 
 // ============= FUNCTION DECLARATIONS =============
 void initHardware();
@@ -118,9 +135,12 @@ void handleState();
 void motorStep(int direction);
 void motorSetEnable(bool enable);
 void motorMoveTo(int target);
+void handleMenuSelect();
 void updateDisplay();
 void drawMenuRow(int i, int y, bool selected);
 void drawMenu();
+void drawSettings();
+void drawAbout();
 void setLED(int ledPin, bool state);
 void setFan(int speed);
 void setUltrasonic(bool on);
@@ -134,8 +154,7 @@ void setup() {
 
     initHardware();
     initSPI();
-    // initTMC2130();  // Uncomment once the TMC2130 is wired — leaving it out
-                       // prevents SPI bus corruption when the chip is absent.
+    initTMC2130();   // Core 1 not yet running — no mutex needed here
     initEncoder();
     initDisplay();
 
@@ -162,6 +181,11 @@ void loop() {
     if (now - lastEncoderRead >= ENCODER_READ_INTERVAL) {
         readEncoder();
         lastEncoderRead = now;
+    }
+
+    if (menuButtonPressed) {
+        menuButtonPressed = false;
+        handleMenuSelect();
     }
 
     readSensors();
@@ -207,6 +231,7 @@ void initSPI() {
     SPI.setTX(TMC_MOSI);
     SPI.setSCK(TMC_SCK);
     SPI.begin();
+    mutex_init(&spi_mutex);
     Serial.print("SPI initialized: SCK=");
     Serial.print(TMC_SCK);
     Serial.print(" MOSI=");
@@ -286,11 +311,26 @@ void readEncoder() {
     if (abs(stepAccum) >= 4) {
         unsigned long now = millis();
         if (now - lastStepTime >= 50) {
-            menuIndex    = (menuIndex + (stepAccum > 0 ? 1 : -1) + MENU_COUNT) % MENU_COUNT;
+            // Only scroll menu when in menu mode
+            if (displayMode == DISP_MENU)
+                menuIndex = (menuIndex + (stepAccum > 0 ? 1 : -1) + MENU_COUNT) % MENU_COUNT;
             lastStepTime = now;
         }
         stepAccum = 0;
     }
+
+    // Button press — falling edge with 200 ms debounce.
+    static bool     lastBtn     = HIGH;
+    static unsigned long lastBtnTime = 0;
+    bool btn = digitalRead(ENC_SW);
+    if (lastBtn == HIGH && btn == LOW) {
+        unsigned long now = millis();
+        if (now - lastBtnTime >= 200) {
+            menuButtonPressed = true;
+            lastBtnTime = now;
+        }
+    }
+    lastBtn = btn;
 }
 
 // ============= STATE MACHINE TRANSITIONS =============
@@ -476,6 +516,41 @@ void handleState() {
     }
 }
 
+// ============= MENU ACTIONS =============
+void handleMenuSelect() {
+    // From any sub-screen, any button press returns to the main menu.
+    if (displayMode != DISP_MENU) {
+        displayMode  = DISP_MENU;
+        menuDrawState = -1;  // force full menu redraw
+        return;
+    }
+
+    switch (menuIndex) {
+        case 0:  // START — begin cleaning cycle from IDLE
+            if (currentState == STATE_IDLE) {
+                currentState    = STATE_HOMING;
+                lastStateChange = millis();
+                Serial.println("Menu: START → HOMING");
+            }
+            break;
+
+        case 1:  // HOME — force homing from any state
+            motorSetEnable(true);
+            currentState    = STATE_HOMING;
+            lastStateChange = millis();
+            Serial.println("Menu: HOME → HOMING");
+            break;
+
+        case 2:  // SETTINGS
+            displayMode = DISP_SETTINGS;
+            break;
+
+        case 3:  // ABOUT
+            displayMode = DISP_ABOUT;
+            break;
+    }
+}
+
 // ============= MOTOR CONTROL =============
 void motorStep(int direction) {
     digitalWrite(TMC_DIR,  direction > 0 ? HIGH : LOW);
@@ -525,14 +600,14 @@ void drawMenu() {
     //   Title  y=2  (size 2, 16 px)
     //   Items  y=22,50,78,106  step=28  (24 px text + 4 px gap)
     //   Status y=150 (size 2, 16 px, bottom-aligned)
-    static int lastDrawnMenu = -1;
 
     // Snapshot volatile once — prevents Core 0 changing it mid-function
     // and leaving two rows simultaneously highlighted.
     int mi = menuIndex;
 
-    if (lastDrawnMenu == -1) {
-        // First draw: screen already black from initDisplay(); paint title + all rows.
+    if (menuDrawState == -1) {
+        // Full redraw: happens on first call or after returning from a sub-screen.
+        tft.fillScreen(ST77XX_BLACK);
         tft.setTextSize(2);
         tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
         tft.setCursor(8, 2);
@@ -542,30 +617,95 @@ void drawMenu() {
             drawMenuRow(i, y, i == mi);
             y += 28;
         }
-    } else if (lastDrawnMenu != mi) {
+    } else if (menuDrawState != mi) {
         // Selection changed: repaint only the two affected rows.
-        drawMenuRow(lastDrawnMenu, 22 + lastDrawnMenu * 28, false);
+        drawMenuRow(menuDrawState, 22 + menuDrawState * 28, false);
         drawMenuRow(mi,            22 + mi             * 28, true);
     }
 
-    lastDrawnMenu = mi;
+    menuDrawState = mi;
+}
+
+void drawSettings() {
+    static DisplayMode lastMode = DISP_MENU;
+    DisplayMode dm = displayMode;
+    if (lastMode == dm) return;
+    lastMode = dm;
+
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextWrap(false);
+    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(8, 4);   tft.print("SETTINGS");
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.setCursor(8, 28);  tft.print("Park  : "); tft.print(PARK_MM);    tft.print(" mm");
+    tft.setCursor(8, 48);  tft.print("Centre: "); tft.print(CENTER_MM);  tft.print(" mm");
+    tft.setCursor(8, 68);  tft.print("Steps : "); tft.print(OSCILLATION_STEPS);
+    tft.setCursor(8, 88);  tft.print("Delay : "); tft.print(OSCILLATION_DELAY / 1000); tft.print(" s");
+    tft.setCursor(8, 108); tft.print("Cycles: "); tft.print(OSCILLATION_CYCLES);
+    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+    tft.setCursor(8, 150); tft.print("Press to return");
+}
+
+void drawAbout() {
+    static DisplayMode lastMode = DISP_MENU;
+    DisplayMode dm = displayMode;
+    if (lastMode == dm) return;
+    lastMode = dm;
+
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextWrap(false);
+    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(8, 4);   tft.print("MEGASONIC v1.0");
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.setCursor(8, 28);  tft.print("RP2040 Pico");
+    tft.setCursor(8, 48);  tft.print("earlephilhower");
+    tft.setCursor(8, 68);  tft.print("GMT147SPI 1.47\"");
+    tft.setCursor(8, 88);  tft.print("172x320  ST7789");
+    tft.setCursor(8, 108); tft.print("SPI 20MHz");
+    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+    tft.setCursor(8, 150); tft.print("Press to return");
 }
 
 void updateDisplay() {
-    // Only redraw when something visible has changed.
     // Snapshot all volatile shared variables once to avoid tearing.
-    static SystemState lastState = (SystemState)-1;
-    static int         lastPos   = -1;
-    static int         lastMenu  = -1;
+    static SystemState  lastState       = (SystemState)-1;
+    static int          lastPos         = -1;
+    static int          lastMenu        = -1;
+    static DisplayMode  lastDisplayMode = DISP_MENU;
 
+    DisplayMode dm    = displayMode;
     int         mi    = menuIndex;
     SystemState state = currentState;
     int         pos   = motorPosition;
+
+    // Sub-screens (SETTINGS / ABOUT) draw themselves once on mode entry.
+    if (dm != DISP_MENU) {
+        mutex_enter_blocking(&spi_mutex);
+        if (dm == DISP_SETTINGS) drawSettings();
+        else                     drawAbout();
+        mutex_exit(&spi_mutex);
+        lastDisplayMode = dm;
+        return;
+    }
+
+    // Returning to menu from a sub-screen: force status bar redraw too.
+    if (lastDisplayMode != DISP_MENU) {
+        lastState = (SystemState)-1;
+        lastPos   = -1;
+        lastMenu  = -1;
+        lastDisplayMode = DISP_MENU;
+    }
 
     bool menuChanged   = (mi    != lastMenu);
     bool statusChanged = (state != lastState || pos != lastPos);
 
     if (!menuChanged && !statusChanged) return;
+
+    // Hold SPI mutex for the entire draw block — TMC2130 on Core 0
+    // must not access SPI0 while the display is being written.
+    mutex_enter_blocking(&spi_mutex);
 
     // Menu rows — only repaints changed rows, no fillScreen.
     if (menuChanged) {
@@ -612,4 +752,6 @@ void updateDisplay() {
         Serial.print(" | Flow:");
         Serial.println(flowDetected ? "YES" : "NO");
     }
+
+    mutex_exit(&spi_mutex);
 }
