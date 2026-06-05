@@ -53,7 +53,7 @@ enum SystemState {
     STATE_ERROR
 };
 
-SystemState currentState = STATE_IDLE;
+volatile SystemState currentState = STATE_IDLE;
 unsigned long lastStateChange = 0;
 
 // ============= MOTION PARAMETERS =============
@@ -78,29 +78,32 @@ const int FAN_WAITING = 128;  // 50 % while priming
 const int FAN_FULL    = 255;  // 100 % during cleaning
 
 // ============= STATUS VARIABLES =============
-int  motorPosition      = 0;
-bool limitSwitchPressed = false;
-bool sprayActive        = false;
-bool flowDetected       = false;
+volatile int  motorPosition      = 0;
+volatile bool limitSwitchPressed = false;
+volatile bool sprayActive        = false;
+volatile bool flowDetected       = false;
 
 unsigned long oscillationCount    = 0;
 int           oscillationDir      = -1;  // -1 = toward limit, +1 = away
 int           oscillationStepCount = 0;  // Steps taken in current sweep
 
 // ============= TIMING =============
-unsigned long lastMotorUpdate   = 0;
-unsigned long lastDisplayUpdate = 0;
-unsigned long lastEncoderRead   = 0;
-const unsigned long MOTOR_UPDATE_INTERVAL   = 50;
-const unsigned long DISPLAY_UPDATE_INTERVAL = 100;
-const unsigned long ENCODER_READ_INTERVAL   = 20;
+unsigned long lastMotorUpdate = 0;
+unsigned long lastEncoderRead = 0;
+const unsigned long MOTOR_UPDATE_INTERVAL  = 50;
+const unsigned long ENCODER_READ_INTERVAL  = 20;
 
 // ============= DISPLAY / MENU =============
+// Hardware SPI on earlephilhower: fast, low-overhead transactions.
 Adafruit_ST7789 tft = Adafruit_ST7789(LCD_CS, LCD_DC, LCD_RST);
 
 const char* menuItems[] = { "START", "HOME", "SETTINGS", "ABOUT" };
 const int   MENU_COUNT  = sizeof(menuItems) / sizeof(menuItems[0]);
-int menuIndex = 0;
+volatile int menuIndex = 0;
+
+// Set to true by Core 0 once hardware is fully initialised.
+// Core 1 waits on this before touching the display.
+volatile bool core0_ready = false;
 
 // ============= FUNCTION DECLARATIONS =============
 void initHardware();
@@ -116,6 +119,7 @@ void motorStep(int direction);
 void motorSetEnable(bool enable);
 void motorMoveTo(int target);
 void updateDisplay();
+void drawMenuRow(int i, int y, bool selected);
 void drawMenu();
 void setLED(int ledPin, bool state);
 void setFan(int speed);
@@ -124,18 +128,31 @@ void setUltrasonic(bool on);
 // ============= SETUP =============
 void setup() {
     Serial.begin(115200);
-    delay(100);
+    // Wait up to 2 s for USB-CDC to enumerate so early prints are not lost.
+    { unsigned long t = millis(); while (!Serial && millis() - t < 2000) delay(10); }
     Serial.println("=== Stepper Controller Initializing ===");
 
     initHardware();
     initSPI();
-    initTMC2130();
+    // initTMC2130();  // Uncomment once the TMC2130 is wired — leaving it out
+                       // prevents SPI bus corruption when the chip is absent.
     initEncoder();
     initDisplay();
 
     currentState    = STATE_IDLE;
     lastStateChange = millis();
     Serial.println("Initialization complete!");
+    core0_ready = true;  // Signal Core 1 to start rendering
+}
+
+// ============= CORE 1 — LCD RENDERING =============
+void setup1() {
+    while (!core0_ready) tight_loop_contents();  // Wait for Core 0 hardware init
+}
+
+void loop1() {
+    updateDisplay();
+    delay(50);  // ~20 fps; non-blocking for Core 1
 }
 
 // ============= MAIN LOOP =============
@@ -150,11 +167,7 @@ void loop() {
     readSensors();
     updateStateMachine();
     handleState();
-
-    if (now - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
-        updateDisplay();
-        lastDisplayUpdate = now;
-    }
+    // Display is handled by Core 1 (loop1).
 }
 
 // ============= HARDWARE INITIALIZATION =============
@@ -167,7 +180,7 @@ void initHardware() {
 
     // Sensors
     pinMode(LIMIT_SWITCH, INPUT_PULLUP);
-    pinMode(SPRAY_VALVE,  INPUT);   // Expects external 0 / 3.3 V signal
+    pinMode(SPRAY_VALVE,  INPUT);
     pinMode(FLOW_SENSOR,  INPUT);
 
     // Outputs
@@ -189,6 +202,10 @@ void initHardware() {
 }
 
 void initSPI() {
+    // earlephilhower: explicit pin assignment so SPI0 uses our wired pins.
+    SPI.setRX(TMC_MISO);
+    SPI.setTX(TMC_MOSI);
+    SPI.setSCK(TMC_SCK);
     SPI.begin();
     Serial.print("SPI initialized: SCK=");
     Serial.print(TMC_SCK);
@@ -222,9 +239,10 @@ void initTMC2130() {
 }
 
 void initDisplay() {
-    tft.init(172, 320);  // GMT147SPI 1.47" 172x320
+    tft.init(172, 320);      // GMT147SPI 1.47" 172x320
+    tft.setSPISpeed(20000000);
     tft.setRotation(1);
-    tft.fillScreen(ST77XX_BLACK);
+    tft.fillScreen(ST77XX_BLACK);  // one clear at boot; drawMenu() reuses this black background
     tft.setTextWrap(false);
     Serial.println("Display initialized (GMT147SPI 1.47\" 172x320)");
 }
@@ -248,20 +266,31 @@ void readSensors() {
 }
 
 void readEncoder() {
-    static int lastEncoded = 0;
+    static int           lastEncoded  = 0;
+    static int           stepAccum    = 0;
+    static unsigned long lastStepTime = 0;
+
     int a       = digitalRead(ENC_A);
     int b       = digitalRead(ENC_B);
     int encoded = (a << 1) | b;
     int sum     = (lastEncoded << 2) | encoded;
-    int delta   = 0;
 
-    if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) delta =  1;
-    if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) delta = -1;
+    if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) stepAccum++;
+    if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) stepAccum--;
 
-    if (delta != 0) {
-        menuIndex = (menuIndex + delta + MENU_COUNT) % MENU_COUNT;
-    }
     lastEncoded = encoded;
+
+    // KY-040 produces 4 quadrature transitions per physical detent click.
+    // Require a full detent (±4) before registering a step — contact bounce
+    // never accumulates that many consistent transitions in one direction.
+    if (abs(stepAccum) >= 4) {
+        unsigned long now = millis();
+        if (now - lastStepTime >= 50) {
+            menuIndex    = (menuIndex + (stepAccum > 0 ? 1 : -1) + MENU_COUNT) % MENU_COUNT;
+            lastStepTime = now;
+        }
+        stepAccum = 0;
+    }
 }
 
 // ============= STATE MACHINE TRANSITIONS =============
@@ -482,77 +511,105 @@ void setUltrasonic(bool on) {
 }
 
 // ============= DISPLAY =============
+void drawMenuRow(int i, int y, bool selected) {
+    uint16_t bg = selected ? ST77XX_BLUE : ST77XX_BLACK;
+    tft.fillRect(6, y - 2, tft.width() - 12, 28, bg);
+    tft.setTextColor(ST77XX_WHITE, bg);
+    tft.setTextSize(3);
+    tft.setCursor(12, y);
+    tft.print(menuItems[i]);
+}
+
 void drawMenu() {
-    tft.fillScreen(ST77XX_BLACK);
+    // Landscape 320×172. Layout with textSize 3 (24 px/row):
+    //   Title  y=2  (size 2, 16 px)
+    //   Items  y=22,50,78,106  step=28  (24 px text + 4 px gap)
+    //   Status y=150 (size 2, 16 px, bottom-aligned)
+    static int lastDrawnMenu = -1;
 
-    tft.setTextSize(2);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(8, 4);
-    tft.print("MEGASONIC");
+    // Snapshot volatile once — prevents Core 0 changing it mid-function
+    // and leaving two rows simultaneously highlighted.
+    int mi = menuIndex;
 
-    int y = 40;
-    for (int i = 0; i < MENU_COUNT; ++i) {
-        if (i == menuIndex) {
-            tft.fillRect(6, y - 2, tft.width() - 12, 40, ST77XX_BLUE);
-            tft.setTextColor(ST77XX_WHITE, ST77XX_BLUE);
-        } else {
-            tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    if (lastDrawnMenu == -1) {
+        // First draw: screen already black from initDisplay(); paint title + all rows.
+        tft.setTextSize(2);
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(8, 2);
+        tft.print("MEGASONIC");
+        int y = 22;
+        for (int i = 0; i < MENU_COUNT; ++i) {
+            drawMenuRow(i, y, i == mi);
+            y += 28;
         }
-        tft.setTextSize(4);
-        tft.setCursor(12, y);
-        tft.print(menuItems[i]);
-        y += 48;
+    } else if (lastDrawnMenu != mi) {
+        // Selection changed: repaint only the two affected rows.
+        drawMenuRow(lastDrawnMenu, 22 + lastDrawnMenu * 28, false);
+        drawMenuRow(mi,            22 + mi             * 28, true);
     }
+
+    lastDrawnMenu = mi;
 }
 
 void updateDisplay() {
-    // Only redraw when something visible has changed
+    // Only redraw when something visible has changed.
+    // Snapshot all volatile shared variables once to avoid tearing.
     static SystemState lastState = (SystemState)-1;
     static int         lastPos   = -1;
     static int         lastMenu  = -1;
 
-    if (currentState == lastState &&
-        motorPosition == lastPos  &&
-        menuIndex     == lastMenu) return;
+    int         mi    = menuIndex;
+    SystemState state = currentState;
+    int         pos   = motorPosition;
 
-    drawMenu();
+    bool menuChanged   = (mi    != lastMenu);
+    bool statusChanged = (state != lastState || pos != lastPos);
 
-    tft.setTextSize(2);
-    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-    tft.setCursor(6, tft.height() - 28);
-    tft.print("State:");
-    switch (currentState) {
-        case STATE_IDLE:          tft.print("IDLE");    break;
-        case STATE_HOMING:        tft.print("HOMING");  break;
-        case STATE_PARKED:        tft.print("PARKED");  break;
-        case STATE_WAITING_SPRAY: tft.print("WAIT");    break;
-        case STATE_SPRAY_ACTIVE:  tft.print("SPRAY");   break;
-        case STATE_OSCILLATING:   tft.print("OSC");     break;
-        case STATE_ERROR:         tft.print("ERROR");   break;
+    if (!menuChanged && !statusChanged) return;
+
+    // Menu rows — only repaints changed rows, no fillScreen.
+    if (menuChanged) {
+        drawMenu();
+        lastMenu = mi;
     }
-    tft.print(" Pos:");
-    tft.print(motorPosition);
-    tft.print("   ");  // Overwrite leftover digits from longer numbers
 
-    lastState = currentState;
-    lastPos   = motorPosition;
-    lastMenu  = menuIndex;
+    // Status bar — fast text-only update, independent of menu redraws.
+    if (statusChanged) {
+        tft.setTextSize(2);
+        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+        tft.setCursor(6, 150);
+        tft.print("State:");
+        switch (state) {
+            case STATE_IDLE:          tft.print("IDLE  "); break;
+            case STATE_HOMING:        tft.print("HOMING"); break;
+            case STATE_PARKED:        tft.print("PARKED"); break;
+            case STATE_WAITING_SPRAY: tft.print("WAIT  "); break;
+            case STATE_SPRAY_ACTIVE:  tft.print("SPRAY "); break;
+            case STATE_OSCILLATING:   tft.print("OSC   "); break;
+            case STATE_ERROR:         tft.print("ERROR "); break;
+        }
+        tft.print(" Pos:");
+        tft.print(pos);
+        tft.print("   ");
 
-    // Mirror to serial for bench debugging
-    Serial.print("State:");
-    switch (currentState) {
-        case STATE_IDLE:          Serial.print("IDLE");         break;
-        case STATE_HOMING:        Serial.print("HOMING");       break;
-        case STATE_PARKED:        Serial.print("PARKED");       break;
-        case STATE_WAITING_SPRAY: Serial.print("WAITING");      break;
-        case STATE_SPRAY_ACTIVE:  Serial.print("SPRAY_ACTIVE"); break;
-        case STATE_OSCILLATING:   Serial.print("OSCILLATING");  break;
-        case STATE_ERROR:         Serial.print("ERROR");        break;
+        lastState = state;
+        lastPos   = pos;
+
+        Serial.print("State:");
+        switch (state) {
+            case STATE_IDLE:          Serial.print("IDLE");         break;
+            case STATE_HOMING:        Serial.print("HOMING");       break;
+            case STATE_PARKED:        Serial.print("PARKED");       break;
+            case STATE_WAITING_SPRAY: Serial.print("WAITING");      break;
+            case STATE_SPRAY_ACTIVE:  Serial.print("SPRAY_ACTIVE"); break;
+            case STATE_OSCILLATING:   Serial.print("OSCILLATING");  break;
+            case STATE_ERROR:         Serial.print("ERROR");        break;
+        }
+        Serial.print(" | Pos:");
+        Serial.print(pos);
+        Serial.print(" | Spray:");
+        Serial.print(sprayActive  ? "ON"  : "OFF");
+        Serial.print(" | Flow:");
+        Serial.println(flowDetected ? "YES" : "NO");
     }
-    Serial.print(" | Pos:");
-    Serial.print(motorPosition);
-    Serial.print(" | Spray:");
-    Serial.print(sprayActive  ? "ON"  : "OFF");
-    Serial.print(" | Flow:");
-    Serial.println(flowDetected ? "YES" : "NO");
 }

@@ -146,9 +146,8 @@ SPRAY_ACTIVE_WAIT = 2000   // ms stabilisation before oscillation
 === Stepper Controller Initializing ===
 Hardware initialized
 SPI initialized: SCK=18 MOSI=19 MISO=16
-Encoder initialized: A=26 B=27
-TMC2130 configured: 600 mA, 16x microsteps, StealthChop
-Display initialized (ST7789V3 240x280)
+Encoder initialized: CLK=26 DT=27 SW=22
+Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
 ```
 
@@ -201,14 +200,14 @@ const int STEPS_PER_MM = ...;  // Recalculate in main.cpp
 
 | Item | Status | Notes |
 |------|--------|-------|
-| TMC2130 SPI config | ✅ Done | 600 mA, 16× microsteps, StealthChop |
-| Encoder quadrature | ✅ Done | Decoding + pull-ups implemented |
-| Oscillation direction | ✅ Fixed | Now alternates correctly |
-| LCD display | ✅ Done | ST7789V3 240×280 rendering |
+| TMC2130 SPI config | ⚠️ Pending wiring | `initTMC2130()` ready, commented out; add SPI mutex when connected |
+| Encoder quadrature + debounce | ✅ Done | 4-transition accumulator + 50 ms guard |
+| Oscillation direction | ✅ Done | Alternates correctly |
+| LCD display | ✅ Done | GMT147SPI 1.47" 172×320, 20 MHz HW SPI, Core 1 ~20 fps |
 | STEPS_PER_MM calibration | ⚠️ Required | Defaults to 1 (uncalibrated) |
 | Error recovery | 🔄 TODO | STATE_ERROR requires power-cycle |
-| Encoder button (SELECT) | 🔄 TODO | No action on button press yet |
-| StallGuard fault detection | 🔄 TODO | TMC2130 supports it; not wired in |
+| Encoder button (SELECT) | 🔄 TODO | GPIO 22 wired; no menu action yet |
+| StallGuard fault detection | 🔄 TODO | TMC2130 supports it; needs wiring |
 
 ---
 
@@ -218,7 +217,7 @@ const int STEPS_PER_MM = ...;  // Recalculate in main.cpp
 |-----------|------|
 | RP2040 Pico | ~$5 |
 | TMC2130 stepper driver | ~$10 |
-| ST7789V3 1.69" SPI LCD (240×280) | ~$8 |
+| GMT147SPI 1.47" SPI LCD (172×320 ST7789) | ~$6 |
 | NEMA17 stepper motor | ~$15 |
 | Rotary encoder | ~$3 |
 | Supporting electronics | ~$15 |

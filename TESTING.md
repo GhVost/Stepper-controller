@@ -13,8 +13,8 @@ pio run
 ```
 Linking .pio/build/pico/firmware.elf
 Checking size .pio/build/pico/firmware.elf
-RAM:   [==        ]  15.4% (used ~41 KB of 264 KB)
-Flash: [          ]   0.2% (used ~4.3 KB of 2 MB)
+RAM:   [          ]   3.6% (used 9536 bytes from 262144 bytes)
+Flash: [          ]   3.6% (used 75164 bytes from 2093056 bytes)
 ========================= [SUCCESS] ...
 ```
 
@@ -41,14 +41,15 @@ pio device monitor --baud 115200
 === Stepper Controller Initializing ===
 Hardware initialized
 SPI initialized: SCK=18 MOSI=19 MISO=16
-Encoder initialized: A=26 B=27
-TMC2130 configured: 600 mA, 16x microsteps, StealthChop
-Display initialized (ST7789V3 240x280)
+Encoder initialized: CLK=26 DT=27 SW=22
+Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
 ```
 
+> TMC2130 line absent — `initTMC2130()` is commented out until the driver is wired.
+
 After startup, serial output appears **only when state, position, or menu changes**
-(dirty-flag display). Trigger changes by connecting sensor pins to 3.3 V or GND.
+(dirty-flag, emitted by Core 1). Trigger changes by connecting sensor pins to 3.3 V or GND.
 
 **No serial output after startup:** Normal — nothing has changed. Connect GPIO 2
 (Spray) to 3.3 V momentarily to trigger the first state transition and confirm output.
@@ -131,9 +132,11 @@ Flowing   → GPIO 3 reads 3.3 V
 
 ### Phase 4: TMC2130 SPI Verification
 
+> `initTMC2130()` is currently commented out in `setup()`. Uncomment it once the TMC2130 is physically wired. A SPI mutex between Core 0 (TMC2130) and Core 1 (display) will also be needed at that point.
+
 With TMC2130 powered (3.3 V logic, VM motor supply):
 
-1. Flash firmware, open serial monitor.
+1. Uncomment `initTMC2130()` in `setup()`, flash firmware, open serial monitor.
 2. Check startup prints `TMC2130 configured: 600 mA, 16x microsteps, StealthChop`.
 3. Add a temporary GSTAT read to `setup()` to verify SPI communication:
 
@@ -271,9 +274,9 @@ const unsigned long MOTOR_UPDATE_INTERVAL = 20;  // 50 ms default
 - Verify 3.3 V on VCC_IO.
 - Confirm `R_SENSE` matches your board (default 0.11 Ω).
 
-### Display flickering
-- Should only update on state/position changes.
-- If flickering persists, verify `updateDisplay()` dirty-flag logic is in the current `main.cpp`.
+### Display flickering or multiple rows highlighted
+- Display rendering runs on Core 1. If rows flicker or two rows appear selected simultaneously, it indicates a stale build — the volatile snapshot fix in `drawMenu()` prevents this.
+- Verify you have the latest `main.cpp` (both `drawMenu()` and `updateDisplay()` snapshot volatile variables to a local at the start of each call).
 
 ### Oscillation goes only one direction
 - Verify `oscillationDir` flips in `handleState() STATE_OSCILLATING`.

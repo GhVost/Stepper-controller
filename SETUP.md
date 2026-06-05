@@ -88,6 +88,21 @@ Stepper-controller/
 
 ---
 
+## Architecture
+
+The firmware uses both RP2040 cores:
+
+| Core | Entry points | Responsibility |
+|------|-------------|----------------|
+| Core 0 | `setup()` / `loop()` | State machine, motor steps, sensor reading, encoder polling |
+| Core 1 | `setup1()` / `loop1()` | LCD rendering (~20 fps) |
+
+Core 1 spins on `core0_ready` (set at the end of `setup()`) before touching the display, ensuring SPI is initialised before either core accesses it. All variables shared between cores are declared `volatile`.
+
+When the TMC2130 is connected, a mutex will be needed around SPI bus access because Core 0 (TMC2130) and Core 1 (display) share SPI0.
+
+---
+
 ## Code Organisation (`src/main.cpp`)
 
 ### Pin Constants (top of file)
@@ -144,6 +159,8 @@ enum SystemState {
 
 **`readEncoder()`** — Quadrature decoding; updates `menuIndex`.
 - Encoder pins use internal pull-ups — no external resistors needed.
+- Accumulates transitions; requires ±4 (one full KY-040 detent click) before registering a step.
+- Enforces 50 ms minimum between accepted steps to suppress contact bounce.
 
 ### Output Control
 
@@ -177,10 +194,14 @@ Both are called every main loop iteration.
 
 ### Display
 
-**`updateDisplay()`** — Redraws LCD and echoes to Serial only when state, position, or
-menu selection changes (dirty-flag check). Avoids constant screen flicker.
+**`updateDisplay()`** — Called by `loop1()` on Core 1 at ~20 fps. Snapshots all volatile
+shared variables once per call and redraws LCD + echoes to Serial only when something
+has changed (dirty-flag check). Avoids screen flicker and cross-core tearing.
 
-**`drawMenu()`** — Full screen redraw: title + 4 menu items with selection highlight.
+**`drawMenu()`** — On first call: paints title + all menu rows. On subsequent calls:
+repaints only the two rows whose selection state changed (no `fillScreen`). Snapshots
+`menuIndex` into a local variable at entry to prevent Core 0 from changing it
+mid-draw and leaving two rows simultaneously highlighted.
 
 ---
 
@@ -227,17 +248,14 @@ case STATE_OSCILLATING:
     break;
 ```
 
-### 5. Add Encoder Button (SELECT)
+### 5. Add Encoder Button Action (SELECT)
 
-Add the button pin (typically `ENC_SW`) and poll it in `readEncoder()`:
+`ENC_SW` (GPIO 22) is already wired with `INPUT_PULLUP`. Add action handling in `readEncoder()`:
 
 ```cpp
-const int ENC_SW = 22;   // Example pin
-pinMode(ENC_SW, INPUT_PULLUP);
-
 // In readEncoder():
 if (digitalRead(ENC_SW) == LOW) {
-    // Confirm menu selection
+    // Confirm menu selection for menuIndex
 }
 ```
 
@@ -281,15 +299,16 @@ Serial.println(gstat, HEX);
 
 ## Performance
 
-Current build (release mode, 16× microsteps):
+Current build (release mode, earlephilhower framework):
 
 | Metric | Value |
 |--------|-------|
-| Flash | ~4.3 KB (0.2 % of 2 MB) |
-| RAM | ~41.5 KB (15.4 % of 264 KB) |
-| Polling interval | 50 ms (motor steps / sensors) |
-| Display update | On change only |
-| Encoder poll | Every 20 ms |
+| Flash | 75 KB (3.6 % of 2 MB) |
+| RAM | 9.5 KB (3.6 % of 264 KB) |
+| Motor/sensor update | Every 50 ms (Core 0) |
+| Encoder poll | Every 20 ms (Core 0) |
+| Display update | ~20 fps (Core 1, on change only) |
+| SPI clock (LCD) | 20 MHz hardware SPI |
 
 ---
 

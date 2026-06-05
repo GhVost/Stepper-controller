@@ -5,9 +5,10 @@ RP2040-based stepper motor controller featuring TMC2130 driver, SPI LCD display,
 ## Features
 
 - **RP2040 Microcontroller** – Dual-core ARM, 133 MHz, 264 KB RAM
+- **Dual-Core Architecture** – Core 0 runs the state machine; Core 1 renders the LCD at ~20 fps
 - **TMC2130 Stepper Driver** – SPI-controlled stepper with current limiting and stall detection
-- **SPI LCD Display** – GMT147SPI 1.47" SPI 172×320 (ST7789 controller)
-- **Rotary Encoder** – Quadrature input + push-button for menu navigation
+- **Hardware SPI LCD** – GMT147SPI 1.47" 172×320 ST7789, 20 MHz SPI via earlephilhower framework
+- **Rotary Encoder** – KY-040 quadrature input + push-button; 4-transition debounce per detent
 - **Sensor Integration** – Limit switch, spray valve, flow sensor
 - **Non-Blocking State Machine** – Smooth operation with millisecond-based timing
 - **Safety Features** – Motor enable/disable, ultrasonic remote control, fan speed PWM
@@ -37,10 +38,14 @@ Expected startup:
 === Stepper Controller Initializing ===
 Hardware initialized
 SPI initialized: SCK=18 MOSI=19 MISO=16
-Encoder initialized: A=26 B=27
-TMC2130 driver: Configure via SPI - TODO
+Encoder initialized: CLK=26 DT=27 SW=22
+Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
-State: IDLE | Pos: 0 | Spray: OFF | Flow: NO
+```
+
+State/position changes are echoed to serial by Core 1 (only on change):
+```
+State:IDLE | Pos:0 | Spray:OFF | Flow:NO
 ```
 
 ## System States
@@ -138,29 +143,31 @@ const unsigned long OSCILLATION_CYCLES = 20;    // Total oscillations
 
 ## Dependencies
 
+- **earlephilhower/arduino-pico** – RP2040 Arduino core with proper hardware SPI, dual-core `setup1()`/`loop1()`, and accurate `analogWrite`
 - **TMCStepper** (teemuatlut) – TMC2130 SPI interface
 - **Adafruit GFX Library** – Graphics primitives
-- **Adafruit ST7735/ST7789** – LCD driver (for ST7789V3 use `Adafruit_ST7789`)
-- Arduino Framework for RP2040
+- **Adafruit ST7735/ST7789** – LCD driver (`Adafruit_ST7789`)
 
 ## Development Status
 
 ### ✅ Implemented
 - [x] State machine core logic
 - [x] Motor control (step/dir)
-- [x] Sensor reading (limit, spray, flow)
+- [x] Sensor reading (limit, spray, flow) with debounce
 - [x] LED indicators
 - [x] Fan PWM control
-- [x] SPI initialization for TMC2130
-- [x] Non-blocking timing system
+- [x] SPI bus (SPI0, shared TMC2130 + LCD)
+- [x] TMC2130 driver configuration (awaiting hardware connection)
+- [x] LCD display — hardware SPI 20 MHz, partial redraw, ~20 fps on Core 1
+- [x] Rotary encoder — 4-transition accumulator debounce + 50 ms guard
+- [x] Non-blocking dual-core architecture
 
 ### 🔄 TODO
-- [ ] TMC2130 SPI register configuration (current, microsteps)
-- [ ] Rotary encoder quadrature decoding
-- [ ] SPI LCD display rendering
-- [ ] Error recovery logic
+- [ ] Wire TMC2130 and uncomment `initTMC2130()` — add SPI mutex between cores when done
+- [ ] Error recovery logic (STATE_ERROR currently requires power-cycle)
+- [ ] Encoder button action (GPIO 22 wired, no menu action yet)
 - [ ] EEPROM parameter storage
-- [ ] Serial debug interface
+- [ ] StallGuard fault detection
 
 ## Troubleshooting
 

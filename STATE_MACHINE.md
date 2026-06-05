@@ -209,17 +209,31 @@ const unsigned long MOTOR_UPDATE_INTERVAL = 50; // ms per step during homing/par
 
 ---
 
-## Control Flow (Main Loop)
+## Control Flow (Dual-Core)
 
+**Core 0** — state machine and I/O:
 ```cpp
 void loop() {
-    readEncoder();           // Every 20 ms
-    readSensors();           // Every iteration (debounced internally)
-    updateStateMachine();    // Check transition conditions
-    handleState();           // Execute current-state actions
-    updateDisplay();         // Redraw LCD only on state/position change
+    readEncoder();           // Every 20 ms (4-transition accumulator, 50 ms guard)
+    readSensors();           // Every iteration (limit switch debounced 20 ms)
+    updateStateMachine();    // Evaluate and apply state transitions
+    handleState();           // Execute current-state outputs (motor, LEDs, fan, relay)
+    // Display is owned by Core 1
 }
 ```
+
+**Core 1** — LCD rendering:
+```cpp
+void setup1() {
+    while (!core0_ready) tight_loop_contents();  // Wait for Core 0 init
+}
+void loop1() {
+    updateDisplay();   // Redraws only on change; snapshots volatile vars to avoid tearing
+    delay(50);         // ~20 fps
+}
+```
+
+All variables shared between cores (`currentState`, `motorPosition`, `menuIndex`, etc.) are declared `volatile` to prevent compiler caching across cores.
 
 ---
 
