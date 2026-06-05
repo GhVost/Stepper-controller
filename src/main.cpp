@@ -526,11 +526,16 @@ void handleMenuSelect() {
     }
 
     switch (menuIndex) {
-        case 0:  // START — begin cleaning cycle from IDLE
+        case 0:  // START / STOP toggle
             if (currentState == STATE_IDLE) {
                 currentState    = STATE_HOMING;
                 lastStateChange = millis();
                 Serial.println("Menu: START → HOMING");
+            } else {
+                motorSetEnable(false);
+                currentState    = STATE_IDLE;
+                lastStateChange = millis();
+                Serial.println("Menu: STOP → IDLE");
             }
             break;
 
