@@ -2,352 +2,295 @@
 
 ## Overview
 
-The Stepper Controller uses a non-blocking, event-driven state machine running on the RP2040. Each state executes independently with millisecond-based timing, allowing responsive sensor input and smooth motor control.
+The Stepper Controller uses a non-blocking, event-driven state machine on the RP2040.
+All timing uses `millis()` comparisons — no `delay()` calls block the main loop.
+Sensor inputs are polled every loop iteration; motor steps and display updates are
+rate-limited by independent interval timers.
+
+---
 
 ## State Diagram
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │          START / IDLE               │
-                    │  • Motor disabled, all outputs OFF  │
-                    │  • Waiting for spray valve trigger  │
-                    └──────────────────┬──────────────────┘
-                                      │
-                    Spray Valve ON ────┴─────────┐
-                                                  │
-                                          ┌───────▼────────┐
-                                          │    HOMING      │
-                                          │ • Motor ON     │
-                                          │ • Move to      │
-                                          │   limit switch │
-                                          └───────┬────────┘
-                                                  │
-                                    Limit switch ─┴─────────┐
-                                                            │
-                                              ┌─────────────▼────────┐
-                                              │     PARKED           │
-                                              │ • Motor at position  │
-                                              │   zero (Park = 7mm)  │
-                                              │ • Wait for flow      │
-                                              └─────────────┬────────┘
-                                                            │
-                                    Spray ON + Flow ON ─────┴────────┐
-                                                                      │
-                              ┌─────────────────────────────────┐    │
-                              │  WAITING_SPRAY                 │◄───┘
-                              │ • Spray detected but no flow    │
-                              │ • Wait for flow sensor          │
-                              └─────────────┬───────────────────┘
-                                            │
-                                    Flow ON ┼────────────────────┐
-                                            │                    │
-                    ┌───────────────────────┴──────────────┐     │
-                    │                                      │     │
-        ┌───────────▼─────────────┐      ┌────────────────▼───────┐
-        │  SPRAY_ACTIVE           │      │  SPRAY_ACTIVE (cont'd) │
-        │ • Prep for cleaning     │      │ • Fan ON (100%)        │
-        │ • Green LED ON          │      │ • Ultrasonic ON        │
-        │ • Motor ready           │      │ • Park position (7mm)  │
-        │ • Fan starts (50%)      │      │ • Check timeout        │
-        └─────────┬──────────────┘      └────────────┬───────────┘
-                  │                                  │
-       After 2s ──┴───────────────────────────────────┘
-                  │
-        ┌─────────▼──────────────┐
-        │   OSCILLATING          │
-        │ • Motor oscillates     │
-        │   back/forth           │
-        │ • Fan full speed (255%)│
-        │ • Ultrasonic ON        │
-        │ • Repeat cycles        │
-        └─────────┬──────────────┘
-                  │
-    After 20 cycles ────► Return to IDLE ──────┐
-    or Spray OFF ──────► Error/Reset ────────┐ │
-    or Flow lost ──────► Error/Reset ────────┼─┘
-                                             │
-                        ┌────────────────────┘
-                        │
-                    ┌───▼────────────────┐
-                    │  ERROR (Future)    │
-                    │ • Motor disabled   │
-                    │ • Red LED ON       │
-                    │ • Manual reset     │
-                    └────────────────────┘
+                    ┌──────────────────────────────────┐
+                    │            STATE_IDLE             │
+                    │  Motor off, all outputs off       │
+                    │  Waiting for spray valve          │
+                    └─────────────┬────────────────────┘
+                                  │ Spray valve ON
+                                  ▼
+                    ┌──────────────────────────────────┐
+                    │           STATE_HOMING            │
+                    │  Motor steps toward limit (−dir)  │
+                    │  Yellow LED ON                    │
+                    └─────────────┬────────────────────┘
+                                  │ Limit switch pressed
+                                  │ (motorPosition reset to 0)
+                                  ▼
+                    ┌──────────────────────────────────┐
+                    │           STATE_PARKED            │
+                    │  Motor steps forward to PARK_STEPS│
+                    │  Motor disabled when at park      │
+                    │  Green LED ON                     │
+                    └──────┬──────────────┬────────────┘
+                           │              │
+              Spray ON,    │              │ Spray ON,
+              no flow      │              │ flow ON
+                           ▼              ▼
+          ┌─────────────────────┐   (→ STATE_SPRAY_ACTIVE)
+          │  STATE_WAITING_SPRAY│
+          │  Fan 50 %           │
+          │  Yellow LED ON      │
+          └──────────┬──────────┘
+                     │ Flow ON
+                     ▼
+                    ┌──────────────────────────────────┐
+                    │         STATE_SPRAY_ACTIVE        │
+                    │  Fan 100 %, Ultrasonic ON         │
+                    │  Motor moves to CENTER_STEPS      │
+                    │  2 s stabilisation wait           │
+                    │  Green LED ON                     │
+                    └─────────────┬────────────────────┘
+                                  │ Motor at centre AND 2 s elapsed
+                                  ▼
+                    ┌──────────────────────────────────┐
+                    │         STATE_OSCILLATING         │
+                    │  Motor sweeps ±OSCILLATION_STEPS  │
+                    │  One step per OSCILLATION_DELAY   │
+                    │  Fan 100 %, Ultrasonic ON         │
+                    │  Green LED ON                     │
+                    └─────────────┬────────────────────┘
+                                  │ 20 sweeps complete
+                                  │ OR spray/flow lost
+                                  ▼
+                    ┌──────────────────────────────────┐
+                    │            STATE_IDLE             │
+                    └──────────────────────────────────┘
+
+At any point, spray or flow loss during SPRAY_ACTIVE or OSCILLATING
+immediately transitions back to STATE_IDLE.
+
+                    ┌──────────────────────────────────┐
+                    │           STATE_ERROR             │
+                    │  Motor off, all outputs off       │
+                    │  Yellow LED blinks at 1 Hz        │
+                    │  Requires power-cycle to reset    │
+                    └──────────────────────────────────┘
 ```
+
+---
 
 ## State Definitions
 
 ### STATE_IDLE
-**Entry**: System startup or cycle complete  
-**Behavior**:
-- Motor disabled (EN pin HIGH)
-- All outputs OFF (LEDs, fan, ultrasonic)
-- Monitoring spray valve (GPIO 2)
-
-**Exit Condition**: Spray valve goes HIGH (spray activated)  
-**Next State**: STATE_HOMING
-
-**Purpose**: Safe wait state, no motion
+**Entry**: Power-on or any cleaning cycle end  
+**Actions**: Motor disabled, all LEDs off, fan off, ultrasonic off  
+**Exit**: Spray valve goes HIGH → STATE_HOMING
 
 ---
 
 ### STATE_HOMING
-**Entry**: From IDLE when spray valve detected  
-**Behavior**:
-- Motor enabled (EN pin LOW)
-- Direction set toward limit switch (DIR pin LOW by convention)
-- Pulse STEP pin slowly (10ms per step)
-- Poll limit switch (GPIO 28)
-- Green LED ON
+**Entry**: Spray valve detected  
+**Actions**:
+- Motor enabled
+- Steps toward limit switch at `MOTOR_UPDATE_INTERVAL` (50 ms/step)
+- Yellow LED ON
 
-**Exit Condition**: Limit switch pressed (GPIO 28 LOW)  
-**Next State**: STATE_PARKED
-
-**Exit Actions**:
-- Set position counter to 0
-- Move forward PARK_POSITION steps (7mm)
-
-**Purpose**: Establish zero reference position
+**Exit**: Limit switch pressed → `motorPosition` reset to 0 → STATE_PARKED
 
 ---
 
 ### STATE_PARKED
-**Entry**: After homing completes and motor moves to park position  
-**Behavior**:
-- Motor disabled (EN pin HIGH)
-- Position = PARK_POSITION (7mm from limit)
-- Monitor: Spray valve (GPIO 2) + Flow sensor (GPIO 3)
+**Entry**: After homing completes  
+**Actions**:
+- Motor steps forward (1 step per 50 ms) until `motorPosition >= PARK_STEPS`
+- Motor disabled once at park position
 - Green LED ON
 
-**Exit Condition**: Both spray HIGH AND flow HIGH  
-**Next State**: STATE_WAITING_SPRAY or STATE_SPRAY_ACTIVE
-
-**Purpose**: Safe hold position waiting for cleaning requirements
+**Exit conditions**:
+- At park AND spray ON AND no flow → STATE_WAITING_SPRAY
+- At park AND spray ON AND flow ON → STATE_SPRAY_ACTIVE
 
 ---
 
 ### STATE_WAITING_SPRAY
-**Entry**: Spray detected but no flow yet  
-**Behavior**:
+**Entry**: Spray detected but flow not yet present  
+**Actions**:
 - Motor disabled
+- Fan at 50 % (PWM 128) to prime circulation
 - Yellow LED ON
-- Fan starts (50% PWM = 128)
-- Monitor flow sensor
 
-**Exit Condition**: Flow detected (GPIO 3 HIGH)  
-**Next State**: STATE_SPRAY_ACTIVE
-
-**Timeout**: 30 seconds → STATE_ERROR (future)
-
-**Purpose**: Intermediate state while system primes
+**Exit conditions**:
+- Flow detected → STATE_SPRAY_ACTIVE
+- Spray lost → STATE_PARKED
 
 ---
 
-### STATE_SPRAY_ACTIVE (Prep Phase)
-**Entry**: Flow detected  
-**Behavior**:
-- Motor disabled
-- Green LED ON
-- Fan speed 100% (PWM 255)
+### STATE_SPRAY_ACTIVE
+**Entry**: Both spray and flow confirmed  
+**Actions**:
+- Fan at 100 % (PWM 255)
 - Ultrasonic relay ON (GPIO 4 LOW)
-- Wait 2 seconds
+- Motor steps toward `CENTER_STEPS` (1 step per 50 ms)
+- Green LED ON
+- Waits `SPRAY_ACTIVE_WAIT` (2 s) for the system to stabilise
 
-**Exit Condition**: After 2 second delay  
-**Next State**: STATE_OSCILLATING
-
-**Purpose**: Allow ultrasonic and circulation to stabilize
+**Exit conditions**:
+- Motor at centre AND ≥ 2 s elapsed → STATE_OSCILLATING
+- Spray or flow lost → STATE_IDLE
 
 ---
 
 ### STATE_OSCILLATING
-**Entry**: From SPRAY_ACTIVE after 2 second delay  
-**Behavior**:
-- Motor ENABLED (EN pin LOW)
-- Move from CENTER_POSITION toward limit in OSCILLATION_STEPS increments
-- One step every OSCILLATION_DELAY ms (10 seconds)
-- Green LED ON
-- Fan PWM 255 (full speed)
-- Ultrasonic ON (GPIO 4 LOW)
-- Increment cycle counter each 16 steps
+**Entry**: From SPRAY_ACTIVE once motor is centred and system is stable  
+**Actions**:
+- Motor alternates direction every `OSCILLATION_STEPS` steps
+- One step fired every `OSCILLATION_DELAY` ms
+- `oscillationCount` increments after each directional sweep
+- Fan 100 %, Ultrasonic ON, Green LED ON
 
-**Pattern**:
+**Oscillation pattern** (default parameters):
 ```
-Oscillation Step:  0    1    2   ...   15   (repeat pattern)
-Motor Position:   26   25   24  ...    10  (moving toward limit)
-Direction:        ◄────────────────────────
-Wait:             10s  10s  10s        10s
+Sweep 1: pos 26 → 10  (16 steps × 10 s = 160 s, toward limit)
+Sweep 2: pos 10 → 26  (16 steps × 10 s = 160 s, away from limit)
+Sweep 3: pos 26 → 10  ...
+...
+Sweep 20: pos 10 → 26
 ```
 
-**Exit Conditions**:
-- Spray valve OFF → STATE_IDLE
-- Flow sensor OFF → STATE_IDLE
-- Cycle count ≥ 20 → STATE_IDLE
-- Timeout > 60 min → STATE_ERROR
+Motor oscillates between `CENTER_STEPS − OSCILLATION_STEPS` and `CENTER_STEPS`.
 
-**Purpose**: Main cleaning operation
+**Timing**:
+- 1 sweep = 16 steps × 10 s = 160 s ≈ 2.7 min
+- 20 sweeps = 3 200 s ≈ **53 min** total cleaning time
+
+**Exit conditions**:
+- `oscillationCount >= OSCILLATION_CYCLES` → STATE_IDLE (cycle complete)
+- Spray or flow lost → STATE_IDLE (emergency stop)
 
 ---
 
-### STATE_ERROR (Future Implementation)
-**Entry**: Fault condition detected  
-**Behavior**:
-- Motor disabled
-- Red LED ON (GPIO 7 + 8 both at fault pattern)
-- All outputs OFF
-- Wait for manual reset
+### STATE_ERROR *(future)*
+**Entry**: Fault condition (not yet wired to automatic detection)  
+**Actions**: Motor disabled, all outputs off, yellow LED blinks 1 Hz  
+**Recovery**: Power-cycle required (no automatic recovery)
 
-**Recovery**: Manual intervention required
+---
+
+## State Transition Table
+
+| Current State | Condition | Next State | Key Actions |
+|---|---|---|---|
+| IDLE | Spray ON | HOMING | Enable motor, yellow LED |
+| HOMING | Limit switch pressed | PARKED | Reset position=0, step to park |
+| PARKED | At park + Spray ON + no flow | WAITING_SPRAY | Fan 50 %, yellow LED |
+| PARKED | At park + Spray ON + Flow ON | SPRAY_ACTIVE | Fan 100 %, ultrasonic ON |
+| WAITING_SPRAY | Flow ON | SPRAY_ACTIVE | Fan 100 %, ultrasonic ON |
+| WAITING_SPRAY | Spray OFF | PARKED | Fan off |
+| SPRAY_ACTIVE | At centre + 2 s elapsed | OSCILLATING | Begin alternating sweeps |
+| SPRAY_ACTIVE | Spray or flow lost | IDLE | All outputs off |
+| OSCILLATING | 20 sweeps complete | IDLE | All outputs off |
+| OSCILLATING | Spray or flow lost | IDLE | Emergency stop |
 
 ---
 
 ## Timing Parameters
 
 ```cpp
-// Motion
-const int STEPS_PER_REVOLUTION = 200;     // NEMA17
-const int PARK_POSITION = 7;              // mm from limit
-const int CENTER_POSITION = 26;           // 34mm from limit
-const int OSCILLATION_STEPS = 16;         // steps per cycle
-
-// Delays
-const unsigned long OSCILLATION_DELAY = 10000;    // ms between steps
-const unsigned long OSCILLATION_CYCLES = 20;      // total repetitions
-const unsigned long SPRAY_ACTIVE_WAIT = 2000;     // ms before oscillation
-const unsigned long STATE_TIMEOUT = 3600000;      // 1 hour max
-
-// Fan PWM
-const int FAN_IDLE = 0;
-const int FAN_WAITING_SPRAY = 128;  // 50%
-const int FAN_SPRAY = 255;          // 100%
+const int STEPS_PER_MM       = 1;      // Calibrate to your hardware
+const int PARK_MM            = 7;      // mm from limit switch
+const int CENTER_MM          = 26;     // mm from limit switch
+const int OSCILLATION_STEPS  = 16;     // Steps per directional sweep
+const unsigned long OSCILLATION_DELAY  = 10000; // ms per step
+const unsigned long OSCILLATION_CYCLES = 20;    // Sweeps before stopping
+const unsigned long SPRAY_ACTIVE_WAIT  = 2000;  // ms stabilisation delay
+const unsigned long MOTOR_UPDATE_INTERVAL = 50; // ms per step during homing/parking
 ```
 
-## State Transition Table
-
-| Current State | Condition | Next State | Actions |
-|---|---|---|---|
-| IDLE | Spray ON | HOMING | Start motor, green LED |
-| HOMING | Limit pressed | PARKED | Stop motor, move forward 7mm |
-| PARKED | Spray + Flow | WAITING_SPRAY | Yellow LED, fan 50% |
-| WAITING_SPRAY | Flow detected | SPRAY_ACTIVE | Wait 2s, prep system |
-| SPRAY_ACTIVE | After 2s | OSCILLATING | Start oscillation, fan 100% |
-| OSCILLATING | Cycles complete | IDLE | Motor off, all outputs off |
-| OSCILLATING | Spray OFF | IDLE | Emergency stop, motor off |
-| OSCILLATING | Flow lost | IDLE | Loss of circulation |
-| Any | Timeout | ERROR | Fault condition (future) |
+---
 
 ## Control Flow (Main Loop)
 
 ```cpp
 void loop() {
-    readSensors();              // Read GPIO inputs
-    updateStateMachine();       // Check transition logic
-    handleState();              // Execute state actions
-    updateDisplay();            // Serial output (LCD future)
-    delay(50);                  // Non-blocking, 50ms poll interval
+    readEncoder();           // Every 20 ms
+    readSensors();           // Every iteration (debounced internally)
+    updateStateMachine();    // Check transition conditions
+    handleState();           // Execute current-state actions
+    updateDisplay();         // Redraw LCD only on state/position change
 }
 ```
 
-### Sensor Polling
-- **Spray valve**: Every 50ms
-- **Flow sensor**: Every 50ms
-- **Limit switch**: Every 50ms during HOMING
-- **Motor position**: Tracked by step counter
+---
 
-### Timing
-- No blocking delays (no `delay()` in motor movement)
-- All delays use `millis()` comparison
-- 50ms polling interval provides ~20Hz responsiveness
-- Step pulses: 10ms pulse width for TMC2130
+## Output Behaviour by State
 
-## Event Handling
+### LED Indicators
 
-### Spray Valve On/Off
-- Monitored every loop
-- ON → transitions toward HOMING
-- OFF → forces return to IDLE (emergency stop)
+| State | Green | Yellow |
+|-------|-------|--------|
+| IDLE | OFF | OFF |
+| HOMING | OFF | ON |
+| PARKED | ON | OFF |
+| WAITING_SPRAY | OFF | ON |
+| SPRAY_ACTIVE | ON | OFF |
+| OSCILLATING | ON | OFF |
+| ERROR | OFF | Blink 1 Hz |
 
-### Flow Sensor On/Off
-- Monitored every loop
-- ON + Spray ON → enables spray active phase
-- OFF during cleaning → stops oscillation
+### Fan Speed
 
-### Limit Switch Press
-- Polled during HOMING state
-- Activates on LOW (connected to GND)
-- Sets position reference to 0
+| State | PWM | % |
+|-------|-----|---|
+| IDLE / HOMING / PARKED | 0 | 0 % |
+| WAITING_SPRAY | 128 | 50 % |
+| SPRAY_ACTIVE / OSCILLATING | 255 | 100 % |
 
-### Rotary Encoder (TODO)
-- A, B on GPIO 26, 27
-- Implement quadrature decoding
-- Could adjust oscillation parameters
+### Ultrasonic Relay (GPIO 4, active-low)
+
+| State | GPIO 4 | Relay |
+|-------|--------|-------|
+| IDLE → WAITING_SPRAY | HIGH | OFF |
+| SPRAY_ACTIVE / OSCILLATING | LOW | ON |
+| Return to IDLE | HIGH | OFF |
+
+---
 
 ## Safety Features
 
-1. **Motor disable on entry to IDLE**
-2. **Ultrasonic only ON during active cleaning**
-3. **Fan speed ramping** (not instant)
-4. **Spray/Flow validation** (both required for cleaning)
-5. **Timeout protection** (future: 60-minute max cleaning)
-6. **Limit switch safeguard** (prevents motor runaway)
+1. **Motor disabled at startup** — EN HIGH until HOMING begins
+2. **Limit switch debounced** — 20 ms settle time prevents bounce triggering
+3. **Two-condition spray start** — Both spray AND flow required to begin cleaning
+4. **Emergency stop** — Spray or flow loss in SPRAY_ACTIVE/OSCILLATING → immediate IDLE
+5. **Ultrasonic interlock** — Ultrasonic only ON during active cleaning states
+6. **StealthChop current limiting** — TMC2130 limits motor current via `rms_current`
+
+---
 
 ## Tuning Parameters
 
-To modify cleaning behavior, adjust in `src/main.cpp`:
+Edit constants at the top of `src/main.cpp`:
 
 ```cpp
-// Clean longer: Increase OSCILLATION_CYCLES
-const unsigned long OSCILLATION_CYCLES = 20;  // Try 30 for longer
+// Longer cleaning: increase sweeps
+const unsigned long OSCILLATION_CYCLES = 30;   // Was 20 (~80 min)
 
-// Clean faster: Decrease OSCILLATION_DELAY
-const unsigned long OSCILLATION_DELAY = 10000;  // Try 5000 for 5sec steps
+// Faster steps: decrease delay
+const unsigned long OSCILLATION_DELAY = 5000;  // Was 10000 (5 s/step → 26 min)
 
-// Wider oscillation: Increase OSCILLATION_STEPS
-const int OSCILLATION_STEPS = 16;  // Try 24 for wider motion
+// Wider oscillation: increase steps (ensure CENTER_STEPS − OSCILLATION_STEPS > 0)
+const int OSCILLATION_STEPS = 24;              // Was 16
 
-// Different park position: Adjust PARK_POSITION (in mm)
-const int PARK_POSITION = 7;  // Try 5 or 10
+// Park further from limit:
+const int PARK_MM = 10;                        // Was 7
+
+// Motor current (reduce if hot, increase if stalling):
+driver.rms_current(800);                       // Was 600 mA
 ```
 
-## Implementation Notes
-
-### Non-Blocking Design
-```cpp
-// BAD (blocking delay)
-if (spray_on) {
-    delay(10000);  // Blocks ALL input, including emergency stop
-    start_oscillation();
-}
-
-// GOOD (non-blocking)
-if (spray_on && state == SPRAY_ACTIVE) {
-    if (millis() - spray_on_time > 10000) {
-        start_oscillation();
-    }
-}
-```
-
-### Position Tracking
-- Position increments with each STEP pulse
-- Reference (0) set during HOMING
-- Allows motor position without encoder
-- Encoder (future) will add validation
-
-## Debug/Monitor
-
-Use serial monitor at 115200 baud to observe state transitions:
-```
-State: IDLE | Pos: 0 | Spray: OFF | Flow: NO
-State: HOMING | Pos: 0 | Spray: ON | Flow: NO
-State: PARKED | Pos: 7 | Spray: ON | Flow: NO
-State: WAITING_SPRAY | Pos: 7 | Spray: ON | Flow: YES
-State: SPRAY_ACTIVE | Pos: 7 | Spray: ON | Flow: YES
-State: OSCILLATING | Pos: 15 | Spray: ON | Flow: YES
-State: OSCILLATING | Pos: 16 | Spray: ON | Flow: YES
-...
-```
+---
 
 ## References
 
-- UML State Machine: https://en.wikipedia.org/wiki/UML_state_machine
-- Event-Driven Design: https://en.wikipedia.org/wiki/Event-driven_programming
+- [UML State Machine](https://en.wikipedia.org/wiki/UML_state_machine)
+- [TMCStepper Library](https://github.com/teemuatlut/TMCStepper)
+- [RP2040 Datasheet](https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf)

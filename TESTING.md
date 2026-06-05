@@ -2,452 +2,327 @@
 
 ## Pre-Hardware Testing
 
-Before connecting to actual hardware, validate the firmware compiles and core logic is sound.
-
 ### Step 1: Build Verification
 
 ```bash
-cd c:\Users\glukhovskoy\Documents\PlatformIO\Projects\Megasonic
+cd Stepper-controller
 pio run
 ```
 
-**Expected Output**:
+**Expected output (last lines):**
 ```
-Processing pico (platform: raspberrypi; board: pico; framework: arduino)
-...
 Linking .pio/build/pico/firmware.elf
 Checking size .pio/build/pico/firmware.elf
-Memory Usage [=                    ] 0.2% (FLASH)
-                [===                ] 15.4% (RAM)
+RAM:   [==        ]  15.4% (used ~41 KB of 264 KB)
+Flash: [          ]   0.2% (used ~4.3 KB of 2 MB)
+========================= [SUCCESS] ...
 ```
 
-**Success**: Exits with 0, no error messages
+**Common build failures:**
 
-**Failure**: Check compiler errors, typically:
-- Missing headers: `#include <...>`
-- Undefined functions: Forward declarations needed
-- Pin conflicts: Check duplicate GPIO assignments
+| Error | Fix |
+|-------|-----|
+| `no such file: TMCStepper.h` | Run `pio pkg install` |
+| `undeclared identifier` | Check you have the latest `src/main.cpp` |
+| Pin conflict warning | Review constants at top of `main.cpp` |
+
+---
 
 ### Step 2: Serial Monitor Startup
 
+Flash the firmware (BOOTSEL mode or `pio run --target upload`), then:
+
 ```bash
-pio run --target upload    # Or drag .uf2 to Pico
 pio device monitor --baud 115200
 ```
 
-**Expected Output** (within 1-2 seconds):
+**Expected startup output:**
 ```
 === Stepper Controller Initializing ===
 Hardware initialized
 SPI initialized: SCK=18 MOSI=19 MISO=16
 Encoder initialized: A=26 B=27
-TMC2130 driver: Configure via SPI - TODO
+TMC2130 configured: 600 mA, 16x microsteps, StealthChop
+Display initialized (ST7789V3 240x280)
 Initialization complete!
-
-State: IDLE | Pos: 0 | Spray: OFF | Flow: NO
-State: IDLE | Pos: 0 | Spray: OFF | Flow: NO
 ```
 
-**Repeating output**: Good (polling every ~50ms)
+After startup, serial output appears **only when state, position, or menu changes**
+(dirty-flag display). Trigger changes by connecting sensor pins to 3.3 V or GND.
 
-**No output**: 
-- Check USB cable and baud rate (115200)
-- Verify Pico is in bootloader mode
-- Try different COM port
+**No serial output after startup:** Normal — nothing has changed. Connect GPIO 2
+(Spray) to 3.3 V momentarily to trigger the first state transition and confirm output.
+
+---
 
 ## Hardware Integration Testing
 
-Once firmware runs, connect hardware incrementally.
+Connect hardware incrementally. Always verify the previous phase before adding more.
 
-### Test Phase 1: Power & GPIOs
+---
 
-**Equipment**: Multimeter or scope
+### Phase 1: Power & GPIO
 
-**Test Motor EN Pin**
-```
-GPIO 13 (TMC_EN) should be HIGH at startup (motor disabled)
-In HOMING state: GPIO 13 should go LOW (motor enabled)
-```
+**Equipment:** Multimeter
 
-**Check with Multimeter**:
-```bash
-# Terminal 1: Monitor state
-pio device monitor --baud 115200
+| Test | GPIO | Expected |
+|------|------|----------|
+| Motor disabled at startup | 13 (EN) | 3.3 V (HIGH) |
+| Motor enabled in HOMING | 13 (EN) | 0 V (LOW) |
+| STEP pulses in HOMING | 14 | Pulses at ~20 Hz |
+| DIR in HOMING (toward limit) | 15 | 0 V (LOW) |
 
-# Terminal 2: Simulate spray on
-# (Hold spray valve wire to 3.3V or connect sensor to GND)
+Trigger HOMING by briefly connecting GPIO 2 (Spray) to 3.3 V.
 
-# Observe: GPIO 13 should drop to ~0.1V when HOMING
-```
+---
 
-**Step Control**
-```
-GPIO 14 (STEP) should pulse every 10ms during HOMING
-GPIO 15 (DIR) should be LOW (toward limit)
-```
-
-Use oscilloscope to verify pulse pattern (optional, or just listen for motor clicks).
-
-### Test Phase 2: Sensors
+### Phase 2: Sensors
 
 **Limit Switch (GPIO 28)**
 
-Multimeter test:
 ```
-Default (switch open): GPIO 28 reads 3.3V (pulled up)
-Switch pressed: GPIO 28 reads 0V (connected to GND)
+Switch open  → GPIO 28 reads 3.3 V  (INPUT_PULLUP, switch not pressed)
+Switch closed → GPIO 28 reads 0 V   (connected to GND)
 ```
 
-Serial test:
-```bash
-# Manually close/open limit switch
-pio device monitor --baud 115200
-
-# Watch serial output:
-# State: HOMING | Pos: 0 | ...    (when limit pressed)
-# State: PARKED | Pos: 7 | ...    (after moving to park)
+Serial output when limit triggers during HOMING:
+```
+→ PARKED (moving to park position)
+State:PARKED | Pos:0 | Spray:ON | Flow:NO
+State:PARKED | Pos:1 | Spray:ON | Flow:NO
+...
+State:PARKED | Pos:7 | Spray:ON | Flow:NO
 ```
 
 **Spray Valve (GPIO 2)**
 
-Multimeter test:
 ```
-Spray OFF: GPIO 2 reads 0V
-Spray ON: GPIO 2 reads 3.3V
+Spray OFF → GPIO 2 reads 0 V
+Spray ON  → GPIO 2 reads 3.3 V
 ```
-
-Connect signal wire from spray valve controller to GPIO 2 (active HIGH).
 
 **Flow Sensor (GPIO 3)**
 
-Multimeter/logic test:
 ```
-No flow: GPIO 3 reads 0V
-Flowing: GPIO 3 reads 3.3V
-```
-
-Connect signal from flow sensor to GPIO 3.
-
-### Test Phase 3: Outputs
-
-**LEDs (GPIO 8 Green, GPIO 7 Yellow)**
-
-```
-Startup (IDLE): No LEDs on
-HOMING: Green LED on
-PARKED: Green LED on
-SPRAY_ACTIVE/OSCILLATING: Green LED on
+No flow   → GPIO 3 reads 0 V
+Flowing   → GPIO 3 reads 3.3 V
 ```
 
-Check with multimeter or visual inspection (LEDs should illuminate).
+---
 
-**Fan PWM (GPIO 12)**
+### Phase 3: Outputs
 
-Scope/PWM meter:
-```
-IDLE: 0% (0V)
-WAITING_SPRAY: 50% (2.5V average)
-SPRAY_ACTIVE/OSCILLATING: 100% (3.3V)
-```
+| Output | GPIO | Idle State | Active State | How to Check |
+|--------|------|------------|--------------|--------------|
+| Green LED | 8 | 0 V | 3.3 V | Visual / multimeter |
+| Yellow LED | 7 | 0 V | 3.3 V | Visual / multimeter |
+| Fan PWM | 12 | 0 V | PWM (avg ~2.5 V at 50 %) | Oscilloscope or PWM meter |
+| Ultrasonic relay | 4 | 3.3 V | 0 V | Multimeter |
 
-Or use oscilloscope to see PWM frequency (~1kHz typical).
+**Fan state vs PWM:**
 
-**Ultrasonic Relay (GPIO 4)**
+| State | GPIO 12 duty |
+|-------|-------------|
+| IDLE / HOMING / PARKED | 0 % |
+| WAITING_SPRAY | 50 % (PWM 128) |
+| SPRAY_ACTIVE / OSCILLATING | 100 % (3.3 V) |
 
-```
-Default (OFF): GPIO 4 reads 3.3V (high, relay inactive)
-SPRAY_ACTIVE: GPIO 4 reads 0V (low, relay activated)
-OSCILLATING: GPIO 4 reads 0V
-```
+---
 
-Connect relay trigger circuit to GPIO 4.
+### Phase 4: TMC2130 SPI Verification
 
-### Test Phase 4: SPI Communication (TMC2130)
+With TMC2130 powered (3.3 V logic, VM motor supply):
 
-**Hardware Setup**:
-- TMC2130 connected via SPI0 (CS=17, SCK=18, MOSI=19, MISO=16)
-- Power: 12-24V for motor coils, 3.3V for logic
+1. Flash firmware, open serial monitor.
+2. Check startup prints `TMC2130 configured: 600 mA, 16x microsteps, StealthChop`.
+3. Add a temporary GSTAT read to `setup()` to verify SPI communication:
 
-**Verify SPI Pins with Multimeter**:
-```
-SCK (GPIO 18): Should pulse at ~1 MHz during HOMING
-MOSI (GPIO 19): Should toggle with data
-MISO (GPIO 16): Should return data from driver
-CS (GPIO 17): Should pulse LOW when accessing driver
-```
-
-**Oscilloscope Capture** (optional):
-- SCK should show clean 1 MHz square wave
-- MOSI/MISO should show SPI data pattern
-- CS should be active (LOW) during transfers
-
-**Serial Debug** (future enhancement):
-Add debug print to `tmcWriteReg()` to log SPI operations.
-
-### Test Phase 5: State Machine Transitions
-
-**Simulate Full Cycle** (without actual motor):
-
-Terminal 1: Monitor state
-```bash
-pio device monitor --baud 115200
-```
-
-Terminal 2: Trigger events by connecting wires
-```
-1. Connect GPIO 2 (Spray) to 3.3V
-   → Watch: STATE_IDLE → STATE_HOMING
-
-2. Connect GPIO 28 (Limit) to GND momentarily
-   → Watch: STATE_HOMING → STATE_PARKED
-
-3. Connect GPIO 3 (Flow) to 3.3V
-   → Watch: STATE_PARKED → STATE_WAITING_SPRAY → STATE_SPRAY_ACTIVE
-
-4. After 2 seconds:
-   → Watch: STATE_SPRAY_ACTIVE → STATE_OSCILLATING
-
-5. Disconnect GPIO 2 (Spray OFF)
-   → Watch: STATE_OSCILLATING → STATE_IDLE
-```
-
-**Expected Full Log**:
-```
-State: IDLE | Pos: 0 | Spray: OFF | Flow: NO
-[Trigger spray on]
-State: HOMING | Pos: 0 | Spray: ON | Flow: NO
-State: HOMING | Pos: 1 | Spray: ON | Flow: NO
-State: HOMING | Pos: 2 | Spray: ON | Flow: NO
-[Trigger limit switch]
-State: PARKED | Pos: 7 | Spray: ON | Flow: NO
-[Trigger flow on]
-State: WAITING_SPRAY | Pos: 7 | Spray: ON | Flow: YES
-State: SPRAY_ACTIVE | Pos: 7 | Spray: ON | Flow: YES
-[Wait 2 seconds]
-State: OSCILLATING | Pos: 8 | Spray: ON | Flow: YES
-State: OSCILLATING | Pos: 9 | Spray: ON | Flow: YES
-State: OSCILLATING | Pos: 10 | Spray: ON | Flow: YES
-...
-[After 20 cycles or spray off]
-State: IDLE | Pos: 0 | Spray: OFF | Flow: NO
-```
-
-## Motor Mechanical Testing
-
-### Test Phase 6: Stepper Motor Behavior
-
-**Before Power**:
-1. Motor should spin freely (motor disabled, no torque)
-2. No unusual grinding sounds
-
-**After Power-Up** (firmware running):
-
-**HOMING State**:
-- Motor pulls hard toward limit switch
-- Should hear clicking (stepper pulses every ~10ms)
-- Motor accelerates as it approaches limit
-
-**At Limit Switch**:
-- Motor stops (position = 0)
-- LED indicator changes to PARKED
-
-**During OSCILLATION**:
-- Motor moves back and forth at 10-second intervals
-- Smooth, consistent motion
-- No stalls or noise changes
-
-**Speed Adjustments** (if needed):
 ```cpp
-// In src/main.cpp, modify OSCILLATION_DELAY:
-const unsigned long OSCILLATION_DELAY = 10000;  // Try 5000 for faster
-
-// Or modify step pulse width in handleState():
-// Currently: digitalWrite(TMC_STEP, LOW/HIGH) with 10ms delay
+uint32_t gstat = driver.GSTAT();
+Serial.print("GSTAT: 0x");
+Serial.println(gstat, HEX);
+// On first power-up: 0x00000001 (reset flag set — expected)
 ```
+
+If GSTAT returns `0xFFFFFFFF`: SPI not communicating — check GPIO 16/17/18/19 wiring and R_SENSE value.
+
+---
+
+### Phase 5: Full State Machine Walkthrough
+
+Use two terminals or a serial monitor while manually bridging GPIO pins:
+
+**Simulated sequence:**
+
+| Step | Action | Expected serial output |
+|------|--------|----------------------|
+| 1 | Connect GPIO 2 to 3.3 V | `→ HOMING` |
+| 2 | Connect GPIO 28 to GND briefly | `→ PARKED (moving to park position)` then position increments to 7 |
+| 3 | Connect GPIO 3 to 3.3 V | `→ SPRAY_ACTIVE` |
+| 4 | Wait ~2 s | `→ OSCILLATING` |
+| 5 | Disconnect GPIO 2 | `→ IDLE (spray or flow lost)` |
+
+**Full expected log:**
+```
+→ HOMING
+State:HOMING | Pos:0 | Spray:ON | Flow:NO
+State:HOMING | Pos:-1 | Spray:ON | Flow:NO
+...
+→ PARKED (moving to park position)
+State:PARKED | Pos:0 | Spray:ON | Flow:NO
+State:PARKED | Pos:1 | Spray:ON | Flow:NO
+...
+State:PARKED | Pos:7 | Spray:ON | Flow:NO
+→ SPRAY_ACTIVE
+State:SPRAY_ACTIVE | Pos:7 | Spray:ON | Flow:YES
+...
+State:SPRAY_ACTIVE | Pos:26 | Spray:ON | Flow:YES
+→ OSCILLATING
+State:OSCILLATING | Pos:25 | Spray:ON | Flow:YES
+...
+Sweep 1/20
+State:OSCILLATING | Pos:10 | Spray:ON | Flow:YES
+State:OSCILLATING | Pos:11 | Spray:ON | Flow:YES
+...
+Sweep 2/20
+...
+→ IDLE (spray or flow lost)
+```
+
+---
+
+### Phase 6: Motor Mechanical Testing
+
+**Before power:**
+- Motor shaft should spin freely (no current, no torque).
+
+**During HOMING:**
+- Motor steps toward limit switch, 1 step per 50 ms.
+- Should move smoothly — no grinding.
+- Limit switch stops motion; motor then steps 7 steps forward to park.
+
+**During OSCILLATING:**
+- Motor sweeps 16 steps in one direction, then 16 steps back, once per 10 s.
+- Motion is slow and quiet (StealthChop).
+- Each direction change is logged: `Sweep N/20`.
+
+**Speed adjustment:**
+```cpp
+// Faster oscillation steps (5 s instead of 10 s):
+const unsigned long OSCILLATION_DELAY = 5000;
+
+// Faster homing/parking:
+const unsigned long MOTOR_UPDATE_INTERVAL = 20;  // 50 ms default
+```
+
+---
 
 ## Integration Checklist
 
-| Component | Test | Status |
-|-----------|------|--------|
-| **Firmware** | Builds cleanly | ☐ |
-| **Serial** | Output at 115200 | ☐ |
-| **Motor EN** | Pulses LOW in HOMING | ☐ |
-| **Motor STEP** | Pulses during motion | ☐ |
-| **Motor DIR** | Set correctly | ☐ |
-| **Limit Switch** | Stops motor | ☐ |
-| **Spray Valve** | Triggers HOMING | ☐ |
-| **Flow Sensor** | Enables oscillation | ☐ |
-| **Green LED** | Lights in HOMING/PARKED | ☐ |
-| **Yellow LED** | Lights in WAITING_SPRAY | ☐ |
-| **Fan PWM** | Varies with state | ☐ |
-| **Ultrasonic** | LOW during spray | ☐ |
-| **State Machine** | All transitions work | ☐ |
-| **SPI Clock** | Runs at ~1 MHz | ☐ |
+| Item | Test | ☐ |
+|------|------|---|
+| Firmware builds without errors | `pio run` exits SUCCESS | ☐ |
+| Startup serial output matches expected | See Phase 2 | ☐ |
+| EN pin HIGH at startup | Multimeter on GPIO 13 | ☐ |
+| EN pin LOW in HOMING | Multimeter on GPIO 13 | ☐ |
+| STEP pulses during HOMING | Scope or click sounds | ☐ |
+| Limit switch stops motor | GPIO 28 to GND | ☐ |
+| Motor steps to park (pos = 7) | Serial monitor | ☐ |
+| Spray valve triggers HOMING | GPIO 2 to 3.3 V | ☐ |
+| Flow sensor enables SPRAY_ACTIVE | GPIO 3 to 3.3 V | ☐ |
+| Fan 0 % in IDLE | Multimeter GPIO 12 | ☐ |
+| Fan 50 % in WAITING_SPRAY | Multimeter GPIO 12 | ☐ |
+| Fan 100 % in OSCILLATING | Multimeter GPIO 12 | ☐ |
+| Ultrasonic LOW in OSCILLATING | Multimeter GPIO 4 | ☐ |
+| Oscillation reverses direction | Serial `Sweep N/20` | ☐ |
+| Motor returns to IDLE cleanly | Disconnect GPIO 2 | ☐ |
+| TMC2130 GSTAT readable | Add debug print | ☐ |
+
+---
 
 ## Troubleshooting by Symptom
 
-### Symptom: Motor won't move
+### Motor won't move
+1. EN pin must be LOW: `motorSetEnable(true)` called in HOMING state.
+2. VM (motor supply) connected and powered.
+3. Coil connections correct (A, A~, B, B~).
+4. `driver.toff(5)` called in `initTMC2130()` — required to activate chopper.
 
-**Check**:
-1. GPIO 13 (EN) is LOW during HOMING
-2. GPIO 14 (STEP) is pulsing
-3. GPIO 15 (DIR) is set
-4. Motor power connected
-5. Motor coil connections correct (A, A~, B, B~)
+### Stuck in HOMING
+- Limit switch not wired to GPIO 28 and GND.
+- Verify: GPIO 28 reads 0 V when switch is manually pressed.
 
-**Fix**:
-```cpp
-// Verify motor is enabled in handleState():
-if (current_state == STATE_HOMING) {
-    motorSetEnable(true);  // EN pin LOW
-    // ... pulsing logic
-}
-```
+### Stuck in PARKED
+- Both spray AND flow must be present to exit.
+- With only spray: transitions to WAITING_SPRAY (yellow LED on).
+- Add flow signal (GPIO 3 → 3.3 V) to continue.
 
-### Symptom: Stuck in HOMING state
+### Fan always off
+- Check `analogWrite(FAN_PWM, speed)` — not `digitalWrite`.
+- Verify GPIO 12 is connected to fan driver input.
 
-**Check**:
-1. Limit switch wired to GPIO 28
-2. Limit switch shows 0V when pressed (multimeter)
-3. Motor is moving toward limit
+### Ultrasonic always on or off
+- `setUltrasonic(true)` drives GPIO 4 LOW (relay ON).
+- `setUltrasonic(false)` drives GPIO 4 HIGH (relay OFF).
+- Verify relay module polarity.
 
-**Fix**:
-```cpp
-// In readSensors(), verify:
-limit_switch = (digitalRead(LIMIT_SWITCH) == LOW);
-```
+### TMC2130 not responding (GSTAT = 0xFFFFFFFF)
+- Check GPIO 16/17/18/19 wiring.
+- Verify 3.3 V on VCC_IO.
+- Confirm `R_SENSE` matches your board (default 0.11 Ω).
 
-### Symptom: LCD doesn't show anything
+### Display flickering
+- Should only update on state/position changes.
+- If flickering persists, verify `updateDisplay()` dirty-flag logic is in the current `main.cpp`.
 
-**Check**:
-1. CS, DC, RST pins correct (9, 10, 11)
-2. SPI SCK/MOSI running (scope)
-3. LCD powered at 3.3V
-4. Initialization code in setup() calls:
-   - `initSPI()`
-   - `updateDisplay()` in loop
+### Oscillation goes only one direction
+- Verify `oscillationDir` flips in `handleState() STATE_OSCILLATING`.
+- Ensure you have the latest `main.cpp` (this was a bug in earlier versions).
 
-**Current**: updateDisplay() only outputs to Serial
-**Future**: Implement Adafruit_ST7789 integration
-
-### Symptom: Fan always on or always off
-
-**Check**:
-1. Fan PWM connected to GPIO 12
-2. State machine sets fan speed:
-   ```cpp
-   case STATE_WAITING_SPRAY:
-       setFan(128);  // 50%
-       break;
-   ```
-
-**Fix**:
-```cpp
-// Verify PWM is analog write, not digital:
-analogWrite(FAN_PWM, speed);  // Not digitalWrite
-```
-
-### Symptom: Encoder not responding
-
-**Current**: Encoder input implemented as TODO placeholder
-- `readEncoder()` returns 0 always
-
-**Future**: Implement quadrature decoding
-- Read GPIO 26 (A) and GPIO 27 (B)
-- Detect transitions to determine rotation direction
-- Update position or menu selection
+---
 
 ## Performance Validation
 
-### Memory Usage
-
 ```bash
 pio run
-# Output shows:
-# FLASH: X% of 2MB (should be < 50% for room)
-# RAM:   X% of 264KB (should be < 50% for room)
+# Check: Flash < 5 %, RAM < 20 % — well within headroom for future features
 ```
 
-**Current**: 0.2% FLASH, 15.4% RAM → Good headroom
+**Oscillation timing** (verify with stopwatch):
+- Each step: 10 s ± 1 s
+- Each 16-step sweep: ~160 s ≈ 2.7 min
+- Full 20-sweep cycle: ~53 min
 
-### CPU Load
+---
 
-Monitor for stalls or lag:
-- Serial output should update every 50ms constantly
-- No random delays or stuttering
-- Responsive to sensor changes
+## Appendix: Quick GPIO Test Snippets
 
-### Timing Accuracy
+Add these temporarily to `setup()` and remove before production:
 
-Compare oscillation with stopwatch:
-```
-Expected: 10 seconds per step
-Actual: Measure with stopwatch during OSCILLATING state
-```
-
-Should be within ±10% (9-11 seconds per step).
-
-## Final Sign-Off
-
-After all tests pass:
-
-1. ✅ Firmware compiles, no warnings
-2. ✅ All GPIO states correct
-3. ✅ All sensors triggering properly
-4. ✅ Motor motion smooth and controlled
-5. ✅ State machine transitions work
-6. ✅ LEDs indicate state correctly
-7. ✅ PWM outputs have correct duty cycles
-8. ✅ Serial output shows real-time updates
-9. ✅ No runtime errors or crashes
-
-**Next Steps**:
-- Implement remaining TODO features (TMC2130 config, encoder, LCD)
-- Calibrate motion parameters for specific application
-- Create production firmware release
-- Document any hardware modifications or customizations
-
-## Appendix: Test Code Snippets
-
-### Quick GPIO Test
 ```cpp
-// Add to setup() to test GPIO toggling
-void testGPIO() {
-    pinMode(LED_GREEN, OUTPUT);
-    pinMode(LED_YELLOW, OUTPUT);
+// Blink both LEDs 5× to confirm GPIO outputs
+void testLEDs() {
     for (int i = 0; i < 5; i++) {
-        digitalWrite(LED_GREEN, HIGH);
-        delay(500);
+        digitalWrite(LED_GREEN, HIGH); delay(300);
         digitalWrite(LED_GREEN, LOW);
-        digitalWrite(LED_YELLOW, HIGH);
-        delay(500);
+        digitalWrite(LED_YELLOW, HIGH); delay(300);
         digitalWrite(LED_YELLOW, LOW);
     }
 }
-```
 
-### Quick SPI Test
-```cpp
-// Test SPI communication (basic)
-void testSPI() {
-    SPI.begin();
-    digitalWrite(TMC_CS, LOW);
-    uint8_t response = SPI.transfer(0x01);  // Read GSTAT
-    digitalWrite(TMC_CS, HIGH);
-    Serial.print("SPI Response: 0x");
-    Serial.println(response, HEX);
-}
-```
-
-### Quick PWM Test
-```cpp
-// Test PWM on fan pin
-void testPWM() {
-    for (int duty = 0; duty <= 255; duty += 25) {
-        analogWrite(FAN_PWM, duty);
-        Serial.print("PWM: ");
-        Serial.println(duty);
-        delay(1000);
+// Ramp fan PWM 0→100 %
+void testFan() {
+    for (int d = 0; d <= 255; d += 25) {
+        analogWrite(FAN_PWM, d);
+        Serial.print("Fan PWM: "); Serial.println(d);
+        delay(500);
     }
+    analogWrite(FAN_PWM, 0);
+}
+
+// Read TMC2130 GSTAT to verify SPI
+void testTMCSPI() {
+    uint32_t gstat = driver.GSTAT();
+    Serial.print("GSTAT: 0x"); Serial.println(gstat, HEX);
 }
 ```
