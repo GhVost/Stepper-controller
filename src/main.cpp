@@ -14,14 +14,18 @@ const int TMC_STEP = 14;
 const int TMC_DIR  = 15;
 const int TMC_EN   = 13;
 
-// SPI LCD — CS/DC/RST separate; SCK/MOSI shared with TMC2130 on SPI0
+// SPI LCD — CS/DC/RST/BL separate; SCK/MOSI shared with TMC2130 on SPI0
+// Module: GMT147SPI 1.47" 172x320 ST7789
+// Board labels: SCL=SCK, SDA=MOSI, RES=RST, BL=backlight
 const int LCD_CS  = 9;
 const int LCD_DC  = 10;
 const int LCD_RST = 11;
+const int LCD_BL  = 20;  // Backlight — HIGH = on. Tie to 3V3 if not needed.
 
-// Rotary encoder
-const int ENC_A = 26;
-const int ENC_B = 27;
+// Rotary encoder (KY-040 type): CLK=ENC_A, DT=ENC_B, SW=ENC_SW
+const int ENC_A  = 26;
+const int ENC_B  = 27;
+const int ENC_SW = 22;  // Push-button (INPUT_PULLUP, LOW when pressed)
 
 // Sensors & outputs
 const int LIMIT_SWITCH = 28;   // LOW when pressed (INPUT_PULLUP)
@@ -171,8 +175,10 @@ void initHardware() {
     pinMode(LED_YELLOW, OUTPUT);
     pinMode(FAN_PWM,    OUTPUT);
     pinMode(ULTRASONIC, OUTPUT);
-    pinMode(LCD_CS,     OUTPUT);
+    pinMode(LCD_CS, OUTPUT);
     digitalWrite(LCD_CS, HIGH);
+    pinMode(LCD_BL, OUTPUT);
+    digitalWrite(LCD_BL, HIGH);  // Backlight on
 
     digitalWrite(LED_GREEN,  LOW);
     digitalWrite(LED_YELLOW, LOW);
@@ -193,13 +199,16 @@ void initSPI() {
 }
 
 void initEncoder() {
-    // Pull-ups required for open-collector encoder outputs
-    pinMode(ENC_A, INPUT_PULLUP);
-    pinMode(ENC_B, INPUT_PULLUP);
-    Serial.print("Encoder initialized: A=");
+    // Pull-ups required for open-collector encoder outputs and push-button
+    pinMode(ENC_A,  INPUT_PULLUP);
+    pinMode(ENC_B,  INPUT_PULLUP);
+    pinMode(ENC_SW, INPUT_PULLUP);
+    Serial.print("Encoder initialized: CLK=");
     Serial.print(ENC_A);
-    Serial.print(" B=");
-    Serial.println(ENC_B);
+    Serial.print(" DT=");
+    Serial.print(ENC_B);
+    Serial.print(" SW=");
+    Serial.println(ENC_SW);
 }
 
 void initTMC2130() {
@@ -213,11 +222,11 @@ void initTMC2130() {
 }
 
 void initDisplay() {
-    tft.init(240, 280);
+    tft.init(172, 320);  // GMT147SPI 1.47" 172x320
     tft.setRotation(1);
     tft.fillScreen(ST77XX_BLACK);
     tft.setTextWrap(false);
-    Serial.println("Display initialized (ST7789V3 240x280)");
+    Serial.println("Display initialized (GMT147SPI 1.47\" 172x320)");
 }
 
 // ============= SENSOR READING =============

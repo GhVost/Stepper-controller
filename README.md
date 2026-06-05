@@ -6,9 +6,8 @@ RP2040-based stepper motor controller featuring TMC2130 driver, SPI LCD display,
 
 - **RP2040 Microcontroller** – Dual-core ARM, 133 MHz, 264 KB RAM
 - **TMC2130 Stepper Driver** – SPI-controlled stepper with current limiting and stall detection
- - **SPI LCD Display** – ST7789V3 SPI 1.69" (240x280) recommended.
-	 Product example: https://de.aliexpress.com/item/1005010739017597.html
-- **Rotary Encoder** – Quadrature input for menu navigation
+- **SPI LCD Display** – GMT147SPI 1.47" SPI 172×320 (ST7789 controller)
+- **Rotary Encoder** – Quadrature input + push-button for menu navigation
 - **Sensor Integration** – Limit switch, spray valve, flow sensor
 - **Non-Blocking State Machine** – Smooth operation with millisecond-based timing
 - **Safety Features** – Motor enable/disable, ultrasonic remote control, fan speed PWM
@@ -73,20 +72,22 @@ See [STATE_MACHINE.md](STATE_MACHINE.md) for detailed flow diagram.
 | DIR | 15   | Direction control |
 | EN  | 13   | Enable (LOW = active) |
 
-### LCD Display (SPI)
-| Pin | GPIO | Function |
-|-----|------|----------|
-| CS  | 9    | Chip select |
-| DC  | 10   | Data/Command |
-| RST | 11   | Reset |
-| SCK | 18   | Shared SPI clock |
-| MOSI| 19   | Shared SPI data |
+### LCD Display — GMT147SPI 1.47" 172×320 (SPI)
+| Board Label | GPIO | Function |
+|-------------|------|----------|
+| CS          | 9    | Chip select |
+| DC          | 10   | Data/Command |
+| RES         | 11   | Reset |
+| SCL         | 18   | Shared SPI clock |
+| SDA         | 19   | Shared SPI data |
+| BL          | 20   | Backlight (HIGH = on) |
 
-### Rotary Encoder
-| Pin | GPIO | Function |
-|-----|------|----------|
-| A   | 26   | Quadrature A |
-| B   | 27   | Quadrature B |
+### Rotary Encoder (KY-040)
+| Board Label | GPIO | Function |
+|-------------|------|----------|
+| CLK         | 26   | Quadrature A |
+| DT          | 27   | Quadrature B |
+| SW          | 22   | Push-button (LOW when pressed) |
 
 ### Sensors & Outputs
 | Pin | GPIO | Function |

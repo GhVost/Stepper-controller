@@ -39,21 +39,24 @@ libraries) to switch SPI mode between devices:
 
 ## Wiring Diagrams
 
-### TMC2130 Stepper Driver
+### TMC2130 Stepper Driver (BigTreeTech V1.1)
+
+Board silkscreen labels (right side): EN, SDI, SCK, CSN, SDO, NC, STP, DIR  
+Board silkscreen labels (left side): VM, GND, 2B, 1B, 1A, 2A, VCC, GND
 
 ```
-RP2040 Pico                TMC2130
-─────────────────          ────────────────
-GPIO 17 ────────── CS      (Chip Select)
+RP2040 Pico                BTT TMC2130 V1.1
+─────────────────          ────────────────────────────────
+GPIO 17 ────────── CSN     (Chip Select — active LOW)
 GPIO 18 ────────── SCK     (SPI Clock)
-GPIO 19 ────────── DI      (SPI Data In from Pico)
-GPIO 16 ────────── DO      (SPI Data Out to Pico)
-GPIO 14 ────────── STEP    (Step pulse)
+GPIO 19 ────────── SDI     (SPI Data In: Pico MOSI → driver)
+GPIO 16 ────────── SDO     (SPI Data Out: driver → Pico MISO)
+GPIO 14 ────────── STP     (Step pulse)
 GPIO 15 ────────── DIR     (Direction)
 GPIO 13 ────────── EN      (Enable — LOW = active)
 GND     ────────── GND
-3V3     ────────── VCC_IO  (Logic supply)
-12–24 V ────────── VM      (Motor supply — separate)
+3V3     ────────── VCC     (Logic supply)
+12–24 V ────────── VM      (Motor supply — separate power rail)
 ```
 
 **Sense resistor (R_SENSE):** Most TMC2130 carrier boards (BigTreeTech, FYSETC)
@@ -70,40 +73,63 @@ TMC2130 B~ → NEMA17 Coil 2−
 
 ---
 
-### LCD Display (ST7789V3 — 1.69" 240×280)
+### LCD Display (GMT147SPI — 1.47" 172×320 ST7789)
 
-This project targets the 1.69" ST7789V3 SPI display (240×280, rounded corners).
-Use the `Adafruit_ST7789` library and initialise with `tft.init(240, 280)`.
+Module: **GMT147SPI** 1.47" SPI display, ST7789 controller, 172×320 pixels.
+Use the `Adafruit_ST7789` library and initialise with `tft.init(172, 320)`.
 Power the module from 3.3 V only.
+
+Board pin labels and their logical meaning:
+
+| Board Label | Function          |
+|-------------|-------------------|
+| SCL         | SPI Clock (SCK)   |
+| SDA         | SPI Data (MOSI)   |
+| RES         | Reset             |
+| DC          | Data/Command      |
+| CS          | Chip Select       |
+| BL          | Backlight enable  |
+| VDD         | 3.3 V supply      |
+| GND         | Ground            |
 
 ```
 RP2040 Pico         Display Module
 ───────────         ──────────────
 GPIO 9  ────────── CS   (Chip Select)
 GPIO 10 ────────── DC   (Data/Command)
-GPIO 11 ────────── RST  (Reset)
-GPIO 18 ────────── SCK  (SPI Clock — shared with TMC2130)
+GPIO 11 ────────── RES  (Reset)
+GPIO 18 ────────── SCL  (SPI Clock — shared with TMC2130)
 GPIO 19 ────────── SDA  (SPI Data  — shared with TMC2130)
-3V3     ────────── VCC
+GPIO 20 ────────── BL   (Backlight — HIGH = on)
+3V3     ────────── VDD
 GND     ────────── GND
 ```
 
-> Do not connect the display VCC to 5 V — the module is 3.3 V only.
+> Do not connect the display VDD to 5 V — the module is 3.3 V only.
+> BL can also be tied directly to 3V3 for always-on backlight (omit GPIO 20 connection).
 
 ---
 
-### Rotary Encoder
+### Rotary Encoder (KY-040 type)
 
-Encoder outputs must be open-collector or push-pull. The firmware enables
-internal pull-ups on both encoder pins, so no external resistors are needed.
+All encoder pins use internal pull-ups — no external resistors needed.
+
+| Board Label | Function            |
+|-------------|---------------------|
+| CLK         | Quadrature A (ENC_A)|
+| DT          | Quadrature B (ENC_B)|
+| SW          | Push-button (ENC_SW)|
+| +           | 3.3 V supply        |
+| GND         | Ground              |
 
 ```
 Encoder             RP2040 Pico
 ───────             ───────────
-A (Phase 1) ─────── GPIO 26  (INPUT_PULLUP)
-B (Phase 2) ─────── GPIO 27  (INPUT_PULLUP)
-GND         ─────── GND
-VCC (opt)   ─────── 3V3
+CLK (Phase A) ───── GPIO 26  (INPUT_PULLUP)
+DT  (Phase B) ───── GPIO 27  (INPUT_PULLUP)
+SW  (Button)  ───── GPIO 22  (INPUT_PULLUP — LOW when pressed)
++             ───── 3V3
+GND           ───── GND
 ```
 
 ---
@@ -190,7 +216,7 @@ STEPS_PER_MM = (200 × 16) / 2 = 1600
 | Motor jitters or stalls | Wrong `rms_current` | Reduce or increase in `initTMC2130()` |
 | Motor won't move | EN pin not going LOW | Check `motorSetEnable(true)` is called |
 | SPI not working | Pin mismatch | Verify GPIO 16/18/19 match SPI0 defaults |
-| LCD blank | Wrong CS/DC/RST | Check GPIO 9, 10, 11 |
+| LCD blank | Wrong CS/DC/RST | Check GPIO 9, 10, 11; also verify BL (GPIO 20) is HIGH |
 | Sensor always HIGH | Floating input | Verify external pull-down or signal source |
 | Encoder not responding | No pull-up | Already fixed: firmware uses `INPUT_PULLUP` |
 | Motor runs hot | Current too high | Lower `rms_current` in `initTMC2130()` |
