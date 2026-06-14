@@ -211,8 +211,10 @@ Both run every Core 0 loop iteration.
 **`updateDisplay()`** — snapshots volatile state once per call and redraws the LCD +
 echoes to serial only on change. Dispatches to `drawMenu()` / `drawSettings()` /
 `drawSetup()` / `drawAbout()` and the status column.
-**`drawArmAnim()`** — top-down sketch under the basic menu: wafer circle, park tick, live
-arm arrow, and a blinking lightning sign while the generator is on.
+**`drawArmAnim()`** — top-down sketch under the basic menu and the Sweep Settings screen:
+wafer circle, park tick, live arm arrow, and a blinking lightning sign while the generator
+is on. The side status column shows the live state/angle plus the sweep config summary
+(angle, time, wafer, type, profile); the run/park hold indicator was removed.
 
 ---
 

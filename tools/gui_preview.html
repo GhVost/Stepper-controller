@@ -30,13 +30,11 @@
 </head>
 <body>
 <div class="wrap">
-  <h1><span>MEGASONIC</span> &mdash; LCD GUI preview (320&times;172, ST7789)</h1>
+  <h1><span>MEGASONIC CLEANER</span> &mdash; LCD GUI preview (320&times;172, ST7789)</h1>
 
   <div class="screens">
-    <div class="lcd"><div class="cap">SETTINGS — change a value…</div>
+    <div class="lcd"><div class="cap">SWEEP SETTINGS — change a value, watch the arm react</div>
       <div class="bezel"><canvas id="lcdS"></canvas></div></div>
-    <div class="lcd"><div class="cap">MAIN MENU — …see the arm react</div>
-      <div class="bezel"><canvas id="lcdM"></canvas></div></div>
   </div>
 
   <div class="controls">
@@ -61,22 +59,24 @@
   </div>
 
   <div class="hint">
-    Both panels render pixel-for-pixel from the firmware draw code. The <b>Settings</b> panel
-    edits a value while the <b>Main menu</b> panel shows the live effect: wafer circle size
-    (sized to the 150&nbsp;mm max and cropped top/bottom), sweep extent (Back-Ctr vs Back-Frt),
-    the park tick, and the red arm arrow. The generator runs <b>only over the wafer</b> — a
-    pulsing ⚡ appears next to the arrow while it is energised. Use <b>Tour shows</b> to pick the
-    demonstrated features and <b>Play speed</b> to slow down or speed up the tour. Each feature now
-    repeats several times before the tour moves on. To record a GIF, capture both panels (Windows
-    <code>Win+Alt+R</code> or ScreenToGif). The hidden hardware <i>Setup</i> and <i>About</i> screens are omitted.
+    The panel renders pixel-for-pixel from the firmware draw code: the <b>SWEEP SETTINGS</b>
+    screen with the arm animation underneath and the live status bar on the right. Editing a
+    value shows the effect immediately — wafer circle size (sized to the 150&nbsp;mm max and
+    cropped top/bottom), sweep extent (Edge↔(•) vs Edge↔Edge), the park tick, and the red arm
+    arrow. The arm speed follows the <b>cycle time</b> and <b>speed profile</b>; the generator
+    runs <b>only over the wafer</b>, where a pulsing ⚡ appears next to the arrow. Use
+    <b>Tour shows</b> to pick the demonstrated features and <b>Play speed</b> to scale the tour;
+    each feature repeats several times before moving on. To record a GIF, capture the panel
+    (Windows <code>Win+Alt+R</code> or ScreenToGif). The hidden hardware <i>Setup</i> and
+    <i>About</i> screens are omitted.
   </div>
 </div>
 
 <script>
 // ===================== device geometry / palette =====================
 const W = 320, H = 172, SS = 2;
-const cS = document.getElementById('lcdS'), cM = document.getElementById('lcdM');
-cS.width = W*SS; cS.height = H*SS; cM.width = W*SS; cM.height = H*SS;
+const cS = document.getElementById('lcdS');
+cS.width = W*SS; cS.height = H*SS;
 let ctx = cS.getContext('2d');
 function use(c){ ctx = c.getContext('2d'); }
 
@@ -112,7 +112,6 @@ const STATUS_X=232, STATUS_W=88, CONTENT_W=230;
 const ANIM_X=4, ANIM_W=224, ANIM_Y=86, ANIM_H=80;
 const SAMPLE=[10,20,50,75,100,150];
 const SENSORS=false;                  // SENSOR_INPUTS_ENABLED default (Setup is hidden)
-const menuItems=["START/STOP","Settings"];
 
 const S = {
   running:false, state:'IDLE', hold:true, angleX10:70,
@@ -131,19 +130,6 @@ function armOverWafer(){ return Math.abs(S.angleX10 - S.center) <= calcSweepX10(
 function genOn(){ return S.running && armOverWafer(); }
 
 // ===================== screen renderers =====================
-function drawIcon(id,x,y,c){
-  if(id===0){ fillTri(x,y+1, x,y+17, x+14,y+9, c); }
-  else if(id===1){
-    rect(x,y+2,16,2,c); rect(x,y+8,16,2,c); rect(x,y+14,16,2,c);
-    fillCircle(x+4,y+3,3,c); fillCircle(x+12,y+9,3,c); fillCircle(x+8,y+15,3,c);
-  }
-}
-function menuRow(i,y,sel){
-  const bg=sel?C.blue:C.black, ic=sel?C.white:C.cyan;
-  rect(6,y-2,CONTENT_W-12,28,bg);
-  if(i===0 && S.running) rect(9,y+3,14,14,ic); else drawIcon(i,8,y+2,ic);
-  text(36,y,menuItems[i],3,C.white);
-}
 function armAnim(){
   const axisY=ANIM_Y+ANIM_H/2, headH=7, tipY=axisY, yTopArm=ANIM_Y;
   const toRad=Math.PI/180, cDeg=S.center/10, pDeg=S.park/10;
@@ -179,82 +165,90 @@ function armAnim(){
 function statusColumn(){
   const x=STATUS_X+6;
   rect(STATUS_X,0,STATUS_W,H,C.black); vline(STATUS_X,0,H,C.grey70);
-  text(x,5,"STATUS",1,C.cyan);
-  if(!SENSORS) text(x,15,"DEBUG ON",1,C.magenta);
-  text(x,24,"STATE",1,C.white); text(x,64,"ANGLE",1,C.white);
-  text(x,106,"SPRAY",1,C.white); text(x,126,"FLOW",1,C.white); text(x,146,"HOLD",1,C.white);
-  text(x,36,S.state,2,C.yellow);
+  text(x,4,"STATUS",1,C.cyan);
+  if(!SENSORS) text(x,14,"DEBUG ON",1,C.magenta);
+  // live state + arm angle
+  text(x,24,"STATE",1,C.white); text(x,34,S.state,2,C.yellow);
+  text(x,54,"ANGLE",1,C.white);
   const ang=degStr(S.angleX10);
-  text(x,76,ang,2,C.yellow); text(x+ang.length*12,76," deg",1,C.yellow);
-  text(x+38,106,SENSORS?"OFF":"DIS",1,SENSORS?C.red:C.magenta);
-  text(x+38,126,SENSORS?"NO":"DIS",1,SENSORS?C.red:C.magenta);
-  text(x+38,146,S.hold?"PARK":"RUN",1,S.hold?C.green:C.white);
-}
-function drawMenu(){
-  rect(0,0,W,H,C.black);
-  const w=C.wave;
-  line(8,12,11,6,w); line(11,6,14,12,w); line(14,12,17,6,w);
-  line(17,6,20,12,w); line(20,12,23,6,w); line(23,6,26,12,w);
-  text(32,2,"MEGASONIC",2,w);
-  menuRow(0,22,false); menuRow(1,50,false);
-  armAnim();
-  statusColumn();
+  text(x,64,ang,2,C.yellow); text(x+ang.length*12,64,"deg",1,C.yellow);
+  // sweep config summary
+  text(x,86,"SWEEP",1,C.cyan);
+  text(x,96,degStr(travelSweepX10())+"deg",1,C.yellow);
+  text(x,106,(S.sweepTimeMs/1000).toFixed(1)+"s",1,C.white);
+  text(x,116,waferMm()+"mm",1,C.white);
+  text(x,126,(S.sweepType===0?"Edge↔(•)":"Edge↔Edge"),1,C.white);
+  text(x,136,(S.profile===0?"Linear":S.profile===1?"Harm":"InvDist"),1,C.white);
+  // sensors
+  text(x,148,"SPRAY",1,C.white); text(x+38,148,SENSORS?"OFF":"DIS",1,SENSORS?C.red:C.magenta);
+  text(x,158,"FLOW",1,C.white);  text(x+38,158,SENSORS?"NO":"DIS",1,SENSORS?C.red:C.magenta);
 }
 function settingsRow(i,y,sel,edit){
-  const labels=["Time   ","Wafer  ","Path   ","Profile","Angle  ","< Back "];
+  const labels=["Time","Wafer","Sweep type","Speed profile","< Back"];
   const bg=edit?C.editgreen:(sel?C.blue:C.black);
-  rect(0,y-2,CONTENT_W,22,bg);
+  rect(0,y-2,CONTENT_W,12,bg);
   let s=labels[i];
-  if(i<5){
+  if(i<4){
     s+=": ";
-    if(i===0) s+=(S.sweepTimeMs/1000).toFixed(1)+"s   ";
-    else if(i===1) s+=waferMm()+"mm  ";
-    else if(i===2) s+=(S.sweepType===0?"Back-Ctr":"Back-Frt");
-    else if(i===3) s+=(S.profile===0?"Linear ":S.profile===1?"Harm   ":"InvDist");
-    else if(i===4) s+=degStr(travelSweepX10())+"deg ";
+    if(i===0) s+=(S.sweepTimeMs/1000).toFixed(1)+"s";
+    else if(i===1) s+=waferMm()+"mm";
+    else if(i===2) s+=(S.sweepType===0?"Edge↔(•)":"Edge↔Edge");
+    else if(i===3) s+=(S.profile===0?"Linear":S.profile===1?"Harm":"InvDist");
   }
-  text(6,y,s,2,C.white);
+  text(6,y,s,1,C.white);
 }
 function drawSettings(){
   rect(0,0,W,H,C.black);
-  text(6,3,"SETTINGS",2,C.cyan);
-  for(let i=0;i<6;i++)
-    settingsRow(i,22+i*24, i===S.settingsIndex, S.editing && i===S.settingsIndex && i<5 && i!==4);
+  text(6,3,"SWEEP SETTINGS",2,C.cyan);
+  for(let i=0;i<5;i++)
+    settingsRow(i,22+i*12, i===S.settingsIndex, S.editing && i===S.settingsIndex && i<4);
+  armAnim();
   statusColumn();
 }
-function render(){ use(cS); drawSettings(); use(cM); drawMenu(); }
+function render(){ use(cS); drawSettings(); }
 
 // ===================== auto tour (checkbox-driven feature segments) =====================
 // `vt` is a virtual clock advanced by (real dt × speed); the tour and the lightning
 // blink both run off it, so the Play-speed slider scales the whole demonstration.
-let auto=true, speed=1, vt=0, lastFrame=performance.now();
+let auto=true, speed=1, vt=0, armPhase=0, lastFrame=performance.now();
 function sweepBounds(){
   const cDeg=S.center/10, half=calcSweepX10()/20;
   return { left:cDeg-half, fwd:(S.sweepType===0?cDeg:cDeg+half) };
 }
-const triWave=(t,p)=>{ const k=(t/p)%1; return k<0.5?k*2:2-2*k; };
-function sweepArm(lt){ const b=sweepBounds(); S.angleX10=Math.round((b.left+(b.fwd-b.left)*triWave(lt,2200))*10);
-  S.running=true; S.state='SPRAY'; S.hold=false; }
+// Position fraction (0..1) along one sweep leg for the selected speed profile.
+function profileEase(u){
+  if(S.profile===1) return 0.5-0.5*Math.cos(Math.PI*u);   // harmonic: ease in/out at the turns
+  if(S.profile===2) return u*u*u*(u*(u*6-15)+10);         // inverse-distance: stronger edge dwell
+  return u;                                               // linear: constant speed
+}
+// Arm angle from the continuous cycle phase (0..1): forward leg, then return leg. The full
+// back-forward-back cycle spans sweepTimeMs, so changing the time or profile changes the speed.
+function sweepAngleFromPhase(){
+  const b=sweepBounds();
+  let e = armPhase<0.5 ? profileEase(armPhase/0.5) : 1-profileEase((armPhase-0.5)/0.5);
+  return Math.round((b.left+(b.fwd-b.left)*e)*10);
+}
+function sweepArm(){ S.running=true; S.state='SPRAY'; S.hold=false; }
 
 // How many times each cycling feature repeats before the tour moves on. The one-shot
 // "Parking" demo (reps:1) plays once; the rest cycle their values REPS times.
 const REPS=3;
-// Each feature -> one tour segment; both panels render every frame.
+// Each feature -> one tour segment; the panel renders every frame.
 // `dur` is the length of one repetition; the segment runs `reps` of them back to back.
 const FEATURES=[
-  {key:'parking', label:'Parking',    dur:3800, reps:1, row:5, run:(lt,f)=>{
+  {key:'parking', label:'Parking',       dur:3800, reps:1, sweeps:false, row:5, run:(lt,f)=>{
       const b=sweepBounds(), k=Math.min(1,f/0.5);
       S.angleX10=Math.round((b.left+(S.park/10-b.left)*k)*10);
       if(f<0.5){ S.running=true; S.state='HOME'; S.hold=false; }
       else     { S.running=false; S.state='PARK'; S.hold=true; } }},
-  {key:'time',    label:'Sweep time', dur:3600, row:0, run:(lt)=>{
-      S.sweepTimeMs=[2000,4000,8000,15000][Math.floor(lt/850)%4]; sweepArm(lt); }},
-  {key:'wafer',   label:'Wafer size', dur:5400, row:1, run:(lt)=>{
-      S.sampleIndex=[2,3,4,5][Math.floor(lt/1300)%4]; sweepArm(lt); }},
-  {key:'path',    label:'Path',       dur:4200, row:2, run:(lt)=>{
-      S.sweepType=(lt%2400<1200)?1:0; sweepArm(lt); }},
-  {key:'profile', label:'Profile',    dur:3600, row:3, run:(lt)=>{
-      S.profile=Math.floor(lt/1000)%3; sweepArm(lt); }},
+  {key:'time',    label:'Sweep time',     dur:3600, row:0, run:(lt)=>{
+      S.sweepTimeMs=[2000,4000,8000,15000][Math.floor(lt/850)%4]; sweepArm(); }},
+  {key:'wafer',   label:'Wafer size',     dur:5400, row:1, run:(lt)=>{
+      S.sampleIndex=[2,3,4,5][Math.floor(lt/1300)%4]; sweepArm(); }},
+  {key:'path',    label:'Sweep type',     dur:4200, row:2, run:(lt)=>{
+      S.sweepType=(lt%2400<1200)?1:0; sweepArm(); }},
+  {key:'profile', label:'Speed profile',  dur:3600, row:3, run:(lt)=>{
+      S.profile=Math.floor(lt/1000)%3; sweepArm(); }},
 ].map(f=>({...f, dur:f.dur*(f.reps||REPS)}));
 const enabled={}; FEATURES.forEach(f=>enabled[f.key]=true);
 
@@ -262,10 +256,16 @@ let tour=[], tourTotal=0;
 function buildTour(){ tour=FEATURES.filter(f=>enabled[f.key]); tourTotal=tour.reduce((a,s)=>a+s.dur,0); vt=0; }
 
 function tick(now){
-  vt += (now-lastFrame)*speed; lastFrame=now;
+  const dtv=(now-lastFrame)*speed; vt+=dtv; lastFrame=now;
   if(auto && tour.length){
-    let t=vt%tourTotal, acc=0;
-    for(const s of tour){ if(t<acc+s.dur){ S.settingsIndex=s.row; S.editing=(s.row<5); s.run(t-acc,(t-acc)/s.dur); break; } acc+=s.dur; }
+    let t=vt%tourTotal, acc=0, active=null;
+    for(const s of tour){ if(t<acc+s.dur){ active=s; S.settingsIndex=s.row; S.editing=(s.row<4); s.run(t-acc,(t-acc)/s.dur); break; } acc+=s.dur; }
+    // Sweeping features drive the arm off a continuous cycle phase, so speed tracks the
+    // current cycle time and profile (the play-speed slider scales it via dtv).
+    if(active && active.sweeps!==false){
+      armPhase=(armPhase + dtv/Math.max(S.sweepTimeMs,1))%1;
+      S.angleX10=sweepAngleFromPhase();
+    }
     syncSlider();
   }
   render();

@@ -63,7 +63,8 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 - **Rotate** = navigate / change value, **Click** = select / edit / confirm.
 - **Basic menu**: START/STOP, Settings (+ arm-position animation).
 - **Advanced menu** (Setup, About): short-click then long-press to toggle.
-- **Settings** (sweep): Time, Wafer, Path, Profile, Angle (read-only), < Back.
+- **Sweep Settings**: Time, Wafer, Sweep type, Speed profile, < Back — compact rows with
+  the arm animation underneath. The sweep angle + parameters appear in the status bar.
 - **Setup** (hardware): Park, Centre (live jog), Arm, Cycles, Current, Mstep, Invert,
   Debug (ON = ignore spray/flow, OFF = use safety inputs), < Back.
 - Edits persist to RP2040 flash EEPROM emulation and are reloaded at boot.
@@ -151,7 +152,8 @@ OSCILLATION_CYCLES = 4      // full cycles to run (0 = forever)
 SPRAY_ACTIVE_WAIT = 2000    // ms settle before oscillation
 ```
 
-Sweep half-width = `asin((waferØ/2)/armLength)`; Back-Centre = half, Back-Front = full.
+Sweep half-width = `asin((waferØ/2)/armLength)`; `Edge↔(•)` = half (edge→centre),
+`Edge↔Edge` = full (edge→edge).
 
 ---
 

@@ -177,7 +177,7 @@ Two hold-current modes reduce heat and holding torque when idle:
 - **Run hold** (`DRIVER_RUN_HOLD_MULTIPLIER`, 25 %) — while moving / staging.
 - **Park hold** (`DRIVER_PARK_HOLD_MULTIPLIER`, 10 %) — once settled at the park angle.
 
-The status column shows `RUN` / `PARK` for the active hold mode.
+The active hold mode (run/park) is reported over the serial log.
 
 ---
 

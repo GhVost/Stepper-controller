@@ -233,8 +233,9 @@ int menuDrawState = -1;  // -1 = full redraw needed
 bool          pendingShortClick     = false;
 unsigned long shortClickReleaseTime = 0;
 
-// Settings screen (sweep): Sweep time, wafer diameter, path, profile, calculated angle, < Back
-const int SETTINGS_COUNT = 6;
+// Settings screen (sweep): Time, Wafer, Sweep type, Speed profile, < Back
+// (the calculated sweep angle now lives in the side status bar, not as a row)
+const int SETTINGS_COUNT = 5;
 volatile int  settingsIndex       = 0;
 volatile bool editingSettings     = false;
 volatile bool settingsNeedsRedraw = false;
@@ -265,6 +266,8 @@ void saveSettings();
 int waferDiameterMm();
 int calculatedSweepDegX10();
 int travelSweepDegX10();
+const char* sweepTypeLabel();
+const char* sweepProfileLabel();
 bool armOverWafer();
 int sweepLeftSteps();
 int sweepRightSteps();
@@ -456,6 +459,7 @@ void initDisplay() {
     tft.setRotation(1);
     tft.fillScreen(ST77XX_BLACK);
     tft.setTextWrap(false);
+    tft.cp437(true);   // CP437 glyphs so the sweep-type arrow (0x1D) and bullet (0x07) render
     Serial.println("Display initialized (GMT147SPI 1.47\" 172x320)");
 }
 
@@ -571,6 +575,17 @@ int calculatedSweepDegX10() {
 int travelSweepDegX10() {
     int full = calculatedSweepDegX10();
     return sweepType == SWEEP_PATH_BACK_CENTER ? (full + 1) / 2 : full;
+}
+
+// Display labels for the sweep type / speed profile (shared by the Settings rows and
+// the status bar). The sweep-type strings use CP437 0x1D (↔) and 0x07 (•) glyphs.
+const char* sweepTypeLabel() {
+    return sweepType == SWEEP_PATH_BACK_CENTER ? "Edge\x1D(\x07)" : "Edge\x1D" "Edge";
+}
+const char* sweepProfileLabel() {
+    if (sweepProfile == SWEEP_PROFILE_LINEAR)   return "Linear";
+    if (sweepProfile == SWEEP_PROFILE_HARMONIC) return "Harm";
+    return "InvDist";
 }
 
 int sweepLeftSteps() {
@@ -1145,13 +1160,11 @@ void handleMenuSelect() {
     }
 
     if (displayMode == DISP_SETTINGS) {
-        if (editingSettings)                       { editingSettings = false; saveSettings(); }
+        if (editingSettings)                          { editingSettings = false; saveSettings(); }
         else if (settingsIndex == SETTINGS_COUNT - 1) {
             saveSettings();
             settingsIndex = 0; displayMode = DISP_MENU; menuDrawState = -1;
-        } else if (settingsIndex == 4) {
-            Serial.printf("Calculated sweep angle: %.1f deg\n", calculatedSweepDegX10() * 0.1f);
-        } else                                     { editingSettings = true; }
+        } else                                        { editingSettings = true; }
         return;
     }
 
@@ -1598,15 +1611,17 @@ const char* stateLabel(SystemState state) {
     return "----";
 }
 
+// Side status bar. Top half: live STATE + arm ANGLE. Middle: the SWEEP config summary
+// (calculated sweep angle, time, wafer, type, profile). Bottom: spray/flow sensors.
 void drawStatusColumn(SystemState state, int posDegX10, bool forceRedraw) {
     static SystemState drawnState = (SystemState)-1;
-    static int drawnPosDegX10 = -9999;
+    static int  drawnPosDegX10 = -9999;
     static bool drawnSpray = false;
-    static bool drawnFlow = false;
-    static bool drawnHold = false;
+    static bool drawnFlow  = false;
+    static int  drawnSweepAng = -1, drawnTime = -1, drawnWafer = -1, drawnType = -1, drawnProfile = -1;
 
-    int x = STATUS_X + 6;
-    int valueW = STATUS_W - 8;
+    int x = STATUS_X + 6;          // 238
+    int valueW = STATUS_W - 8;     // 80
 
     if (forceRedraw) {
         tft.fillRect(STATUS_X, 0, STATUS_W, tft.height(), ST77XX_BLACK);
@@ -1615,90 +1630,101 @@ void drawStatusColumn(SystemState state, int posDegX10, bool forceRedraw) {
         tft.setTextWrap(false);
         tft.setTextSize(1);
         tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-        tft.setCursor(x, 5);
-        tft.print("STATUS");
+        tft.setCursor(x, 4);  tft.print("STATUS");
         if (!SENSOR_INPUTS_ENABLED) {
             tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
-            tft.setCursor(x, 15);
-            tft.print("DEBUG ON");
+            tft.setCursor(x, 14); tft.print("DEBUG ON");
         }
-
         tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-        tft.setCursor(x, 24);
-        tft.print("STATE");
-        tft.setCursor(x, 64);
-        tft.print("ANGLE");
-        tft.setCursor(x, 106);
-        tft.print("SPRAY");
-        tft.setCursor(x, 126);
-        tft.print("FLOW");
-        tft.setCursor(x, 146);
-        tft.print("HOLD");
+        tft.setCursor(x, 24); tft.print("STATE");
+        tft.setCursor(x, 54); tft.print("ANGLE");
+        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+        tft.setCursor(x, 86); tft.print("SWEEP");
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(x, 148); tft.print("SPRAY");
+        tft.setCursor(x, 158); tft.print("FLOW");
 
         drawnState = (SystemState)-1;
         drawnPosDegX10 = -9999;
         drawnSpray = !sprayActive;
-        drawnFlow = !flowDetected;
-        drawnHold = !driverParkHoldMode;
+        drawnFlow  = !flowDetected;
+        drawnSweepAng = drawnTime = drawnWafer = drawnType = drawnProfile = -1;
     }
 
     if (forceRedraw || state != drawnState) {
-        tft.fillRect(x, 36, valueW, 18, ST77XX_BLACK);
+        tft.fillRect(x, 34, valueW, 16, ST77XX_BLACK);
         tft.setTextSize(2);
         tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-        tft.setCursor(x, 36);
-        tft.print(stateLabel(state));
+        tft.setCursor(x, 34); tft.print(stateLabel(state));
         drawnState = state;
     }
 
     if (forceRedraw || posDegX10 != drawnPosDegX10) {
-        tft.fillRect(x, 76, valueW, 18, ST77XX_BLACK);
+        tft.fillRect(x, 64, valueW, 16, ST77XX_BLACK);
         tft.setTextSize(2);
         tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-        tft.setCursor(x, 76);
-        printDegX10(posDegX10);
-        tft.setTextSize(1);
-        tft.print(" deg");
+        tft.setCursor(x, 64); printDegX10(posDegX10);
+        tft.setTextSize(1); tft.print("deg");
         drawnPosDegX10 = posDegX10;
     }
 
+    // SWEEP config summary (updates live while editing on the Settings screen).
+    int sweepAng = travelSweepDegX10();
+    if (forceRedraw || sweepAng != drawnSweepAng) {
+        tft.fillRect(x, 96, valueW, 8, ST77XX_BLACK);
+        tft.setTextSize(1); tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+        tft.setCursor(x, 96); printDegX10(sweepAng); tft.print("deg");
+        drawnSweepAng = sweepAng;
+    }
+    if (forceRedraw || (int)SWEEP_TIME_MS != drawnTime) {
+        tft.fillRect(x, 106, valueW, 8, ST77XX_BLACK);
+        tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(x, 106); tft.print(SWEEP_TIME_MS / 1000.0f, 1); tft.print("s");
+        drawnTime = (int)SWEEP_TIME_MS;
+    }
+    if (forceRedraw || sampleIndex != drawnWafer) {
+        tft.fillRect(x, 116, valueW, 8, ST77XX_BLACK);
+        tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(x, 116); tft.print(waferDiameterMm()); tft.print("mm");
+        drawnWafer = sampleIndex;
+    }
+    if (forceRedraw || sweepType != drawnType) {
+        tft.fillRect(x, 126, valueW, 8, ST77XX_BLACK);
+        tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(x, 126); tft.print(sweepTypeLabel());
+        drawnType = sweepType;
+    }
+    if (forceRedraw || sweepProfile != drawnProfile) {
+        tft.fillRect(x, 136, valueW, 8, ST77XX_BLACK);
+        tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(x, 136); tft.print(sweepProfileLabel());
+        drawnProfile = sweepProfile;
+    }
+
     if (forceRedraw || sprayActive != drawnSpray) {
-        tft.fillRect(x + 38, 106, valueW - 38, 8, ST77XX_BLACK);
+        tft.fillRect(x + 38, 148, valueW - 38, 8, ST77XX_BLACK);
         tft.setTextSize(1);
         if (SENSOR_INPUTS_ENABLED) {
             tft.setTextColor(sprayActive ? ST77XX_GREEN : ST77XX_RED, ST77XX_BLACK);
-            tft.setCursor(x + 38, 106);
-            tft.print(sprayActive ? "ON" : "OFF");
+            tft.setCursor(x + 38, 148); tft.print(sprayActive ? "ON" : "OFF");
         } else {
             tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
-            tft.setCursor(x + 38, 106);
-            tft.print("DIS");
+            tft.setCursor(x + 38, 148); tft.print("DIS");
         }
         drawnSpray = sprayActive;
     }
 
     if (forceRedraw || flowDetected != drawnFlow) {
-        tft.fillRect(x + 38, 126, valueW - 38, 8, ST77XX_BLACK);
+        tft.fillRect(x + 38, 158, valueW - 38, 8, ST77XX_BLACK);
         tft.setTextSize(1);
         if (SENSOR_INPUTS_ENABLED) {
             tft.setTextColor(flowDetected ? ST77XX_GREEN : ST77XX_RED, ST77XX_BLACK);
-            tft.setCursor(x + 38, 126);
-            tft.print(flowDetected ? "YES" : "NO");
+            tft.setCursor(x + 38, 158); tft.print(flowDetected ? "YES" : "NO");
         } else {
             tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
-            tft.setCursor(x + 38, 126);
-            tft.print("DIS");
+            tft.setCursor(x + 38, 158); tft.print("DIS");
         }
         drawnFlow = flowDetected;
-    }
-
-    if (forceRedraw || driverParkHoldMode != drawnHold) {
-        tft.fillRect(x + 38, 146, valueW - 38, 8, ST77XX_BLACK);
-        tft.setTextSize(1);
-        tft.setTextColor(driverParkHoldMode ? ST77XX_GREEN : ST77XX_WHITE, ST77XX_BLACK);
-        tft.setCursor(x + 38, 146);
-        tft.print(driverParkHoldMode ? "PARK" : "RUN");
-        drawnHold = driverParkHoldMode;
     }
 }
 
@@ -1781,8 +1807,8 @@ void drawMenu() {
 
         tft.setTextSize(2);
         tft.setTextColor(wc, ST77XX_BLACK);
-        tft.setCursor(32, 2);
-        tft.print("MEGASONIC");
+        tft.setCursor(28, 2);
+        tft.print("MEGASONIC CLEANER");
 
         for (int i = 0; i < visibleCount; i++)
             drawMenuRow(i, 22 + i * 28, i == mi);
@@ -1922,38 +1948,24 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
 }
 
 // ============= SETTINGS SCREEN (sweep params) =============
+// Compact (textSize 1) rows so the list plus the arm animation both fit, matching the
+// main-menu layout. Values are shown inline; the calculated sweep angle is in the status bar.
 void drawSettingsRow(int i, int y, bool selected, bool editing) {
-    const char* labels[] = { "Time   ", "Wafer  ", "Path   ", "Profile", "Angle  ", "< Back " };
+    const char* labels[] = { "Time", "Wafer", "Sweep type", "Speed profile", "< Back" };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
-    tft.fillRect(0, y - 2, CONTENT_W, 22, bg);
+    tft.fillRect(0, y - 2, CONTENT_W, 12, bg);
     tft.setTextColor(ST77XX_WHITE, bg);
-    tft.setTextSize(2);
+    tft.setTextSize(1);
     tft.setCursor(6, y);
     tft.print(labels[i]);
     if (i < SETTINGS_COUNT - 1) {
         tft.print(": ");
         switch (i) {
-            case 0:
-                tft.print(SWEEP_TIME_MS / 1000.0f, 1);
-                tft.print("s   ");
-                break;
-            case 1:
-                tft.print(SAMPLE_TABLE[sampleIndex]);
-                tft.print("mm  ");
-                break;
-            case 2:
-                tft.print(sweepType == SWEEP_PATH_BACK_CENTER ? "Back-Ctr" : "Back-Frt");
-                break;
-            case 3:
-                if      (sweepProfile == SWEEP_PROFILE_LINEAR)   tft.print("Linear ");
-                else if (sweepProfile == SWEEP_PROFILE_HARMONIC) tft.print("Harm   ");
-                else                                             tft.print("InvDist");
-                break;
-            case 4:
-                printDegX10(travelSweepDegX10());
-                tft.print("deg ");
-                break;
+            case 0: tft.print(SWEEP_TIME_MS / 1000.0f, 1); tft.print("s"); break;
+            case 1: tft.print(SAMPLE_TABLE[sampleIndex]);  tft.print("mm"); break;
+            case 2: tft.print(sweepTypeLabel());    break;
+            case 3: tft.print(sweepProfileLabel()); break;
         }
     }
 }
@@ -1961,18 +1973,16 @@ void drawSettingsRow(int i, int y, bool selected, bool editing) {
 void drawSettings() {
     static int  lastIdx      = -1;
     static bool lastEdit     = false;
-    static int  lastVals[5]  = {};
+    static int  lastVals[4]  = {};
 
     if (settingsNeedsRedraw) { settingsNeedsRedraw = false; lastIdx = -1; }
 
     int  si = settingsIndex;
     bool ed = editingSettings;
-    int  vals[5] = {
-        (int)(SWEEP_TIME_MS / 100), sampleIndex, sweepType, sweepProfile, travelSweepDegX10()
-    };
+    int  vals[4] = { (int)(SWEEP_TIME_MS / 100), sampleIndex, sweepType, sweepProfile };
 
     bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit);
-    for (int i = 0; i < 5 && !changed; i++) changed = (vals[i] != lastVals[i]);
+    for (int i = 0; i < 4 && !changed; i++) changed = (vals[i] != lastVals[i]);
     if (!changed) return;
 
     if (lastIdx == -1) {
@@ -1981,14 +1991,14 @@ void drawSettings() {
         tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
         tft.setTextSize(2);
         tft.setCursor(6, 3);
-        tft.print("SETTINGS");
+        tft.print("SWEEP SETTINGS");
     }
 
     for (int i = 0; i < SETTINGS_COUNT; i++)
-        drawSettingsRow(i, 22 + i * 24, i == si, i == si && ed && i < SETTINGS_COUNT - 1 && i != 4);
+        drawSettingsRow(i, 22 + i * 12, i == si, i == si && ed && i < SETTINGS_COUNT - 1);
 
     lastIdx = si; lastEdit = ed;
-    for (int i = 0; i < 5; i++) lastVals[i] = vals[i];
+    for (int i = 0; i < 4; i++) lastVals[i] = vals[i];
 }
 
 // ============= SETUP SCREEN (hardware params) =============
@@ -2141,11 +2151,15 @@ void updateDisplay() {
         bool modeChanged = (dm != lastDisplayMode);
         mutex_enter_blocking(&spi_mutex);
         if (dm == DISP_SETTINGS) {
+            // Same arm animation as the main menu sits under the rows; the status column
+            // is refreshed every frame so its SWEEP summary tracks live edits (it
+            // self-gates per field, so this does not flicker).
             drawSettings();
-            if (modeChanged || statusChanged) drawStatusColumn(state, posDegX10, modeChanged);
+            drawArmAnim(modeChanged, posDegX10);
+            drawStatusColumn(state, posDegX10, modeChanged);
         } else if (dm == DISP_SETUP) {
             drawSetup();
-            if (modeChanged || statusChanged) drawStatusColumn(state, posDegX10, modeChanged);
+            drawStatusColumn(state, posDegX10, modeChanged);
         } else {
             drawAbout();
         }

@@ -66,12 +66,15 @@ value, **click** to select / enter-edit / confirm.
   a blinking lightning sign while the ultrasonic generator is energised.
 - **Advanced menu**: a short-click immediately followed by a long-press toggles the
   advanced items (`Setup` and `About`) on/off.
-- **Settings** (sweep): sweep time, wafer diameter, path, velocity profile, and the
-  calculated sweep angle (read-only).
+- **Sweep Settings**: sweep time, wafer diameter, **sweep type**, and **speed profile**, as
+  a compact list with the same arm animation underneath as the main menu. The calculated
+  sweep angle and the live sweep parameters are shown in the side status bar.
 - **Setup** (hardware): park angle, centre angle (live jog while editing), arm length,
   cycles, driver current, microsteps, direction invert, and the **Debug** toggle
   (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active).
 - **About**: firmware version and live TMC2130 driver status.
+- **Status bar** (right side of every screen): live state, arm angle, the sweep summary
+  (sweep angle, time, wafer, type, profile), and spray/flow.
 
 Settings are stored in RP2040 flash EEPROM emulation and reloaded at boot. Empty or
 corrupt flash is initialized with defaults; compatible older records are accepted and
@@ -186,10 +189,10 @@ the sweep extremes land on the wafer edges:
 sweep = 2 · asin( (wafer_diameter / 2) / arm_length )
 ```
 
-- **Path** `Back-Centre`: arm travels edge → centre (half the sweep).
-- **Path** `Back-Front`: arm travels edge → edge (full sweep).
-- **Profile**: `Linear` (constant speed), `Harmonic` (sinusoidal ease in/out), or
-  `Inverse-Distance` (slower near the centre).
+- **Sweep type** `Edge↔(•)`: arm travels edge → centre (half the sweep).
+- **Sweep type** `Edge↔Edge`: arm travels edge → edge (full sweep).
+- **Speed profile**: `Linear` (constant speed), `Harmonic` (sinusoidal ease in/out), or
+  `Inverse-Distance` (varies speed with distance from the wafer centre).
 
 The ultrasonic generator is energised **only while the arm tip is over the wafer disk**.
 
