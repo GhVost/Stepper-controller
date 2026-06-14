@@ -188,6 +188,12 @@ double        sweepTimingCompletedFactorSum = 0.0;
 double        sweepTimingLegFactorSum = 1.0;
 double        sweepTimingBaseUs = 1.0;
 unsigned long lastEncoderRead = 0;
+volatile int     encoderDetentDelta = 0;
+volatile int     encoderTransitionAccum = 0;
+volatile uint8_t encoderIsrState = 0;
+volatile bool    encoderButtonEdgePending = false;
+volatile bool    encoderButtonRawState = HIGH;
+volatile unsigned long encoderButtonEdgeMillis = 0;
 const unsigned long MOTOR_UPDATE_INTERVAL_US = 500;
 const unsigned long MIN_SWEEP_STEP_INTERVAL_US = 100;
 const unsigned long ENCODER_READ_INTERVAL = 1;
@@ -249,6 +255,8 @@ mutex_t spi_mutex;
 void initHardware();
 void initSPI();
 void initEncoder();
+void encoderIsr();
+void encoderButtonIsr();
 void initTMC2130();
 void initDisplay();
 uint32_t settingsChecksum(const StoredSettings& settings);
@@ -415,7 +423,15 @@ void initEncoder() {
     pinMode(ENC_A,  INPUT_PULLUP);
     pinMode(ENC_B,  INPUT_PULLUP);
     pinMode(ENC_SW, INPUT_PULLUP);
-    Serial.printf("Encoder initialized: CLK=%d DT=%d SW=%d\n", ENC_A, ENC_B, ENC_SW);
+    encoderIsrState = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
+    encoderTransitionAccum = 0;
+    encoderDetentDelta = 0;
+    encoderButtonRawState = digitalRead(ENC_SW);
+    encoderButtonEdgePending = false;
+    attachInterrupt(digitalPinToInterrupt(ENC_A), encoderIsr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_B), encoderIsr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_SW), encoderButtonIsr, CHANGE);
+    Serial.printf("Encoder initialized: CLK=%d DT=%d SW=%d (interrupt mode)\n", ENC_A, ENC_B, ENC_SW);
 }
 
 void initTMC2130() {
@@ -754,107 +770,114 @@ void readSensors() {
 }
 
 // ============= ENCODER =============
+const int8_t ENCODER_TRANSITION_TABLE[16] = {
+    0, -1,  1,  0,
+    1,  0,  0, -1,
+   -1,  0,  0,  1,
+    0,  1, -1,  0
+};
+
+void encoderIsr() {
+    uint8_t encoded = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
+    uint8_t transition = (encoderIsrState << 2) | encoded;
+    int8_t movement = ENCODER_TRANSITION_TABLE[transition];
+    encoderIsrState = encoded;
+
+    if (movement == 0) return;
+
+    int accum = encoderTransitionAccum + movement;
+    if (accum >= 4) {
+        encoderDetentDelta++;
+        accum -= 4;
+    } else if (accum <= -4) {
+        encoderDetentDelta--;
+        accum += 4;
+    }
+    encoderTransitionAccum = accum;
+}
+
+void encoderButtonIsr() {
+    encoderButtonRawState = digitalRead(ENC_SW);
+    encoderButtonEdgeMillis = millis();
+    encoderButtonEdgePending = true;
+}
+
 void readEncoder() {
-    static int           lastEncoded      = -1;
-    static int           stableEncoded    = -1;
-    static int           candidateEncoded = -1;
-    static uint8_t       candidateCount   = 0;
-    static int           stepAccum        = 0;
     static unsigned long lastStepTime     = 0;
+    static int           pendingDetents   = 0;
 
-    int rawEncoded = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
-    if (stableEncoded < 0) {
-        stableEncoded = rawEncoded;
-        candidateEncoded = rawEncoded;
-        lastEncoded = rawEncoded;
-    }
+    int detents = 0;
+    noInterrupts();
+    detents = encoderDetentDelta;
+    encoderDetentDelta = 0;
+    interrupts();
+    pendingDetents += detents;
 
-    if (rawEncoded != candidateEncoded) {
-        candidateEncoded = rawEncoded;
-        candidateCount = 1;
-    } else if (candidateCount < ENCODER_STABLE_SAMPLES) {
-        candidateCount++;
-    }
-
-    if (candidateCount >= ENCODER_STABLE_SAMPLES && candidateEncoded != stableEncoded) {
-        stableEncoded = candidateEncoded;
-        int sum = (lastEncoded << 2) | stableEncoded;
-        lastEncoded = stableEncoded;
-
-        if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
-            stepAccum++;
-        } else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
-            stepAccum--;
-        } else {
-            stepAccum = 0;
-        }
-    }
-
-    if (abs(stepAccum) >= 4) {
+    if (pendingDetents != 0) {
         unsigned long now = millis();
         if (now - lastStepTime >= ENCODER_STEP_MIN_INTERVAL) {
             unsigned long stepInterval = now - lastStepTime;
-            int d = stepAccum > 0 ? 1 : -1;
-            int editDelta = d * encoderAcceleration(stepInterval);
+            int d = pendingDetents > 0 ? 1 : -1;
+            int steps = abs(pendingDetents);
+            int editDelta = d * steps * encoderAcceleration(stepInterval);
             switch (displayMode) {
                 case DISP_MENU:
                     {
                         int visibleCount = advancedMenuUnlocked ? MENU_COUNT : BASIC_MENU_COUNT;
-                        menuIndex = (menuIndex + d + visibleCount) % visibleCount;
+                        menuIndex = (menuIndex + d * steps + visibleCount * steps) % visibleCount;
                     }
                     break;
                 case DISP_SETTINGS:
                     if (editingSettings) adjustSettingsValue(editDelta);
-                    else settingsIndex = constrain(settingsIndex + d, 0, SETTINGS_COUNT - 1);
+                    else settingsIndex = constrain(settingsIndex + d * steps, 0, SETTINGS_COUNT - 1);
                     break;
                 case DISP_SETUP:
                     if (editingSetup) adjustSetupValue(editDelta);
-                    else setupIndex = constrain(setupIndex + d, 0, SETUP_COUNT - 1);
+                    else setupIndex = constrain(setupIndex + d * steps, 0, SETUP_COUNT - 1);
                     break;
                 case DISP_ABOUT:
                     break;
             }
             lastStepTime = now;
+            pendingDetents = 0;
         }
-        stepAccum = 0;
     }
 
     static bool          stableBtn    = HIGH;
-    static bool          candidateBtn = HIGH;
-    static uint8_t       btnSamples   = 0;
     static unsigned long lastBtnTime  = 0;
     static unsigned long pressStart   = 0;
     static bool          longFired    = false;
-    bool rawBtn = digitalRead(ENC_SW);
 
-    if (rawBtn != candidateBtn) {
-        candidateBtn = rawBtn;
-        btnSamples = 1;
-    } else if (btnSamples < ENCODER_STABLE_SAMPLES) {
-        btnSamples++;
+    bool edgePending = false;
+    bool rawBtn = HIGH;
+    unsigned long edgeTime = 0;
+    noInterrupts();
+    edgePending = encoderButtonEdgePending;
+    if (edgePending) {
+        rawBtn = encoderButtonRawState;
+        edgeTime = encoderButtonEdgeMillis;
+        encoderButtonEdgePending = false;
     }
+    interrupts();
 
-    if (btnSamples >= ENCODER_STABLE_SAMPLES && candidateBtn != stableBtn) {
-        unsigned long now = millis();
-        if (now - lastBtnTime >= ENCODER_BUTTON_DEBOUNCE) {
-            bool oldStableBtn = stableBtn;
-            stableBtn   = candidateBtn;
-            lastBtnTime = now;
+    if (edgePending && rawBtn != stableBtn && edgeTime - lastBtnTime >= ENCODER_BUTTON_DEBOUNCE) {
+        bool oldStableBtn = stableBtn;
+        stableBtn   = rawBtn;
+        lastBtnTime = edgeTime;
 
-            if (oldStableBtn == HIGH && stableBtn == LOW) {
-                // ---- pressed (falling edge) ----
-                pressStart = now;
-                longFired  = false;
-            } else {
-                // ---- released (rising edge) ----
-                if (!longFired) {
-                    if (displayMode == DISP_MENU) {
-                        // defer: a long press may follow to toggle the advanced menu
-                        pendingShortClick     = true;
-                        shortClickReleaseTime = now;
-                    } else {
-                        menuButtonPressed = true;
-                    }
+        if (oldStableBtn == HIGH && stableBtn == LOW) {
+            // ---- pressed (falling edge) ----
+            pressStart = edgeTime;
+            longFired  = false;
+        } else {
+            // ---- released (rising edge) ----
+            if (!longFired) {
+                if (displayMode == DISP_MENU) {
+                    // defer: a long press may follow to toggle the advanced menu
+                    pendingShortClick     = true;
+                    shortClickReleaseTime = edgeTime;
+                } else {
+                    menuButtonPressed = true;
                 }
             }
         }

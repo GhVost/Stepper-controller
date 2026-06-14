@@ -176,8 +176,9 @@ using the live microstep setting.
 **`readSensors()`** — debounces the limit switch always; reads spray/flow only when
 `SENSOR_INPUTS_ENABLED`, otherwise forces them inactive for Debug mode.
 
-**`readEncoder()`** — 4-transition quadrature accumulator with acceleration; routes the
-delta to the active screen (menu navigation, value edit) and handles the click /
+**`encoderIsr()` / `encoderButtonIsr()` / `readEncoder()`** — GPIO interrupts capture
+quadrature detents and button edges; `readEncoder()` consumes those events, applies
+acceleration/debounce, routes deltas to the active screen, and handles the click /
 short-then-long-press menu-unlock gesture.
 
 ### Output Control
@@ -263,7 +264,7 @@ ERR). `d` on serial dumps the full register decode.
 | Metric | Value |
 |--------|-------|
 | Motor step cadence (homing/parking) | every 500 µs |
-| Encoder poll | every loop iteration (~1 ms gate) |
+| Encoder input | GPIO interrupts; main loop consumes pending events |
 | Driver status poll | every 500 ms |
 | Settings auto-save debounce | 2.5 s of quiet |
 | Display update | ~20 fps (Core 1, on change only) |

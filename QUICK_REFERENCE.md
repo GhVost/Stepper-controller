@@ -123,7 +123,7 @@ degX10ToSteps(int degX10);    // angle (0.1°) → microsteps
 
 // Sensors / input
 readSensors();                // limit always; spray/flow only when Debug = OFF
-readEncoder();                // navigation, value edit, menu unlock combo
+readEncoder();                // consume interrupt encoder/button events
 
 // Outputs
 setLED(pin, state);
@@ -176,7 +176,7 @@ Hardware initialized
 SPI0 LCD initialized: SCK=18 MOSI=19
 SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
 TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
-Encoder initialized: CLK=26 DT=27 SW=22
+Encoder initialized: CLK=26 DT=27 SW=22 (interrupt mode)
 Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
 ```
@@ -215,7 +215,7 @@ int           driverMicrosteps   = 128;   // resolution (no recalibration needed
 |------|--------|-------|
 | TMC2130 SPI config | ✅ Done | SPI1; run/park hold modes; fault polling |
 | Driver fault handling | ✅ Done | OT / S2G / charge-pump UV → park + ERROR |
-| Encoder + menu UI | ✅ Done | Navigation, edit, basic/advanced unlock |
+| Encoder + menu UI | ✅ Done | Interrupt input, navigation, edit, basic/advanced unlock |
 | Persistent settings | ✅ Done | Versioned, checksummed, compatible flash records |
 | Error recovery | ✅ Done | START clears the latch and re-homes |
 | LCD display | ✅ Done | GMT147SPI 172×320, 20 MHz HW SPI, ~20 fps, arm animation |

@@ -39,7 +39,7 @@ SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
 TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
 === TMC2130 DEBUG ===
 ...register dump...
-Encoder initialized: CLK=26 DT=27 SW=22
+Encoder initialized: CLK=26 DT=27 SW=22 (interrupt mode)
 Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
 ```

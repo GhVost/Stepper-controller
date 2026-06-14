@@ -46,7 +46,7 @@ Hardware initialized
 SPI0 LCD initialized: SCK=18 MOSI=19
 SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
 TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
-Encoder initialized: CLK=26 DT=27 SW=22
+Encoder initialized: CLK=26 DT=27 SW=22 (interrupt mode)
 Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
 ```
@@ -211,7 +211,7 @@ The ultrasonic generator is energised **only while the arm tip is over the wafer
 - [x] Sensor reading (limit, spray, flow) with debounce + sensor-bypass DEBUG mode
 - [x] LED indicators, fan PWM, ultrasonic relay (energised only over the wafer)
 - [x] LCD UI — hardware SPI 20 MHz, partial redraw, ~20 fps on Core 1, arm-position animation
-- [x] Rotary encoder — 4-transition accumulator debounce, acceleration, basic/advanced menu unlock
+- [x] Rotary encoder — interrupt-based quadrature/button input, acceleration, basic/advanced menu unlock
 - [x] On-device Settings/Setup editors
 - [x] Persistent settings in flash (versioned, checksummed, compatible record loading)
 - [x] Recoverable ERROR state (START re-homes and clears the fault latch)

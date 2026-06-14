@@ -4,8 +4,8 @@
 
 MEGASONIC uses a non-blocking, event-driven state machine on Core 0 of the RP2040.
 All timing uses `millis()` / `micros()` comparisons — no `delay()` blocks the loop.
-Sensors and the encoder are polled every iteration; motor steps are rate-limited by
-interval timers. Core 1 owns the LCD.
+Sensors are polled every iteration; the encoder uses GPIO interrupts and is consumed by
+the main loop. Motor steps are rate-limited by interval timers. Core 1 owns the LCD.
 
 Two things shape the behaviour throughout:
 
@@ -197,7 +197,7 @@ wafer edges; `Back-Centre` travels half of this, `Back-Front` the full width.
 ```cpp
 void loop() {
     handleSerialDebug();
-    readEncoder();            // ~1 ms cadence; 4-transition accumulator + acceleration
+    readEncoder();            // consumes interrupt encoder/button events + acceleration
     if (menuButtonPressed) handleMenuSelect();
     readSensors();            // limit always; spray/flow only when Debug = OFF
     updateStateMachine();     // evaluate transitions
