@@ -5,11 +5,12 @@
 | File | Purpose |
 |------|---------|
 | [README.md](README.md) | Project overview & features |
-| [HARDWARE.md](HARDWARE.md) | Pin assignments, wiring, calibration |
+| [HARDWARE.md](HARDWARE.md) | Pin assignments, wiring, driver config |
 | [STATE_MACHINE.md](STATE_MACHINE.md) | State diagram & behaviour |
 | [SETUP.md](SETUP.md) | Development environment & API |
 | [TESTING.md](TESTING.md) | Validation & troubleshooting |
 | [src/main.cpp](src/main.cpp) | All firmware |
+| [tools/gui_preview.html](tools/gui_preview.html) | Browser mock-up of the LCD UI |
 | [platformio.ini](platformio.ini) | Project config & library deps |
 
 ---
@@ -29,48 +30,66 @@ pio run --target clean              # Remove build artefacts
 
 ## Pin Quick Map
 
+Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
+
 | Function | GPIO |
 |----------|------|
-| TMC_CS | 17 |
-| TMC_SCK | 18 (shared with LCD) |
-| TMC_MOSI | 19 (shared with LCD) |
-| TMC_MISO | 16 |
+| TMC_CS | 13 |
+| TMC_SCK | 10 (SPI1) |
+| TMC_MOSI | 11 (SPI1) |
+| TMC_MISO | 12 (SPI1) |
 | TMC_STEP | 14 |
 | TMC_DIR | 15 |
-| TMC_EN | 13 (LOW = active) |
+| TMC_EN | 1 (LOW = active) |
 | LCD_CS | 9 |
-| LCD_DC | 10 |
-| LCD_RST | 11 |
-| ENC_A | 26 (INPUT_PULLUP) |
-| ENC_B | 27 (INPUT_PULLUP) |
+| LCD_DC | 5 |
+| LCD_RST | 6 |
+| LCD_SCK | 18 (SPI0) |
+| LCD_MOSI | 19 (SPI0) |
+| LCD_BL | 20 (HIGH = on) |
+| ENC_A / ENC_B | 26 / 27 (INPUT_PULLUP) |
+| ENC_SW | 22 (INPUT_PULLUP, LOW = pressed) |
 | LIMIT_SWITCH | 28 (INPUT_PULLUP, LOW = pressed) |
-| SPRAY_VALVE | 2 (HIGH = active) |
-| FLOW_SENSOR | 3 (HIGH = flowing) |
-| LED_GREEN | 8 |
-| LED_YELLOW | 7 |
-| FAN_PWM | 12 |
+| SPRAY_VALVE | 2 (INPUT_PULLDOWN, HIGH = active) |
+| FLOW_SENSOR | 3 (INPUT_PULLDOWN, HIGH = flowing) |
+| LED_GREEN / LED_YELLOW | 8 / 7 |
+| FAN_PWM | 21 |
 | ULTRASONIC | 4 (LOW = ON, active-low relay) |
+
+---
+
+## On-Device UI
+
+- **Rotate** = navigate / change value, **Click** = select / edit / confirm.
+- **Basic menu**: START/STOP, Settings (+ arm-position animation).
+- **Advanced menu** (Setup, About): short-click then long-press to toggle.
+- **Settings** (sweep): Time, Wafer, Path, Profile, Angle (read-only), < Back.
+- **Setup** (hardware): Park, Centre (live jog), Arm, Cycles, Current, Mstep, Invert,
+  Safety (ON/DEBUG), < Back.
+- Edits auto-save to flash (debounced ~2.5 s).
 
 ---
 
 ## State Machine
 
 ```
-IDLE → HOMING → PARKED → WAITING_SPRAY → SPRAY_ACTIVE → OSCILLATING → IDLE
-                    └──────────────────────────────────────┘
-                         (spray + flow both present skips WAITING_SPRAY)
+IDLE → HOMING → PARKED → SPRAY_ACTIVE → OSCILLATING → PARKED → IDLE
+                  └→ WAITING_SPRAY ─┘   (sensor mode: spray, then flow)
+STOP → PARKED → IDLE         Fault/timeout → ERROR (START to recover)
 ```
+
+START always re-homes first (position is unknown whenever the motor was disabled).
 
 ### State Duration
 
 | State | Duration |
 |-------|----------|
 | IDLE | Indefinite |
-| HOMING | Until limit switch triggers |
-| PARKED | Until at park position + spray/flow |
-| WAITING_SPRAY | Until flow detected or spray lost |
-| SPRAY_ACTIVE | 2 s + time to reach centre |
-| OSCILLATING | 20 sweeps × 16 steps × 10 s ≈ **53 min** |
+| HOMING | Until limit switch (timeout 70° → ERROR) |
+| PARKED | Until at park angle, then branch |
+| WAITING_SPRAY | Until flow detected or spray lost (sensor mode) |
+| SPRAY_ACTIVE | ≥ 2 s + time to reach the sweep start |
+| OSCILLATING | `OSCILLATION_CYCLES` sweeps × `SWEEP_TIME_MS` (0 cycles = forever) |
 
 ### LED Indicators
 
@@ -80,9 +99,8 @@ IDLE → HOMING → PARKED → WAITING_SPRAY → SPRAY_ACTIVE → OSCILLATING �
 | HOMING | OFF | ON |
 | PARKED | ON | OFF |
 | WAITING_SPRAY | OFF | ON |
-| SPRAY_ACTIVE | ON | OFF |
-| OSCILLATING | ON | OFF |
-| ERROR | OFF | Blink |
+| SPRAY_ACTIVE / OSCILLATING | ON | OFF |
+| ERROR | OFF | Blink 1 Hz |
 
 ### Fan Speed
 
@@ -97,26 +115,27 @@ IDLE → HOMING → PARKED → WAITING_SPRAY → SPRAY_ACTIVE → OSCILLATING �
 ## Key Functions
 
 ```cpp
-// Motor
-motorStep(int dir);           // ±1 direction; updates motorPosition
-motorSetEnable(bool en);      // true = coils energised
-motorMoveTo(int target);      // Call repeatedly — steps one at a time
+// Motor (angle-based)
+motorStep(int dir);           // ±1 step; updates motorPosition
+motorSetEnable(bool en);      // LOW = energised
+motorMoveTo(int target);      // call repeatedly — one step toward target
+degX10ToSteps(int degX10);    // angle (0.1°) → microsteps
 
-// Sensors (called every loop)
-readSensors();                // Updates limitSwitchPressed, sprayActive, flowDetected
-readEncoder();                // Updates menuIndex
+// Sensors / input
+readSensors();                // limit always; spray/flow only when Safety = ON
+readEncoder();                // navigation, value edit, menu unlock combo
 
 // Outputs
-setLED(pin, state);           // true = on
+setLED(pin, state);
 setFan(speed);                // 0–255 PWM (clamped)
 setUltrasonic(bool on);       // true = relay ON (GPIO 4 LOW)
+armOverWafer();               // true when the tip is over the wafer disk
 
-// State machine
-updateStateMachine();         // Evaluates transitions
-handleState();                // Executes state actions
-
-// Display (LCD + serial)
-updateDisplay();              // Redraws only on change
+// State machine / settings
+updateStateMachine();         // evaluate transitions
+handleState();                // execute state actions
+pollDriverStatus();           // poll + latch driver faults
+saveSettings() / loadSettings();  // flash persistence (versioned + checksummed)
 ```
 
 ---
@@ -124,74 +143,68 @@ updateDisplay();              // Redraws only on change
 ## Motion Parameters
 
 ```cpp
-STEPS_PER_MM      = 1      // Calibrate before use (see HARDWARE.md)
-PARK_MM           = 7      // mm from limit switch to park
-CENTER_MM         = 26     // mm from limit switch to oscillation centre
-OSCILLATION_STEPS = 16     // Steps per directional sweep
-OSCILLATION_DELAY = 10000  // ms per step (10 s)
-OSCILLATION_CYCLES = 20    // Sweeps before returning to IDLE
-SPRAY_ACTIVE_WAIT = 2000   // ms stabilisation before oscillation
+PARK_DEG_X10      = 70      // 7.0° park angle near the limit
+CENTER_DEG_X10    = 260     // 26.0° sweep centre over the wafer
+ARM_LENGTH_MM     = 250     // arm length (transducer radius)
+SWEEP_TIME_MS     = 4000    // ms per directional sweep
+OSCILLATION_CYCLES = 4      // sweeps per cycle (0 = forever)
+SPRAY_ACTIVE_WAIT = 2000    // ms settle before oscillation
 ```
 
-**Timing:**
-- 1 sweep = 16 × 10 s = 160 s ≈ 2.7 min
-- 20 sweeps = 3 200 s ≈ 53 min total
+Sweep half-width = `asin((waferØ/2)/armLength)`; Back-Centre = half, Back-Front = full.
 
 ---
 
-## Serial Monitor Output
+## Serial Debug Commands
+
+Type a key in the serial monitor (115200):
+
+| Key | Action |
+|-----|--------|
+| `d` | Dump TMC2130 registers |
+| `e` / `x` | Enable / disable motor |
+| `+` / `-` | One step forward / back |
+| `f` / `b` | 400 steps forward / back |
+| `r` | One full shaft revolution |
+| `?` | List commands |
 
 **Startup:**
 ```
 === Stepper Controller Initializing ===
+Settings: loaded from flash
 Hardware initialized
-SPI initialized: SCK=18 MOSI=19 MISO=16
+SPI0 LCD initialized: SCK=18 MOSI=19
+SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
+TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
 Encoder initialized: CLK=26 DT=27 SW=22
 Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
 ```
 
-**During operation** (only on change):
+**During operation** (on change):
 ```
-→ HOMING
-State:HOMING | Pos:-1 | Spray:ON | Flow:NO
+Menu: START → HOMING
 → PARKED (moving to park position)
-State:PARKED | Pos:7 | Spray:ON | Flow:NO
-→ SPRAY_ACTIVE
+State:PARKED | Pos:78 steps (7.0 deg) | Spray:OFF | Flow:NO
+→ SPRAY_ACTIVE (sensor bypass)
 → OSCILLATING
-Sweep 1/20
-Sweep 2/20
-...
-→ IDLE (cleaning cycle complete)
+Sweep 1/4
+→ PARKED (cleaning cycle complete)
+→ IDLE (parked, motor disabled)
 ```
 
 ---
 
 ## Common Adjustments
 
-### Longer cleaning
+Most are editable on-device (Settings / Setup) and persist to flash. To change defaults,
+edit the constants near the top of `src/main.cpp`:
 
 ```cpp
-const unsigned long OSCILLATION_CYCLES = 30;  // Was 20 (~80 min total)
-```
-
-### Faster steps
-
-```cpp
-const unsigned long OSCILLATION_DELAY = 5000;  // Was 10000 (26 min total)
-```
-
-### Higher motor current (more torque)
-
-```cpp
-driver.rms_current(800);  // Was 600 mA — in initTMC2130()
-```
-
-### Different microstep resolution
-
-```cpp
-driver.microsteps(32);         // In initTMC2130()
-const int STEPS_PER_MM = ...;  // Recalculate in main.cpp
+unsigned long OSCILLATION_CYCLES = 8;     // more/longer cleaning (0 = forever)
+unsigned long SWEEP_TIME_MS      = 2000;  // faster sweeps
+int           driverCurrent      = 800;   // more torque (was 600 mA)
+int           driverMicrosteps   = 128;   // resolution (no recalibration needed)
 ```
 
 ---
@@ -200,28 +213,13 @@ const int STEPS_PER_MM = ...;  // Recalculate in main.cpp
 
 | Item | Status | Notes |
 |------|--------|-------|
-| TMC2130 SPI config | ⚠️ Pending wiring | `initTMC2130()` ready, commented out; add SPI mutex when connected |
-| Encoder quadrature + debounce | ✅ Done | 4-transition accumulator + 50 ms guard |
-| Oscillation direction | ✅ Done | Alternates correctly |
-| LCD display | ✅ Done | GMT147SPI 1.47" 172×320, 20 MHz HW SPI, Core 1 ~20 fps |
-| STEPS_PER_MM calibration | ⚠️ Required | Defaults to 1 (uncalibrated) |
-| Error recovery | 🔄 TODO | STATE_ERROR requires power-cycle |
-| Encoder button (SELECT) | 🔄 TODO | GPIO 22 wired; no menu action yet |
-| StallGuard fault detection | 🔄 TODO | TMC2130 supports it; needs wiring |
-
----
-
-## Hardware BOM (Approximate)
-
-| Component | Cost |
-|-----------|------|
-| RP2040 Pico | ~$5 |
-| TMC2130 stepper driver | ~$10 |
-| GMT147SPI 1.47" SPI LCD (172×320 ST7789) | ~$6 |
-| NEMA17 stepper motor | ~$15 |
-| Rotary encoder | ~$3 |
-| Supporting electronics | ~$15 |
-| **Total** | **~$56** |
+| TMC2130 SPI config | ✅ Done | SPI1; run/park hold modes; fault polling |
+| Driver fault handling | ✅ Done | OT / S2G / charge-pump UV → park + ERROR |
+| Encoder + menu UI | ✅ Done | Navigation, edit, basic/advanced unlock |
+| Persistent settings | ✅ Done | Versioned, checksummed, debounced auto-save |
+| Error recovery | ✅ Done | START clears the latch and re-homes |
+| LCD display | ✅ Done | GMT147SPI 172×320, 20 MHz HW SPI, ~20 fps, arm animation |
+| StallGuard load detection | 🔄 Future | Hardware supports it |
 
 ---
 
@@ -231,3 +229,4 @@ const int STEPS_PER_MM = ...;  // Recalculate in main.cpp
 - [RP2040 Datasheet](https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf)
 - [TMC2130 Datasheet](https://www.trinamic.com/fileadmin/assets/Documents/TMC2130_Datasheet_Rev1.35.pdf)
 - [PlatformIO Docs](https://docs.platformio.org/)
+</content>

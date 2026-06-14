@@ -2,15 +2,18 @@
 
 ## Overview
 
-The Stepper Controller uses one shared SPI bus (SPI0) and numerous GPIO pins on the RP2040 Pico. The TMC2130 stepper driver and the ST7789 LCD share the same SPI0 clock and data lines; they are distinguished by separate Chip Select pins.
+MEGASONIC runs on an RP2040 (Pico). The TMC2130 stepper driver and the ST7789 LCD are
+on **two separate SPI buses** — the driver on **SPI1**, the display on **SPI0** — so
+there is no bus sharing and no per-transaction SPI-mode switching between them. A single
+firmware mutex serialises SPI access across the two cores.
 
 ### Power Requirements
 
 | Component | Supply |
 |-----------|--------|
 | RP2040 Pico | 5 V USB or 3.3 V regulated |
-| TMC2130 driver | 12–24 V motor supply + 3.3 V logic (VCC_IO) |
-| LCD display | 3.3 V |
+| TMC2130 driver | 12–24 V motor supply (VM) + 3.3 V logic (VCC_IO) |
+| LCD display | 3.3 V only |
 | Sensors | 3.3 V |
 | LEDs | 3.3 V with 470 Ω resistor |
 
@@ -18,22 +21,32 @@ The Stepper Controller uses one shared SPI bus (SPI0) and numerous GPIO pins on 
 
 ## Pin Assignment Map
 
-### SPI0 — Shared by TMC2130 and LCD
+### SPI1 — TMC2130 stepper driver
 
 ```
-SCK  = GPIO 18   (shared)
-MOSI = GPIO 19   (shared)
-MISO = GPIO 16   (TMC2130 only — LCD is write-only)
-CS   = GPIO 17   (TMC2130 chip select)
-CS   = GPIO 9    (LCD chip select)
+SCK  = GPIO 10
+MOSI = GPIO 11   (SDI: Pico → driver)
+MISO = GPIO 12   (SDO: driver → Pico)
+CS   = GPIO 13   (chip select, active LOW)
+STEP = GPIO 14
+DIR  = GPIO 15
+EN   = GPIO 1    (LOW = motor active)
 ```
 
-Each device is selected exclusively via its own CS pin. The firmware uses
-`SPI.beginTransaction()` (handled internally by the TMCStepper and Adafruit
-libraries) to switch SPI mode between devices:
+### SPI0 — ST7789 LCD
 
-- TMC2130 requires **SPI Mode 3** (CPOL=1, CPHA=1)
-- ST7789 requires **SPI Mode 0** (CPOL=0, CPHA=0)
+```
+SCK  = GPIO 18   (SCL)
+MOSI = GPIO 19   (SDA)   — display is write-only, no MISO
+CS   = GPIO 9
+DC   = GPIO 5
+RES  = GPIO 6
+BL   = GPIO 20   (backlight, HIGH = on)
+```
+
+The TMC2130 requires **SPI Mode 3** (CPOL=1, CPHA=1); the ST7789 uses Mode 0. Because
+each device has its own bus, the firmware configures the mode per bus once — no runtime
+switching.
 
 ---
 
@@ -41,34 +54,32 @@ libraries) to switch SPI mode between devices:
 
 ### TMC2130 Stepper Driver (BigTreeTech V1.1)
 
-Board silkscreen labels (right side): EN, SDI, SCK, CSN, SDO, NC, STP, DIR  
+Board silkscreen labels (right side): EN, SDI, SCK, CSN, SDO, NC, STP, DIR
 Board silkscreen labels (left side): VM, GND, 2B, 1B, 1A, 2A, VCC, GND
 
 ```
 RP2040 Pico                BTT TMC2130 V1.1
 ─────────────────          ────────────────────────────────
-GPIO 17 ────────── CSN     (Chip Select — active LOW)
-GPIO 18 ────────── SCK     (SPI Clock)
-GPIO 19 ────────── SDI     (SPI Data In: Pico MOSI → driver)
-GPIO 16 ────────── SDO     (SPI Data Out: driver → Pico MISO)
+GPIO 13 ────────── CSN     (Chip Select — active LOW)
+GPIO 10 ────────── SCK     (SPI1 Clock)
+GPIO 11 ────────── SDI     (SPI Data In: Pico MOSI → driver)
+GPIO 12 ────────── SDO     (SPI Data Out: driver → Pico MISO)
 GPIO 14 ────────── STP     (Step pulse)
 GPIO 15 ────────── DIR     (Direction)
-GPIO 13 ────────── EN      (Enable — LOW = active)
+GPIO 1  ────────── EN      (Enable — LOW = active)
 GND     ────────── GND
 3V3     ────────── VCC     (Logic supply)
 12–24 V ────────── VM      (Motor supply — separate power rail)
 ```
 
-**Sense resistor (R_SENSE):** Most TMC2130 carrier boards (BigTreeTech, FYSETC)
-use **0.11 Ω**. Check your board schematic. The value is set in `main.cpp` as
+**Sense resistor (R_SENSE):** Most TMC2130 carrier boards (BigTreeTech, FYSETC) use
+**0.11 Ω**. Check your board schematic. It is set in `main.cpp` as
 `#define R_SENSE 0.11f` — update it if your board differs.
 
 **Motor Connections:**
 ```
-TMC2130 A  → NEMA17 Coil 1+
-TMC2130 A~ → NEMA17 Coil 1−
-TMC2130 B  → NEMA17 Coil 2+
-TMC2130 B~ → NEMA17 Coil 2−
+TMC2130 1A / 1B → NEMA17 coil 1 (A, A−)
+TMC2130 2A / 2B → NEMA17 coil 2 (B, B−)
 ```
 
 ---
@@ -76,51 +87,30 @@ TMC2130 B~ → NEMA17 Coil 2−
 ### LCD Display (GMT147SPI — 1.47" 172×320 ST7789)
 
 Module: **GMT147SPI** 1.47" SPI display, ST7789 controller, 172×320 pixels.
-Use the `Adafruit_ST7789` library and initialise with `tft.init(172, 320)`.
-Power the module from 3.3 V only.
-
-Board pin labels and their logical meaning:
-
-| Board Label | Function          |
-|-------------|-------------------|
-| SCL         | SPI Clock (SCK)   |
-| SDA         | SPI Data (MOSI)   |
-| RES         | Reset             |
-| DC          | Data/Command      |
-| CS          | Chip Select       |
-| BL          | Backlight enable  |
-| VDD         | 3.3 V supply      |
-| GND         | Ground            |
+Driven with `Adafruit_ST7789`, initialised as `tft.init(172, 320)` then
+`tft.setRotation(1)` (landscape 320×172). Power from 3.3 V only.
 
 ```
 RP2040 Pico         Display Module
 ───────────         ──────────────
 GPIO 9  ────────── CS   (Chip Select)
-GPIO 10 ────────── DC   (Data/Command)
-GPIO 11 ────────── RES  (Reset)
-GPIO 18 ────────── SCL  (SPI Clock — shared with TMC2130)
-GPIO 19 ────────── SDA  (SPI Data  — shared with TMC2130)
+GPIO 5  ────────── DC   (Data/Command)
+GPIO 6  ────────── RES  (Reset)
+GPIO 18 ────────── SCL  (SPI0 Clock)
+GPIO 19 ────────── SDA  (SPI0 Data / MOSI)
 GPIO 20 ────────── BL   (Backlight — HIGH = on)
 3V3     ────────── VDD
 GND     ────────── GND
 ```
 
 > Do not connect the display VDD to 5 V — the module is 3.3 V only.
-> BL can also be tied directly to 3V3 for always-on backlight (omit GPIO 20 connection).
+> BL can be tied directly to 3V3 for an always-on backlight (omit GPIO 20).
 
 ---
 
 ### Rotary Encoder (KY-040 type)
 
 All encoder pins use internal pull-ups — no external resistors needed.
-
-| Board Label | Function            |
-|-------------|---------------------|
-| CLK         | Quadrature A (ENC_A)|
-| DT          | Quadrature B (ENC_B)|
-| SW          | Push-button (ENC_SW)|
-| +           | 3.3 V supply        |
-| GND         | Ground              |
 
 ```
 Encoder             RP2040 Pico
@@ -132,20 +122,27 @@ SW  (Button)  ───── GPIO 22  (INPUT_PULLUP — LOW when pressed)
 GND           ───── GND
 ```
 
+**UI gestures:** rotate to navigate / edit, click to select. On the main menu a short
+click immediately followed by a long press (≥ 700 ms, within 400 ms of the release)
+toggles the advanced menu (Setup / About).
+
 ---
 
 ### Sensors & Switches
 
 ```
-Component           GPIO    Mode            Notes
-──────────          ────    ────            ─────
-Limit Switch ─────── 28     INPUT_PULLUP    Connect switch between GPIO 28 and GND.
-                                            Reads LOW when pressed.
-Spray Valve  ─────── 2      INPUT           External 0 / 3.3 V signal.
-                                            HIGH = spray is active.
-Flow Sensor  ─────── 3      INPUT           External 0 / 3.3 V signal.
-                                            HIGH = liquid is flowing.
+Component           GPIO    Mode             Notes
+──────────          ────    ────             ─────
+Limit Switch ─────── 28     INPUT_PULLUP     Switch between GPIO 28 and GND.
+                                             Reads LOW when pressed. 20 ms debounce.
+Spray Valve  ─────── 2      INPUT_PULLDOWN   External 0 / 3.3 V signal.
+                                             HIGH = spray active.
+Flow Sensor  ─────── 3      INPUT_PULLDOWN   External 0 / 3.3 V signal.
+                                             HIGH = liquid flowing.
 ```
+
+> Spray/flow are only read when the **Safety** setting is `ON`. In the default `DEBUG`
+> mode they are ignored and forced inactive in firmware.
 
 ### Outputs
 
@@ -154,58 +151,64 @@ Component           GPIO    Notes
 ──────────          ────    ─────
 LED Green    ─────── 8      3V3 through 470 Ω resistor
 LED Yellow   ─────── 7      3V3 through 470 Ω resistor
-Fan PWM      ─────── 12     Connect to fan driver/MOSFET gate (12 V fan)
-Ultrasonic   ─────── 4      Active-low relay trigger. LOW = ultrasonic ON.
+Fan PWM      ─────── 21     To fan driver / MOSFET gate (12 V fan)
+Ultrasonic   ─────── 4      Active-low relay trigger. LOW = generator ON.
+                            Energised only while the arm is over the wafer.
 ```
 
 ---
 
 ## TMC2130 Driver Configuration
 
-The driver is configured via SPI at startup using the **TMCStepper** library.
-Key settings (adjustable in `initTMC2130()` in `src/main.cpp`):
+Configured over SPI1 at startup in `initTMC2130()` using the **TMCStepper** library.
+Settings persist to flash and can be changed on-device in the **Setup** menu (Current,
+Mstep, Invert).
 
-| Setting | Value | Notes |
-|---------|-------|-------|
-| `rms_current` | 600 mA | Reduce if driver or motor runs hot |
-| `microsteps` | 16× | Update `STEPS_PER_MM` in `main.cpp` to match |
-| `en_pwm_mode` | true | StealthChop — silent at low speed |
+| Setting | Default | Notes |
+|---------|---------|-------|
+| `rms_current` | 600 mA | Run hold 25 %, park hold 10 % of run current |
+| `microsteps` | 256× | Editable; motion is angle-based, so no recalibration needed |
+| `en_pwm_mode` | true | StealthChop — quiet at low speed |
 | `pwm_autoscale` | true | Auto-tune StealthChop amplitude |
+| `intpol` | true | 256-microstep interpolation |
 | `toff` | 5 | Enables the chopper — required |
 
-> **After changing `microsteps`:** recalculate and update `STEPS_PER_MM` in
-> `main.cpp`. Formula: `(motor_steps_per_rev × microsteps) ÷ lead_screw_pitch_mm`.
+Two hold-current modes reduce heat and holding torque when idle:
+- **Run hold** (`DRIVER_RUN_HOLD_MULTIPLIER`, 25 %) — while moving / staging.
+- **Park hold** (`DRIVER_PARK_HOLD_MULTIPLIER`, 10 %) — once settled at the park angle.
+
+The status column shows `RUN` / `PARK` for the active hold mode.
 
 ---
 
-## Steps-per-mm Calibration
+## Angle-Based Motion (no steps-per-mm)
 
-`STEPS_PER_MM` defaults to `1` (uncalibrated). To calibrate:
+There is **no `STEPS_PER_MM` calibration**. Motion is commanded in arm angle and
+converted to steps using the live microstep setting:
 
-1. Command the motor to move a known number of steps.
-2. Measure actual travel with a ruler.
-3. Calculate: `STEPS_PER_MM = steps_commanded / mm_travelled`.
-4. Update `const int STEPS_PER_MM = <value>;` in `src/main.cpp`.
-
-Example (200 step/rev motor, 2 mm lead screw, 16× microsteps):
 ```
-STEPS_PER_MM = (200 × 16) / 2 = 1600
+steps = degrees × FULL_STEPS_PER_REV × microsteps / 360
 ```
+
+Changing microsteps therefore needs no recalibration — angles stay correct. The sweep
+width is derived from the selected wafer diameter and the arm length
+(`ARM_LENGTH_MM`, set in Setup).
 
 ---
 
 ## Testing Checklist
 
 - [ ] **Power**: 12–24 V at VM, 3.3 V on VCC_IO
-- [ ] **SPI**: Scope or multimeter on CS, SCK, MOSI during startup
-- [ ] **TMC2130**: Serial output shows "TMC2130 configured"
-- [ ] **Motor**: Spins during HOMING state (EN goes LOW)
+- [ ] **SPI1 (TMC)**: scope CS/SCK/MOSI on GPIO 13/10/11 during startup
+- [ ] **SPI0 (LCD)**: display initialises (title visible)
+- [ ] **TMC2130**: serial shows "TMC2130 configured…"; About screen shows live status
+- [ ] **Motor**: spins during HOMING (EN GPIO 1 goes LOW)
 - [ ] **Limit switch**: GPIO 28 drops to 0 V when pressed
-- [ ] **Spray valve**: GPIO 2 reads 3.3 V when spray is active
-- [ ] **Flow sensor**: GPIO 3 reads 3.3 V when liquid is flowing
-- [ ] **LEDs**: Green and Yellow illuminate per state table
-- [ ] **Fan PWM**: Duty cycle varies with state (multimeter)
-- [ ] **Ultrasonic relay**: GPIO 4 drops to 0 V in SPRAY_ACTIVE/OSCILLATING
+- [ ] **Spray valve** (Safety = ON): GPIO 2 reads 3.3 V when active
+- [ ] **Flow sensor** (Safety = ON): GPIO 3 reads 3.3 V when flowing
+- [ ] **LEDs**: green/yellow follow the state table
+- [ ] **Fan PWM**: duty varies with state on GPIO 21
+- [ ] **Ultrasonic relay**: GPIO 4 drops to 0 V while the arm is over the wafer
 
 ---
 
@@ -213,13 +216,14 @@ STEPS_PER_MM = (200 × 16) / 2 = 1600
 
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
-| Motor jitters or stalls | Wrong `rms_current` | Reduce or increase in `initTMC2130()` |
-| Motor won't move | EN pin not going LOW | Check `motorSetEnable(true)` is called |
-| SPI not working | Pin mismatch | Verify GPIO 16/18/19 match SPI0 defaults |
-| LCD blank | Wrong CS/DC/RST | Check GPIO 9, 10, 11; also verify BL (GPIO 20) is HIGH |
-| Sensor always HIGH | Floating input | Verify external pull-down or signal source |
-| Encoder not responding | No pull-up | Already fixed: firmware uses `INPUT_PULLUP` |
-| Motor runs hot | Current too high | Lower `rms_current` in `initTMC2130()` |
+| Motor jitters or stalls | Wrong current | Adjust Current in Setup or `driverCurrent` |
+| Motor won't move | EN not LOW | Check GPIO 1; `motorSetEnable(true)` in active states |
+| TMC SPI dead | Pin/bus mismatch | Verify SPI1 on GPIO 10/11/12/13 and 3.3 V VCC_IO |
+| LCD blank | Wrong CS/DC/RES | Check GPIO 9/5/6; ensure BL (GPIO 20) is HIGH |
+| Sensor always inactive | Safety = DEBUG | Set Safety = ON in Setup to read GPIO 2/3 |
+| Sensor floating | No source | Inputs use pull-downs; drive with a real 0/3.3 V signal |
+| ERROR after start | Driver fault / home timeout | Check About status + limit wiring; press START to retry |
+| Motor runs hot | Current too high | Lower Current in Setup |
 
 ---
 
@@ -229,3 +233,4 @@ STEPS_PER_MM = (200 × 16) / 2 = 1600
 - [TMC2130 Datasheet](https://www.trinamic.com/fileadmin/assets/Documents/TMC2130_Datasheet_Rev1.35.pdf)
 - [TMCStepper Library](https://github.com/teemuatlut/TMCStepper)
 - [Adafruit ST7789 Library](https://github.com/adafruit/Adafruit-ST7789-Library)
+</content>

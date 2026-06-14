@@ -33,8 +33,8 @@ cd Stepper-controller
 pio pkg install
 ```
 
-This downloads the RP2040 Arduino framework, GCC ARM toolchain, and all libraries
-(TMCStepper, Adafruit GFX, Adafruit ST7789).
+This downloads the earlephilhower RP2040 Arduino core, the GCC ARM toolchain, and the
+libraries (TMCStepper, Adafruit GFX, Adafruit ST7789).
 
 #### 4. Generate VS Code IntelliSense Config
 
@@ -45,41 +45,34 @@ pio init --ide vscode
 ### Build & Flash
 
 ```bash
-# Build only
-pio run
-
-# Build and upload (Pico must be in BOOTSEL/bootloader mode)
-pio run --target upload
-
-# Monitor serial output at 115200 baud
-pio device monitor --baud 115200
-
-# Clean build artefacts
-pio run --target clean
+pio run                          # Build only
+pio run --target upload          # Build and upload (Pico in BOOTSEL mode)
+pio device monitor --baud 115200 # Serial monitor
+pio run --target clean           # Clean build artefacts
 ```
 
 **Flash via drag-and-drop:**
-1. Hold BOOTSEL button on Pico, then plug in USB.
-2. Pico appears as a USB drive.
-3. Drag `.pio/build/pico/firmware.uf2` onto the drive.
-4. Pico reboots automatically.
+1. Hold BOOTSEL on the Pico, then plug in USB.
+2. The Pico appears as a USB drive.
+3. Drag `.pio/build/<env>/firmware.uf2` onto the drive.
+4. The Pico reboots automatically.
 
 ---
 
 ## Project Structure
 
 ```
-Stepper-controller/
+Megasonic/
 ├── platformio.ini          # PlatformIO project config & library deps
 ├── src/
-│   └── main.cpp            # All firmware (~350 lines)
+│   └── main.cpp            # All firmware (~2050 lines)
+├── tools/
+│   └── gui_preview.html    # Browser mock-up of the LCD UI
 ├── include/                # Header files (reserved for future modularisation)
 ├── lib/                    # Local libraries (reserved)
-├── .vscode/
-│   ├── extensions.json     # Recommended extensions
-│   └── c_cpp_properties.json  # IntelliSense paths (auto-generated)
+├── test/                   # Unit tests (reserved)
 ├── README.md               # Project overview
-├── HARDWARE.md             # Pin assignments, wiring, calibration
+├── HARDWARE.md             # Pin assignments, wiring, driver config
 ├── STATE_MACHINE.md        # State diagram & behaviour reference
 ├── SETUP.md                # This file
 ├── TESTING.md              # Validation & troubleshooting
@@ -94,12 +87,16 @@ The firmware uses both RP2040 cores:
 
 | Core | Entry points | Responsibility |
 |------|-------------|----------------|
-| Core 0 | `setup()` / `loop()` | State machine, motor steps, sensor reading, encoder polling |
-| Core 1 | `setup1()` / `loop1()` | LCD rendering (~20 fps) |
+| Core 0 | `setup()` / `loop()` | State machine, motor steps, sensors, encoder, TMC2130, settings |
+| Core 1 | `setup1()` / `loop1()` | LCD rendering (~20 fps, on change only) |
 
-Core 1 spins on `core0_ready` (set at the end of `setup()`) before touching the display, ensuring SPI is initialised before either core accesses it. All variables shared between cores are declared `volatile`.
+Core 1 spins on `core0_ready` (set at the end of `setup()`) before touching the display.
+All variables shared between cores are declared `volatile`. The TMC2130 (SPI1) and the
+LCD (SPI0) are on **separate buses**; a single `mutex_t spi_mutex` serialises all SPI
+access so the two cores never drive a bus concurrently.
 
-When the TMC2130 is connected, a mutex will be needed around SPI bus access because Core 0 (TMC2130) and Core 1 (display) share SPI0.
+`setup()` order: `loadSettings()` → `initHardware()` → `initSPI()` → `initTMC2130()`
+→ `initEncoder()` → `initDisplay()`.
 
 ---
 
@@ -108,24 +105,28 @@ When the TMC2130 is connected, a mutex will be needed around SPI bus access beca
 ### Pin Constants (top of file)
 
 ```cpp
-const int TMC_CS = 17, TMC_SCK = 18, TMC_MOSI = 19, TMC_MISO = 16;
-const int TMC_STEP = 14, TMC_DIR = 15, TMC_EN = 13;
-const int LCD_CS = 9, LCD_DC = 10, LCD_RST = 11;
-const int ENC_A = 26, ENC_B = 27;
+// TMC2130 on SPI1
+const int TMC_CS = 13, TMC_SCK = 10, TMC_MOSI = 11, TMC_MISO = 12;
+const int TMC_STEP = 14, TMC_DIR = 15, TMC_EN = 1;   // EN LOW = active
+// LCD on SPI0
+const int LCD_CS = 9, LCD_DC = 5, LCD_RST = 6, LCD_MOSI = 19, LCD_SCK = 18, LCD_BL = 20;
+// Encoder, sensors, outputs
+const int ENC_A = 26, ENC_B = 27, ENC_SW = 22;
 const int LIMIT_SWITCH = 28, SPRAY_VALVE = 2, FLOW_SENSOR = 3;
-const int LED_GREEN = 8, LED_YELLOW = 7, FAN_PWM = 12, ULTRASONIC = 4;
+const int LED_GREEN = 8, LED_YELLOW = 7, FAN_PWM = 21, ULTRASONIC = 4;
 ```
 
-### Motion Parameters
+### Motion Parameters (angle-based; editable on-device, persisted to flash)
 
 ```cpp
-const int STEPS_PER_MM      = 1;     // Calibrate first — see HARDWARE.md
-const int PARK_MM           = 7;     // Park position (mm from limit)
-const int CENTER_MM         = 26;    // Oscillation centre (mm from limit)
-const int OSCILLATION_STEPS = 16;    // Steps per directional sweep
-const unsigned long OSCILLATION_DELAY  = 10000; // ms per step
-const unsigned long OSCILLATION_CYCLES = 20;    // Sweeps before idle
-const unsigned long SPRAY_ACTIVE_WAIT  = 2000;  // ms stabilisation delay
+const int FULL_STEPS_PER_REV = 200;   // 1.8° NEMA17
+int  PARK_DEG_X10   = 70;             // 7.0° park angle
+int  CENTER_DEG_X10 = 260;            // 26.0° sweep centre
+int  ARM_LENGTH_MM  = 250;            // arm length (transducer radius)
+unsigned long SWEEP_TIME_MS      = 4000;  // ms per directional sweep
+unsigned long OSCILLATION_CYCLES = 4;     // sweeps per cycle (0 = forever)
+const unsigned long SPRAY_ACTIVE_WAIT = 2000;
+bool SENSOR_INPUTS_ENABLED = false;   // false = DEBUG (sensors bypassed)
 ```
 
 ### State Machine
@@ -137,178 +138,135 @@ enum SystemState {
 };
 ```
 
+Control flags: `needsHoming` (re-home before a run), `stopRequested` (park then
+disable), `faultLatched` (driver fault), `homingToStop` (abort path), and
+`sensorBypassCycleArmed` (DEBUG-mode run gate).
+
+### Persistent Settings
+
+`StoredSettings` is written to flash via the `EEPROM` emulation, tagged with a magic
+(`"MSGC"`), a version (`SETTINGS_VERSION`), a size, and an FNV-1a checksum. Edits call
+`markSettingsDirty()`; `loop()` commits them after `SETTINGS_SAVE_DELAY` (2.5 s) of quiet
+so a burst of encoder steps becomes one flash write. A version/size/checksum mismatch
+falls back to defaults.
+
 ---
 
 ## Function API
 
-### Motor Control
+### Motor Control (angle-based)
 
-**`motorStep(int direction)`** — Pulse the STEP pin once; update position counter.
-- `direction`: `1` = forward (away from limit), `−1` = toward limit.
+**`motorStep(int direction)`** — pulse STEP once; update `motorPosition`.
+`1` = away from limit, `−1` = toward limit. Honours `motorDirectionInverted`.
 
-**`motorSetEnable(bool enable)`** — Drive the TMC2130 EN pin.
-- `true` = motor active (holds torque); `false` = motor disabled.
+**`motorSetEnable(bool enable)`** — drive EN. `false` (HIGH) disables and implies the
+position is now unknown (`needsHoming`).
 
-**`motorMoveTo(int target)`** — Call repeatedly; moves one step per call toward target.
-- Stops when `motorPosition == target`.
+**`motorMoveTo(int target)`** — call repeatedly; one step per call toward `target`.
 
-### Sensor Reading
+**`motorMoveToBlocking(int target, us)`** — busy-loop to a target (used for the live
+Centre jog in Setup).
 
-**`readSensors()`** — Polls all inputs; updates globals `limitSwitchPressed`, `sprayActive`, `flowDetected`.
-- Limit switch is debounced (20 ms).
+**`degX10ToSteps()` / `stepsToDegX10()`** — convert between angle (0.1°) and microsteps
+using the live microstep setting.
 
-**`readEncoder()`** — Quadrature decoding; updates `menuIndex`.
-- Encoder pins use internal pull-ups — no external resistors needed.
-- Accumulates transitions; requires ±4 (one full KY-040 detent click) before registering a step.
-- Enforces 50 ms minimum between accepted steps to suppress contact bounce.
+### Sensors / Input
+
+**`readSensors()`** — debounces the limit switch always; reads spray/flow only when
+`SENSOR_INPUTS_ENABLED`, otherwise forces them inactive.
+
+**`readEncoder()`** — 4-transition quadrature accumulator with acceleration; routes the
+delta to the active screen (menu navigation, value edit) and handles the click /
+short-then-long-press menu-unlock gesture.
 
 ### Output Control
 
-**`setLED(int pin, bool state)`** — `true` = LED on.
-
-**`setFan(int speed)`** — PWM 0–255 via `analogWrite`. Clamped with `constrain`.
-
-**`setUltrasonic(bool on)`** — `true` = relay ON (GPIO 4 driven LOW). Active-low logic.
+**`setLED(pin, state)`** — `true` = on.
+**`setFan(speed)`** — PWM 0–255 via `analogWrite` (clamped).
+**`setUltrasonic(bool on)`** — `true` drives GPIO 4 LOW (relay ON) and sets
+`ultrasonicActive`. Callers pass `armOverWafer()` so the generator is on only over the
+wafer.
+**`armOverWafer()`** — true when `|currentAngle − centre| ≤ half the sweep`.
 
 ### TMC2130
 
-The driver is accessed through the **TMCStepper** library object `driver`.
-Raw SPI register access is available via `driver.read()` / `driver.write()` if needed.
+Accessed through the TMCStepper `driver` object on SPI1, guarded by `spi_mutex`.
 
-Key calls used at startup in `initTMC2130()`:
-
-```cpp
-driver.begin();
-driver.toff(5);              // Enable chopper (mandatory)
-driver.rms_current(600);     // RMS current in mA
-driver.microsteps(16);       // Microstep resolution
-driver.en_pwm_mode(true);    // StealthChop
-driver.pwm_autoscale(true);  // Auto-tune amplitude
-```
+- `initTMC2130()` — current, microsteps, StealthChop, interpolation, hold delays.
+- `applyDriverSettings()` — re-apply current/microsteps after an edit.
+- `setDriverParkHold(bool)` — switch between run-hold (25 %) and park-hold (10 %).
+- `pollDriverStatus()` — every 500 ms; reads `DRV_STATUS`/`GSTAT` and latches a fault on
+  overtemperature, short-to-ground, or charge-pump undervoltage.
 
 ### State Machine
 
-**`updateStateMachine()`** — Evaluates transition conditions; updates `currentState`.  
-**`handleState()`** — Executes actions for the current state (motor steps, LED, fan, etc.).  
-Both are called every main loop iteration.
+**`updateStateMachine()`** — evaluate transition conditions; update `currentState`.
+**`handleState()`** — execute the current state's outputs (motor, LEDs, fan, generator).
+Both run every Core 0 loop iteration.
 
-### Display
+### Display (Core 1)
 
-**`updateDisplay()`** — Called by `loop1()` on Core 1 at ~20 fps. Snapshots all volatile
-shared variables once per call and redraws LCD + echoes to Serial only when something
-has changed (dirty-flag check). Avoids screen flicker and cross-core tearing.
-
-**`drawMenu()`** — On first call: paints title + all menu rows. On subsequent calls:
-repaints only the two rows whose selection state changed (no `fillScreen`). Snapshots
-`menuIndex` into a local variable at entry to prevent Core 0 from changing it
-mid-draw and leaving two rows simultaneously highlighted.
+**`updateDisplay()`** — snapshots volatile state once per call and redraws the LCD +
+echoes to serial only on change. Dispatches to `drawMenu()` / `drawSettings()` /
+`drawSetup()` / `drawAbout()` and the status column.
+**`drawArmAnim()`** — top-down sketch under the basic menu: wafer circle, park tick, live
+arm arrow, and a blinking lightning sign while the generator is on.
 
 ---
 
-## Adding Features
+## Extending the Firmware
 
-### 1. Calibrate Steps-per-mm
+### Change default sweep / hardware parameters
+Edit the initialisers near the top of `main.cpp` (`PARK_DEG_X10`, `CENTER_DEG_X10`,
+`ARM_LENGTH_MM`, `SWEEP_TIME_MS`, `OSCILLATION_CYCLES`, `driverCurrent`,
+`driverMicrosteps`). All are also editable on-device and override defaults from flash.
 
-Update `const int STEPS_PER_MM` after measuring actual travel:
+### Add a persisted setting
+1. Add a field to `StoredSettings` and bump `SETTINGS_VERSION`.
+2. Populate it in `saveSettings()` and read it (with `constrain`) in `loadSettings()`.
+3. Expose it in the relevant screen (`drawSettingsRow`/`drawSetupRow` +
+   `adjustSettingsValue`/`adjustSetupValue`), then call `markSettingsDirty()`.
 
-```cpp
-// Example: 200 step/rev, 16× microsteps, 2 mm lead screw
-const int STEPS_PER_MM = 1600;
-```
+> Bumping the version invalidates old flash blobs, so the device falls back to defaults
+> on the first boot after the change — expected.
 
-### 2. Adjust Motor Current
+### Add a velocity profile
+Extend `sweepStepIntervalUs()` with a new branch and add the constant + UI label
+(`SWEEP_PROFILE_*`, `drawSettingsRow` case 3).
 
-In `initTMC2130()`:
-
-```cpp
-driver.rms_current(800);   // 800 mA for higher-torque motors
-```
-
-Reduce if driver or motor runs hot. Measure temperature after a few minutes.
-
-### 3. Change Microstep Resolution
-
-Update both the driver and the calibration constant:
-
-```cpp
-driver.microsteps(32);         // Change microstep setting
-const int STEPS_PER_MM = ...;  // Recalculate accordingly
-```
-
-### 4. Add Error Detection
-
-Wire a fault condition into `updateStateMachine()`:
-
-```cpp
-case STATE_OSCILLATING:
-    if (driver.stallguard()) {  // TMC2130 stall detection
-        currentState    = STATE_ERROR;
-        lastStateChange = millis();
-    }
-    break;
-```
-
-### 5. Add Encoder Button Action (SELECT)
-
-`ENC_SW` (GPIO 22) is already wired with `INPUT_PULLUP`. Add action handling in `readEncoder()`:
-
-```cpp
-// In readEncoder():
-if (digitalRead(ENC_SW) == LOW) {
-    // Confirm menu selection for menuIndex
-}
-```
+### Microstep changes need no recalibration
+Motion is angle-based, so changing `driverMicrosteps` keeps all angles correct — no
+steps-per-mm to recompute.
 
 ---
 
 ## Debugging Tips
 
-### Serial Monitor
+### Serial commands
+Type a key in the monitor: `d` dump TMC, `e`/`x` enable/disable, `+`/`-` single step,
+`f`/`b` 400-step burst, `r` one shaft revolution, `?` help. See `handleSerialDebug()`.
 
-```bash
-pio device monitor --baud 115200
-```
+### GPIO testing (multimeter)
+- `0 V` = LOW, `3.3 V` = HIGH.
+- EN (GPIO 1) reads `0 V` when the motor is active, `3.3 V` when disabled.
+- ULTRASONIC (GPIO 4) reads `0 V` only while the arm is over the wafer during a cycle.
 
-Output appears only on state or position changes (dirty flag). Force a debug
-print by adding to any function:
-
-```cpp
-Serial.print("debug: motorPosition=");
-Serial.println(motorPosition);
-```
-
-### GPIO Testing
-
-Use a multimeter:
-- `0 V` = LOW, `3.3 V` = HIGH
-- EN pin should read `0 V` when motor is active, `3.3 V` when disabled
-- ULTRASONIC pin should read `0 V` during SPRAY_ACTIVE and OSCILLATING
-
-### TMC2130 Verification
-
-Read a register to confirm SPI communication:
-
-```cpp
-uint32_t gstat = driver.GSTAT();
-Serial.print("GSTAT: 0x");
-Serial.println(gstat, HEX);
-// Expected: 0x00000001 on first power-up (reset flag set)
-```
+### Driver status
+The **About** screen shows live `DRV_STATUS`/`GSTAT` fields (OT, OTPW, CS, SG, STST,
+ERR). `d` on serial dumps the full register decode.
 
 ---
 
 ## Performance
 
-Current build (release mode, earlephilhower framework):
-
 | Metric | Value |
 |--------|-------|
-| Flash | 75 KB (3.6 % of 2 MB) |
-| RAM | 9.5 KB (3.6 % of 264 KB) |
-| Motor/sensor update | Every 50 ms (Core 0) |
-| Encoder poll | Every 20 ms (Core 0) |
+| Motor step cadence (homing/parking) | every 500 µs |
+| Encoder poll | every loop iteration (~1 ms gate) |
+| Driver status poll | every 500 ms |
+| Settings auto-save debounce | 2.5 s of quiet |
 | Display update | ~20 fps (Core 1, on change only) |
-| SPI clock (LCD) | 20 MHz hardware SPI |
+| SPI clock (LCD) | 20 MHz |
 
 ---
 
@@ -318,3 +276,4 @@ Current build (release mode, earlephilhower framework):
 - [RP2040 Arduino Core (earlephilhower)](https://github.com/earlephilhower/arduino-pico)
 - [TMCStepper Library](https://github.com/teemuatlut/TMCStepper)
 - [Adafruit ST7789 Library](https://github.com/adafruit/Adafruit-ST7789-Library)
+</content>

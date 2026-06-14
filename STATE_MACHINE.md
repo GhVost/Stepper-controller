@@ -2,178 +2,149 @@
 
 ## Overview
 
-The Stepper Controller uses a non-blocking, event-driven state machine on the RP2040.
-All timing uses `millis()` comparisons — no `delay()` calls block the main loop.
-Sensor inputs are polled every loop iteration; motor steps and display updates are
-rate-limited by independent interval timers.
+MEGASONIC uses a non-blocking, event-driven state machine on Core 0 of the RP2040.
+All timing uses `millis()` / `micros()` comparisons — no `delay()` blocks the loop.
+Sensors and the encoder are polled every iteration; motor steps are rate-limited by
+interval timers. Core 1 owns the LCD.
+
+Two things shape the behaviour throughout:
+
+- **Operating mode** — the **Safety** setting (`SENSOR_INPUTS_ENABLED`). When `ON`,
+  the spray valve and flow sensor gate the cycle. When `DEBUG` (the default), those
+  inputs are ignored and the cycle is driven from the menu (`sensorBypassCycleArmed`).
+- **Position knowledge** — `needsHoming`. Whenever the motor is de-energised the
+  position is considered unknown, so the controller **re-homes before every run**.
+  Homing clears the flag once the limit switch is reached.
+
+Motion is expressed in **arm angle** (tenths of a degree, `…DegX10`). `PARK_DEG_X10`
+is a small angle near the limit switch; `CENTER_DEG_X10` is the sweep centre over the
+wafer. The sweep half-width is derived from the wafer diameter and arm length.
 
 ---
 
 ## State Diagram
 
 ```
-                    ┌──────────────────────────────────┐
-                    │            STATE_IDLE             │
-                    │  Motor off, all outputs off       │
-                    │  Waiting for spray valve          │
-                    └─────────────┬────────────────────┘
-                                  │ Spray valve ON
-                                  ▼
-                    ┌──────────────────────────────────┐
-                    │           STATE_HOMING            │
-                    │  Motor steps toward limit (−dir)  │
-                    │  Yellow LED ON                    │
-                    └─────────────┬────────────────────┘
-                                  │ Limit switch pressed
-                                  │ (motorPosition reset to 0)
-                                  ▼
-                    ┌──────────────────────────────────┐
-                    │           STATE_PARKED            │
-                    │  Motor steps forward to PARK_STEPS│
-                    │  Motor disabled when at park      │
-                    │  Green LED ON                     │
-                    └──────┬──────────────┬────────────┘
-                           │              │
-              Spray ON,    │              │ Spray ON,
-              no flow      │              │ flow ON
-                           ▼              ▼
-          ┌─────────────────────┐   (→ STATE_SPRAY_ACTIVE)
-          │  STATE_WAITING_SPRAY│
-          │  Fan 50 %           │
-          │  Yellow LED ON      │
-          └──────────┬──────────┘
-                     │ Flow ON
-                     ▼
-                    ┌──────────────────────────────────┐
-                    │         STATE_SPRAY_ACTIVE        │
-                    │  Fan 100 %, Ultrasonic ON         │
-                    │  Motor moves to CENTER_STEPS      │
-                    │  2 s stabilisation wait           │
-                    │  Green LED ON                     │
-                    └─────────────┬────────────────────┘
-                                  │ Motor at centre AND 2 s elapsed
-                                  ▼
-                    ┌──────────────────────────────────┐
-                    │         STATE_OSCILLATING         │
-                    │  Motor sweeps ±OSCILLATION_STEPS  │
-                    │  One step per OSCILLATION_DELAY   │
-                    │  Fan 100 %, Ultrasonic ON         │
-                    │  Green LED ON                     │
-                    └─────────────┬────────────────────┘
-                                  │ 20 sweeps complete
-                                  │ OR spray/flow lost
-                                  ▼
-                    ┌──────────────────────────────────┐
-                    │            STATE_IDLE             │
-                    └──────────────────────────────────┘
+        ┌───────────────────────────────────────────────┐
+        │                  STATE_IDLE                    │
+        │  Motor disabled, all outputs off               │
+        │  START (menu)  ── or, in sensor mode, spray ON │
+        └───────────────┬───────────────────────────────┘
+                        │  capture homingStartPos
+                        ▼
+        ┌───────────────────────────────────────────────┐
+        │                 STATE_HOMING                   │
+        │  Step toward limit (dir −1), yellow LED         │
+        │  Abort → ERROR if no endstop within 70° travel  │
+        └───────────────┬───────────────────────────────┘
+                        │  limit pressed → position = 0, needsHoming = false
+                        ▼
+        ┌───────────────────────────────────────────────┐
+        │                 STATE_PARKED                   │
+        │  Move to PARK_DEG_X10, then park-hold current   │
+        │  Green LED                                      │
+        └──┬─────────────┬──────────────┬────────────────┘
+           │ stop / none │ DEBUG armed   │ sensor mode
+           ▼             ▼  or spray+flow ▼  spray, no flow
+      STATE_IDLE   STATE_SPRAY_ACTIVE   STATE_WAITING_SPRAY
+      (disable)          ▲                     │ flow ON
+                         └─────────────────────┘
+                         ▼
+        ┌───────────────────────────────────────────────┐
+        │              STATE_SPRAY_ACTIVE                │
+        │  Fan 100 %, generator ON over wafer             │
+        │  Move to sweep start; wait SPRAY_ACTIVE_WAIT    │
+        └───────────────┬───────────────────────────────┘
+                        │  at start AND ≥ 2 s
+                        ▼
+        ┌───────────────────────────────────────────────┐
+        │               STATE_OSCILLATING                │
+        │  Sweep across the wafer per SWEEP_TIME/profile  │
+        │  Fan 100 %, generator ON only over the wafer    │
+        └───────────────┬───────────────────────────────┘
+                        │  OSCILLATION_CYCLES done (0 = forever)
+                        ▼
+                  STATE_PARKED ── nothing pending → STATE_IDLE (disable)
 
-At any point, spray or flow loss during SPRAY_ACTIVE or OSCILLATING
-immediately transitions back to STATE_IDLE.
+  STOP (menu) at any active state → PARKED → disable → IDLE.
+  In sensor mode, loss of spray/flow during SPRAY_ACTIVE/OSCILLATING → PARKED.
 
-                    ┌──────────────────────────────────┐
-                    │           STATE_ERROR             │
-                    │  Motor off, all outputs off       │
-                    │  Yellow LED blinks at 1 Hz        │
-                    │  Requires power-cycle to reset    │
-                    └──────────────────────────────────┘
+        ┌───────────────────────────────────────────────┐
+        │                 STATE_ERROR                    │
+        │  Motor disabled, outputs off, yellow LED 1 Hz   │
+        │  Entered on driver fault or home-search timeout │
+        │  Recover with START (re-homes, clears fault)    │
+        └───────────────────────────────────────────────┘
 ```
+
+---
+
+## Menu START / STOP
+
+`START/STOP` is menu item 0; the icon shows ▶ when idle and ■ when running.
+
+- **START from `IDLE` or `ERROR`** — clears `faultLatched`/`stopRequested`, arms the
+  bypass cycle in DEBUG mode, captures `homingStartPos`, and enters `HOMING`. This
+  always re-establishes position first.
+- **START from `PARKED` with known position (DEBUG mode)** — begins the cleaning cycle
+  directly (`SPRAY_ACTIVE`).
+- **STOP (any other active state)** — sets `stopRequested`, routes through `PARKED`,
+  then disables the motor and returns to `IDLE`.
 
 ---
 
 ## State Definitions
 
 ### STATE_IDLE
-**Entry**: Power-on or any cleaning cycle end  
-**Actions**: Motor disabled, all LEDs off, fan off, ultrasonic off  
-**Exit**: Spray valve goes HIGH → STATE_HOMING
-
----
+**Entry**: power-on, end of cycle, or after a stop.
+**Actions**: motor disabled, LEDs off, fan off, generator off.
+**Exit**: driver fault → `ERROR`; START → `HOMING`; (sensor mode) spray ON → `HOMING`.
 
 ### STATE_HOMING
-**Entry**: Spray valve detected  
-**Actions**:
-- Motor enabled
-- Steps toward limit switch at `MOTOR_UPDATE_INTERVAL` (50 ms/step)
-- Yellow LED ON
-
-**Exit**: Limit switch pressed → `motorPosition` reset to 0 → STATE_PARKED
-
----
+**Entry**: START or spray detected.
+**Actions**: motor enabled, steps toward the limit at `MOTOR_UPDATE_INTERVAL_US`,
+yellow LED on.
+**Safety**: if the limit is not reached within `HOMING_MAX_DEG_X10` (70°) of travel,
+the motor is disabled and the state latches `ERROR`.
+**Exit**: limit pressed → `motorPosition = 0`, `needsHoming = false` →
+`PARKED` (or `ERROR`/`IDLE` if a fault or stop/abort is pending).
 
 ### STATE_PARKED
-**Entry**: After homing completes  
-**Actions**:
-- Motor steps forward (1 step per 50 ms) until `motorPosition >= PARK_STEPS`
-- Motor disabled once at park position
-- Green LED ON
+**Entry**: after homing, after a stop, or at the end of a cleaning cycle.
+**Actions**: steps to `PARK_DEG_X10`; once there, switches to park-hold current
+(reduced) — green LED on, fan off, generator off.
+**Exit (once at the park angle)**:
+- fault latched → `ERROR`
+- `stopRequested` → `IDLE` (motor disabled)
+- DEBUG bypass armed, or (sensor mode) spray + flow → `SPRAY_ACTIVE`
+- (sensor mode) spray, no flow → `WAITING_SPRAY`
+- nothing pending → `IDLE` (motor disabled)
 
-**Exit conditions**:
-- At park AND spray ON AND no flow → STATE_WAITING_SPRAY
-- At park AND spray ON AND flow ON → STATE_SPRAY_ACTIVE
-
----
-
-### STATE_WAITING_SPRAY
-**Entry**: Spray detected but flow not yet present  
-**Actions**:
-- Motor disabled
-- Fan at 50 % (PWM 128) to prime circulation
-- Yellow LED ON
-
-**Exit conditions**:
-- Flow detected → STATE_SPRAY_ACTIVE
-- Spray lost → STATE_PARKED
-
----
+### STATE_WAITING_SPRAY *(sensor mode only)*
+**Entry**: spray detected but no flow yet.
+**Actions**: motor disabled, fan at 50 % (`FAN_WAITING`), yellow LED on.
+**Exit**: flow ON → `SPRAY_ACTIVE`; spray lost → `PARKED`.
 
 ### STATE_SPRAY_ACTIVE
-**Entry**: Both spray and flow confirmed  
-**Actions**:
-- Fan at 100 % (PWM 255)
-- Ultrasonic relay ON (GPIO 4 LOW)
-- Motor steps toward `CENTER_STEPS` (1 step per 50 ms)
-- Green LED ON
-- Waits `SPRAY_ACTIVE_WAIT` (2 s) for the system to stabilise
-
-**Exit conditions**:
-- Motor at centre AND ≥ 2 s elapsed → STATE_OSCILLATING
-- Spray or flow lost → STATE_IDLE
-
----
+**Entry**: cycle gated (bypass armed, or spray + flow confirmed).
+**Actions**: fan 100 %, generator ON **while the arm is over the wafer**, green LED on;
+moves to the sweep start (`sweepBackSteps()`); waits `SPRAY_ACTIVE_WAIT` (2 s).
+**Exit**: at the sweep start AND ≥ 2 s elapsed → `OSCILLATING`;
+(sensor mode) spray or flow lost → `PARKED`.
 
 ### STATE_OSCILLATING
-**Entry**: From SPRAY_ACTIVE once motor is centred and system is stable  
-**Actions**:
-- Motor alternates direction every `OSCILLATION_STEPS` steps
-- One step fired every `OSCILLATION_DELAY` ms
-- `oscillationCount` increments after each directional sweep
-- Fan 100 %, Ultrasonic ON, Green LED ON
+**Entry**: from `SPRAY_ACTIVE` once at the sweep start and settled.
+**Actions**: alternates between the sweep start and end; step interval comes from
+`SWEEP_TIME_MS` shaped by the velocity profile; `oscillationCount` increments after each
+return sweep. Fan 100 %, generator ON over the wafer, green LED on.
+**Exit**: `oscillationCount >= OSCILLATION_CYCLES` (when > 0) → `PARKED` (cycle complete);
+(sensor mode) spray or flow lost → `PARKED`.
 
-**Oscillation pattern** (default parameters):
-```
-Sweep 1: pos 26 → 10  (16 steps × 10 s = 160 s, toward limit)
-Sweep 2: pos 10 → 26  (16 steps × 10 s = 160 s, away from limit)
-Sweep 3: pos 26 → 10  ...
-...
-Sweep 20: pos 10 → 26
-```
-
-Motor oscillates between `CENTER_STEPS − OSCILLATION_STEPS` and `CENTER_STEPS`.
-
-**Timing**:
-- 1 sweep = 16 steps × 10 s = 160 s ≈ 2.7 min
-- 20 sweeps = 3 200 s ≈ **53 min** total cleaning time
-
-**Exit conditions**:
-- `oscillationCount >= OSCILLATION_CYCLES` → STATE_IDLE (cycle complete)
-- Spray or flow lost → STATE_IDLE (emergency stop)
-
----
-
-### STATE_ERROR *(future)*
-**Entry**: Fault condition (not yet wired to automatic detection)  
-**Actions**: Motor disabled, all outputs off, yellow LED blinks 1 Hz  
-**Recovery**: Power-cycle required (no automatic recovery)
+### STATE_ERROR
+**Entry**: a latched driver fault (overtemperature, short-to-ground, or charge-pump
+undervoltage) detected by `pollDriverStatus()`, or a home-search timeout.
+**Actions**: motor disabled, all outputs off, yellow LED blinks at 1 Hz.
+**Recovery**: press START — it clears `faultLatched` and re-homes. (No power-cycle needed.)
 
 ---
 
@@ -181,59 +152,68 @@ Motor oscillates between `CENTER_STEPS − OSCILLATION_STEPS` and `CENTER_STEPS`
 
 | Current State | Condition | Next State | Key Actions |
 |---|---|---|---|
-| IDLE | Spray ON | HOMING | Enable motor, yellow LED |
-| HOMING | Limit switch pressed | PARKED | Reset position=0, step to park |
-| PARKED | At park + Spray ON + no flow | WAITING_SPRAY | Fan 50 %, yellow LED |
-| PARKED | At park + Spray ON + Flow ON | SPRAY_ACTIVE | Fan 100 %, ultrasonic ON |
-| WAITING_SPRAY | Flow ON | SPRAY_ACTIVE | Fan 100 %, ultrasonic ON |
-| WAITING_SPRAY | Spray OFF | PARKED | Fan off |
-| SPRAY_ACTIVE | At centre + 2 s elapsed | OSCILLATING | Begin alternating sweeps |
-| SPRAY_ACTIVE | Spray or flow lost | IDLE | All outputs off |
-| OSCILLATING | 20 sweeps complete | IDLE | All outputs off |
-| OSCILLATING | Spray or flow lost | IDLE | Emergency stop |
+| IDLE | Driver fault | ERROR | Disable, needsHoming |
+| IDLE | START / (sensor mode) spray ON | HOMING | Capture homingStartPos, enable, yellow LED |
+| HOMING | Endstop not found within 70° | ERROR | Disable |
+| HOMING | Limit pressed | PARKED | position = 0, needsHoming = false |
+| HOMING | Limit pressed + fault/abort | ERROR / IDLE | Disable |
+| PARKED | At park + stop / nothing pending | IDLE | Disable |
+| PARKED | At park + bypass armed / spray+flow | SPRAY_ACTIVE | Fan 100 %, generator over wafer |
+| PARKED | At park + spray, no flow (sensor) | WAITING_SPRAY | Fan 50 %, yellow LED |
+| WAITING_SPRAY | Flow ON / bypass armed | SPRAY_ACTIVE | Fan 100 % |
+| WAITING_SPRAY | Spray lost | PARKED | Fan off |
+| SPRAY_ACTIVE | At sweep start + 2 s | OSCILLATING | Begin alternating sweeps |
+| SPRAY_ACTIVE | (sensor) spray/flow lost | PARKED | — |
+| OSCILLATING | Cycles complete (> 0) | PARKED | Disarm bypass |
+| OSCILLATING | (sensor) spray/flow lost | PARKED | — |
+| any active | Driver fault | PARKED → ERROR | Park, then disable + latch |
 
 ---
 
-## Timing Parameters
+## Timing & Motion Parameters
 
 ```cpp
-const int STEPS_PER_MM       = 1;      // Calibrate to your hardware
-const int PARK_MM            = 7;      // mm from limit switch
-const int CENTER_MM          = 26;     // mm from limit switch
-const int OSCILLATION_STEPS  = 16;     // Steps per directional sweep
-const unsigned long OSCILLATION_DELAY  = 10000; // ms per step
-const unsigned long OSCILLATION_CYCLES = 20;    // Sweeps before stopping
-const unsigned long SPRAY_ACTIVE_WAIT  = 2000;  // ms stabilisation delay
-const unsigned long MOTOR_UPDATE_INTERVAL = 50; // ms per step during homing/parking
+int  PARK_DEG_X10   = 70;     // 7.0° park angle (near the limit)
+int  CENTER_DEG_X10 = 260;    // 26.0° sweep centre (over the wafer)
+int  ARM_LENGTH_MM  = 250;    // arm length (transducer radius)
+unsigned long SWEEP_TIME_MS      = 4000;  // ms per directional sweep
+unsigned long OSCILLATION_CYCLES = 4;     // sweeps per cycle (0 = run forever)
+const unsigned long SPRAY_ACTIVE_WAIT      = 2000; // ms settle before oscillation
+const unsigned long MOTOR_UPDATE_INTERVAL_US = 500; // µs per step (homing/parking)
+const int           HOMING_MAX_DEG_X10     = 700;  // 70° home-search limit
 ```
+
+Steps are derived from angle: `steps = degX10 × FULL_STEPS_PER_REV × microsteps / 3600`.
+The sweep half-width = `asin((waferØ/2) / armLength)`, so the sweep extremes reach the
+wafer edges; `Back-Centre` travels half of this, `Back-Front` the full width.
 
 ---
 
 ## Control Flow (Dual-Core)
 
-**Core 0** — state machine and I/O:
+**Core 0** — state machine, I/O, driver:
 ```cpp
 void loop() {
-    readEncoder();           // Every 20 ms (4-transition accumulator, 50 ms guard)
-    readSensors();           // Every iteration (limit switch debounced 20 ms)
-    updateStateMachine();    // Evaluate and apply state transitions
-    handleState();           // Execute current-state outputs (motor, LEDs, fan, relay)
-    // Display is owned by Core 1
+    handleSerialDebug();
+    readEncoder();            // ~1 ms cadence; 4-transition accumulator + acceleration
+    if (menuButtonPressed) handleMenuSelect();
+    readSensors();            // limit always; spray/flow only when Safety = ON
+    updateStateMachine();     // evaluate transitions
+    handleState();            // drive motor, LEDs, fan, generator
+    pollDriverStatus();       // every 500 ms; latches faults
+    // debounced auto-save of settings to flash
 }
 ```
 
 **Core 1** — LCD rendering:
 ```cpp
-void setup1() {
-    while (!core0_ready) tight_loop_contents();  // Wait for Core 0 init
-}
-void loop1() {
-    updateDisplay();   // Redraws only on change; snapshots volatile vars to avoid tearing
-    delay(50);         // ~20 fps
-}
+void setup1() { while (!core0_ready) tight_loop_contents(); }
+void loop1()  { updateDisplay(); delay(50); }   // ~20 fps, redraws on change only
 ```
 
-All variables shared between cores (`currentState`, `motorPosition`, `menuIndex`, etc.) are declared `volatile` to prevent compiler caching across cores.
+Variables shared between cores (`currentState`, `motorPosition`, `menuIndex`,
+`ultrasonicActive`, …) are `volatile`. A single mutex serialises all SPI access across
+both cores (LCD on SPI0, TMC2130 on SPI1).
 
 ---
 
@@ -259,47 +239,38 @@ All variables shared between cores (`currentState`, `motorPosition`, `menuIndex`
 | WAITING_SPRAY | 128 | 50 % |
 | SPRAY_ACTIVE / OSCILLATING | 255 | 100 % |
 
-### Ultrasonic Relay (GPIO 4, active-low)
+### Ultrasonic Generator (GPIO 4, active-low)
 
-| State | GPIO 4 | Relay |
-|-------|--------|-------|
-| IDLE → WAITING_SPRAY | HIGH | OFF |
-| SPRAY_ACTIVE / OSCILLATING | LOW | ON |
-| Return to IDLE | HIGH | OFF |
+| State | Relay |
+|-------|-------|
+| IDLE → WAITING_SPRAY | OFF |
+| SPRAY_ACTIVE / OSCILLATING | ON **only while the arm is over the wafer** |
+| PARKED / ERROR | OFF |
 
 ---
 
 ## Safety Features
 
-1. **Motor disabled at startup** — EN HIGH until HOMING begins
-2. **Limit switch debounced** — 20 ms settle time prevents bounce triggering
-3. **Two-condition spray start** — Both spray AND flow required to begin cleaning
-4. **Emergency stop** — Spray or flow loss in SPRAY_ACTIVE/OSCILLATING → immediate IDLE
-5. **Ultrasonic interlock** — Ultrasonic only ON during active cleaning states
-6. **StealthChop current limiting** — TMC2130 limits motor current via `rms_current`
+1. **Re-home before every run** — position is treated as unknown whenever the motor is
+   disabled (`needsHoming`); START always homes first.
+2. **Home-search timeout** — homing aborts to `ERROR` if the endstop is not found within
+   70° of travel.
+3. **Driver fault latch** — overtemperature, short-to-ground, or charge-pump
+   undervoltage parks the arm, disables the motor, and latches `ERROR`.
+4. **Ultrasonic interlock** — the generator is energised only while the arm tip is over
+   the wafer, and only in active cleaning states.
+5. **Park-then-disable stop** — STOP always parks the arm before cutting current.
+6. **Limit-switch debounce** — 20 ms settle prevents bounce from false-triggering home.
+7. **Recoverable ERROR** — START clears the fault and re-homes; no power-cycle required.
 
 ---
 
-## Tuning Parameters
+## Tuning
 
-Edit constants at the top of `src/main.cpp`:
-
-```cpp
-// Longer cleaning: increase sweeps
-const unsigned long OSCILLATION_CYCLES = 30;   // Was 20 (~80 min)
-
-// Faster steps: decrease delay
-const unsigned long OSCILLATION_DELAY = 5000;  // Was 10000 (5 s/step → 26 min)
-
-// Wider oscillation: increase steps (ensure CENTER_STEPS − OSCILLATION_STEPS > 0)
-const int OSCILLATION_STEPS = 24;              // Was 16
-
-// Park further from limit:
-const int PARK_MM = 10;                        // Was 7
-
-// Motor current (reduce if hot, increase if stalling):
-driver.rms_current(800);                       // Was 600 mA
-```
+All sweep and hardware parameters are editable on-device (Settings / Setup) and persist
+to flash. To change defaults, edit the constants near the top of `src/main.cpp`
+(`PARK_DEG_X10`, `CENTER_DEG_X10`, `ARM_LENGTH_MM`, `SWEEP_TIME_MS`,
+`OSCILLATION_CYCLES`, `driverCurrent`, `driverMicrosteps`).
 
 ---
 
@@ -308,3 +279,4 @@ driver.rms_current(800);                       // Was 600 mA
 - [UML State Machine](https://en.wikipedia.org/wiki/UML_state_machine)
 - [TMCStepper Library](https://github.com/teemuatlut/TMCStepper)
 - [RP2040 Datasheet](https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf)
+</content>
