@@ -66,7 +66,8 @@
     arrow. The arm speed follows the <b>cycle time</b> and <b>speed profile</b>; the generator
     runs <b>only over the wafer</b>, where a pulsing ⚡ appears next to the arrow. Use
     <b>Tour shows</b> to pick the demonstrated features and <b>Play speed</b> to scale the tour;
-    each feature repeats several times before moving on. To record a GIF, capture the panel
+    each value runs for a few full oscillations and only changes when the arm is at the wafer
+    edge. To record a GIF, capture the panel
     (Windows <code>Win+Alt+R</code> or ScreenToGif). The hidden hardware <i>Setup</i> and
     <i>About</i> screens are omitted.
   </div>
@@ -228,46 +229,69 @@ function sweepAngleFromPhase(){
   let e = armPhase<0.5 ? profileEase(armPhase/0.5) : 1-profileEase((armPhase-0.5)/0.5);
   return Math.round((b.left+(b.fwd-b.left)*e)*10);
 }
-function sweepArm(){ S.running=true; S.state='SPRAY'; S.hold=false; }
+// Oscillation-driven tour: each value is demonstrated for OSC_PER_VALUE full
+// back-forward-back oscillations, and the value (or feature) only changes at a wrap point —
+// i.e. when the arm is back at the wafer edge (armPhase 0) — so there are no mid-sweep jumps.
+const OSC_PER_VALUE = 3;
 
-// How many times each cycling feature repeats before the tour moves on. The one-shot
-// "Parking" demo (reps:1) plays once; the rest cycle their values REPS times.
-const REPS=3;
-// Each feature -> one tour segment; the panel renders every frame.
-// `dur` is the length of one repetition; the segment runs `reps` of them back to back.
 const FEATURES=[
-  {key:'parking', label:'Parking',       dur:3800, reps:1, sweeps:false, row:5, run:(lt,f)=>{
-      const b=sweepBounds(), k=Math.min(1,f/0.5);
+  { key:'parking', label:'Parking',       row:5, sweeps:false, dur:3800, run:(fr)=>{
+      const b=sweepBounds(), k=Math.min(1,fr/0.5);
       S.angleX10=Math.round((b.left+(S.park/10-b.left)*k)*10);
-      if(f<0.5){ S.running=true; S.state='HOME'; S.hold=false; }
-      else     { S.running=false; S.state='PARK'; S.hold=true; } }},
-  {key:'time',    label:'Sweep time',     dur:3600, row:0, run:(lt)=>{
-      S.sweepTimeMs=[2000,4000,8000,15000][Math.floor(lt/850)%4]; sweepArm(); }},
-  {key:'wafer',   label:'Wafer size',     dur:5400, row:1, run:(lt)=>{
-      S.sampleIndex=[2,3,4,5][Math.floor(lt/1300)%4]; sweepArm(); }},
-  {key:'path',    label:'Sweep type',     dur:4200, row:2, run:(lt)=>{
-      S.sweepType=(lt%2400<1200)?1:0; sweepArm(); }},
-  {key:'profile', label:'Speed profile',  dur:3600, row:3, run:(lt)=>{
-      S.profile=Math.floor(lt/1000)%3; sweepArm(); }},
-].map(f=>({...f, dur:f.dur*(f.reps||REPS)}));
+      if(fr<0.5){ S.running=true; S.state='HOME'; S.hold=false; }
+      else      { S.running=false; S.state='PARK'; S.hold=true; } } },
+  { key:'time',    label:'Sweep time',    row:0, sweeps:true, values:[2000,4000,6000], apply:v=>S.sweepTimeMs=v },
+  { key:'wafer',   label:'Wafer size',    row:1, sweeps:true, values:[2,3,4,5],         apply:v=>S.sampleIndex=v },
+  { key:'path',    label:'Sweep type',    row:2, sweeps:true, values:[1,0],             apply:v=>S.sweepType=v },
+  { key:'profile', label:'Speed profile', row:3, sweeps:true, values:[0,1,2],           apply:v=>S.profile=v },
+];
 const enabled={}; FEATURES.forEach(f=>enabled[f.key]=true);
 
-let tour=[], tourTotal=0;
-function buildTour(){ tour=FEATURES.filter(f=>enabled[f.key]); tourTotal=tour.reduce((a,s)=>a+s.dur,0); vt=0; }
+let tour=[], fIdx=0, vIdx=0, oscCount=0, parkClock=0;
+function curFeature(){ return tour[fIdx]; }
+function enterFeature(){
+  vIdx=0; oscCount=0; parkClock=0;
+  const f=curFeature();
+  if(f.sweeps){ armPhase=0; f.apply(f.values[0]); }
+}
+function nextFeature(){ fIdx=(fIdx+1)%tour.length; enterFeature(); }
+function buildTour(){
+  tour=FEATURES.filter(f=>enabled[f.key]);
+  fIdx=0; vt=0;
+  if(tour.length) enterFeature();
+}
+
+function advanceTour(dtv){
+  const f=curFeature();
+  if(f.sweeps){
+    armPhase += dtv/Math.max(S.sweepTimeMs,1);
+    while(armPhase>=1){
+      armPhase-=1;                                 // one full oscillation completed, arm at the edge
+      if(++oscCount>=OSC_PER_VALUE){
+        oscCount=0;
+        if(++vIdx>=f.values.length){ nextFeature(); return; }  // advance feature, also at the edge
+      }
+    }
+  } else {
+    parkClock+=dtv;
+    if(parkClock>=f.dur) nextFeature();
+  }
+}
+function applyTour(){
+  const f=curFeature();
+  S.settingsIndex=f.row; S.editing=(f.row<4);
+  if(f.sweeps){
+    f.apply(f.values[vIdx]);
+    S.running=true; S.state='SPRAY'; S.hold=false;
+    S.angleX10=sweepAngleFromPhase();
+  } else {
+    f.run(Math.min(1, parkClock/f.dur));
+  }
+}
 
 function tick(now){
   const dtv=(now-lastFrame)*speed; vt+=dtv; lastFrame=now;
-  if(auto && tour.length){
-    let t=vt%tourTotal, acc=0, active=null;
-    for(const s of tour){ if(t<acc+s.dur){ active=s; S.settingsIndex=s.row; S.editing=(s.row<4); s.run(t-acc,(t-acc)/s.dur); break; } acc+=s.dur; }
-    // Sweeping features drive the arm off a continuous cycle phase, so speed tracks the
-    // current cycle time and profile (the play-speed slider scales it via dtv).
-    if(active && active.sweeps!==false){
-      armPhase=(armPhase + dtv/Math.max(S.sweepTimeMs,1))%1;
-      S.angleX10=sweepAngleFromPhase();
-    }
-    syncSlider();
-  }
+  if(auto && tour.length){ advanceTour(dtv); applyTour(); syncSlider(); }
   render();
   requestAnimationFrame(tick);
 }
