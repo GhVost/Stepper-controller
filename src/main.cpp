@@ -178,7 +178,6 @@ unsigned long oscillationCount    = 0;
 int           oscillationDir      = -1;
 int           oscillationStepCount = 0;
 
-unsigned long lastMotorUpdate = 0;
 unsigned long lastMotorStepMicros = 0;
 bool          sweepTimingActive = false;
 int           sweepTimingStartSteps = 0;
@@ -1824,7 +1823,6 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
     const int axisY   = ANIM_Y + ANIM_H / 2;        // 126: wafer centre / arrow-tip line
     const int yTop    = ANIM_Y;                      // crop window top
     const int yBot    = ANIM_Y + ANIM_H - 1;         // crop window bottom
-    const int armTopY = ANIM_Y + 2;
     const int headH   = 7;                            // arrowhead height
     const int tipY    = axisY;                        // arrow points down onto the plane
     const uint16_t gray = tft.color565(60, 60, 60);

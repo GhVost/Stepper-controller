@@ -49,6 +49,12 @@
   </div>
 
   <div class="row">
+    <span style="font-size:12.5px;color:#8b93a3">Play speed</span>
+    <input id="speed" type="range" min="0.25" max="4" step="0.25" value="1">
+    <span id="speedLbl" style="font-size:12.5px;width:54px">1.0&times;</span>
+  </div>
+
+  <div class="row">
     <span style="font-size:12.5px;color:#8b93a3">Arm angle</span>
     <input id="angle" type="range" min="0" max="380" value="70">
     <span id="angleLbl" style="font-size:12.5px;width:54px">7.0&deg;</span>
@@ -60,8 +66,9 @@
     (sized to the 150&nbsp;mm max and cropped top/bottom), sweep extent (Back-Ctr vs Back-Frt),
     the park tick, and the red arm arrow. The generator runs <b>only over the wafer</b> — a
     pulsing ⚡ appears next to the arrow while it is energised. Use <b>Tour shows</b> to pick the
-    demonstrated features. To record a GIF, capture both panels (Windows <code>Win+Alt+R</code>
-    or ScreenToGif). The hidden hardware <i>Setup</i> and <i>About</i> screens are omitted.
+    demonstrated features and <b>Play speed</b> to slow down or speed up the tour. Each feature now
+    repeats several times before the tour moves on. To record a GIF, capture both panels (Windows
+    <code>Win+Alt+R</code> or ScreenToGif). The hidden hardware <i>Setup</i> and <i>About</i> screens are omitted.
   </div>
 </div>
 
@@ -162,7 +169,7 @@ function armAnim(){
   rect(armX-1,yTopArm,2,(tipY-headH)-yTopArm,C.red);
   fillTri(armX-4,tipY-headH, armX+4,tipY-headH, armX,tipY, C.red);
   // pulsing lightning while generator energised (only over the wafer)
-  if(genOn() && ((performance.now()/250|0)&1)){
+  if(genOn() && ((vt/250|0)&1)){
     const bx=armX+5, by=yTopArm+1;
     line(bx+3,by, bx,by+5, C.yellow); line(bx,by+5, bx+4,by+5, C.yellow);
     line(bx+4,by+5, bx+1,by+11, C.yellow); line(bx+2,by, bx-1,by+5, C.yellow);
@@ -218,7 +225,9 @@ function drawSettings(){
 function render(){ use(cS); drawSettings(); use(cM); drawMenu(); }
 
 // ===================== auto tour (checkbox-driven feature segments) =====================
-let auto=true, t0=performance.now();
+// `vt` is a virtual clock advanced by (real dt × speed); the tour and the lightning
+// blink both run off it, so the Play-speed slider scales the whole demonstration.
+let auto=true, speed=1, vt=0, lastFrame=performance.now();
 function sweepBounds(){
   const cDeg=S.center/10, half=calcSweepX10()/20;
   return { left:cDeg-half, fwd:(S.sweepType===0?cDeg:cDeg+half) };
@@ -227,9 +236,13 @@ const triWave=(t,p)=>{ const k=(t/p)%1; return k<0.5?k*2:2-2*k; };
 function sweepArm(lt){ const b=sweepBounds(); S.angleX10=Math.round((b.left+(b.fwd-b.left)*triWave(lt,2200))*10);
   S.running=true; S.state='SPRAY'; S.hold=false; }
 
+// How many times each cycling feature repeats before the tour moves on. The one-shot
+// "Parking" demo (reps:1) plays once; the rest cycle their values REPS times.
+const REPS=3;
 // Each feature -> one tour segment; both panels render every frame.
+// `dur` is the length of one repetition; the segment runs `reps` of them back to back.
 const FEATURES=[
-  {key:'parking', label:'Parking',    dur:3800, row:5, run:(lt,f)=>{
+  {key:'parking', label:'Parking',    dur:3800, reps:1, row:5, run:(lt,f)=>{
       const b=sweepBounds(), k=Math.min(1,f/0.5);
       S.angleX10=Math.round((b.left+(S.park/10-b.left)*k)*10);
       if(f<0.5){ S.running=true; S.state='HOME'; S.hold=false; }
@@ -242,15 +255,16 @@ const FEATURES=[
       S.sweepType=(lt%2400<1200)?1:0; sweepArm(lt); }},
   {key:'profile', label:'Profile',    dur:3600, row:3, run:(lt)=>{
       S.profile=Math.floor(lt/1000)%3; sweepArm(lt); }},
-];
+].map(f=>({...f, dur:f.dur*(f.reps||REPS)}));
 const enabled={}; FEATURES.forEach(f=>enabled[f.key]=true);
 
 let tour=[], tourTotal=0;
-function buildTour(){ tour=FEATURES.filter(f=>enabled[f.key]); tourTotal=tour.reduce((a,s)=>a+s.dur,0); t0=performance.now(); }
+function buildTour(){ tour=FEATURES.filter(f=>enabled[f.key]); tourTotal=tour.reduce((a,s)=>a+s.dur,0); vt=0; }
 
 function tick(now){
+  vt += (now-lastFrame)*speed; lastFrame=now;
   if(auto && tour.length){
-    let t=(now-t0)%tourTotal, acc=0;
+    let t=vt%tourTotal, acc=0;
     for(const s of tour){ if(t<acc+s.dur){ S.settingsIndex=s.row; S.editing=(s.row<5); s.run(t-acc,(t-acc)/s.dur); break; } acc+=s.dur; }
     syncSlider();
   }
@@ -263,6 +277,9 @@ function stopAuto(){ auto=false; document.getElementById('bAuto').classList.remo
 document.getElementById('bAuto').onclick=(e)=>{ auto=!auto; e.target.classList.toggle('on',auto); if(auto) buildTour(); };
 document.getElementById('bRun').onclick=()=>{ stopAuto(); S.running=!S.running;
   S.state=S.running?'SPRAY':'PARK'; S.hold=!S.running; };
+const spd=document.getElementById('speed'), spdLbl=document.getElementById('speedLbl');
+spd.oninput=()=>{ speed=+spd.value; spdLbl.innerHTML=speed.toFixed(1)+'&times;'; };
+
 const slider=document.getElementById('angle'), slbl=document.getElementById('angleLbl');
 slider.oninput=()=>{ stopAuto(); S.angleX10=+slider.value; slbl.innerHTML=degStr(S.angleX10)+'&deg;'; };
 function syncSlider(){ slider.value=S.angleX10; slbl.innerHTML=degStr(S.angleX10)+'&deg;'; }
