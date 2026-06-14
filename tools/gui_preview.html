@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MEGASONIC LCD preview</title>
+<style>
+  :root { --bg:#15171c; --panel:#1d2028; --accent:#00c8ff; }
+  html,body { margin:0; height:100%; background:var(--bg); color:#cdd3df;
+              font-family:"Segoe UI",system-ui,sans-serif; }
+  .wrap { display:flex; flex-direction:column; align-items:center; gap:18px; padding:26px; }
+  h1 { font-size:18px; font-weight:600; margin:0; letter-spacing:.5px; }
+  h1 span { color:var(--accent); }
+  .bezel { padding:16px; background:#0a0b0e; border-radius:14px;
+           box-shadow:0 0 0 2px #2b2f3a, 0 10px 30px rgba(0,0,0,.6); }
+  canvas { display:block; border-radius:4px; image-rendering:auto; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; max-width:980px; }
+  button { background:var(--panel); color:#cdd3df; border:1px solid #333a47;
+           padding:8px 14px; border-radius:8px; font-size:13px; cursor:pointer; }
+  button:hover { border-color:var(--accent); color:#fff; }
+  button.on { background:var(--accent); color:#06121a; border-color:var(--accent); font-weight:600; }
+  .hint { font-size:12.5px; color:#8b93a3; max-width:900px; text-align:center; line-height:1.5; }
+  .row { display:flex; align-items:center; gap:10px; }
+  input[type=range] { width:240px; }
+  code { background:#23262e; padding:1px 6px; border-radius:4px; color:#d8dee9; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span>MEGASONIC</span> &mdash; LCD GUI preview (320&times;172, ST7789)</h1>
+
+  <div class="bezel"><canvas id="lcd"></canvas></div>
+
+  <div class="controls">
+    <button id="bAuto" class="on">▶ Auto tour</button>
+    <button data-mode="MENU">Main menu</button>
+    <button data-mode="SETTINGS">Settings</button>
+    <button data-mode="ABOUT">About</button>
+    <button id="bRun">Start / Stop</button>
+    <button id="bPath">Toggle Path (angle ×2)</button>
+  </div>
+
+  <div class="row">
+    <span style="font-size:12.5px;color:#8b93a3">Arm angle</span>
+    <input id="angle" type="range" min="0" max="380" value="70">
+    <span id="angleLbl" style="font-size:12.5px;width:54px">7.0&deg;</span>
+  </div>
+
+  <div class="hint">
+    The render is pixel-for-pixel from the firmware draw code (same coordinates, colours,
+    fonts metrics and the new <b>arm animation</b> + <b>path-dependent Angle</b>).
+    To make a GIF: leave <b>Auto tour</b> running (one loop ≈ 20&nbsp;s shows every non-hidden
+    feature) and capture the panel with any screen recorder
+    (Windows <code>Win+Alt+R</code>, or ScreenToGif → export GIF). The hardware
+    <i>Setup</i> screen is intentionally omitted (hidden behind the short+long-press unlock).
+  </div>
+</div>
+
+<script>
+// ===================== device geometry / palette =====================
+const W = 320, H = 172, SS = 3;            // logical size + supersample for crisp output
+const cv = document.getElementById('lcd');
+cv.width = W*SS; cv.height = H*SS;
+const ctx = cv.getContext('2d');
+
+const C = {
+  black:'#000000', white:'#FFFFFF', blue:'#0000FF', cyan:'#00FFFF',
+  red:'#FF0000', green:'#00FF00', yellow:'#FFFF00', magenta:'#FF00FF',
+  wave:'#00C8FF', editgreen:'#008C00', grey70:'#464646', grey60:'#3C3C3C'
+};
+
+// ---- primitives mirroring Adafruit_GFX calls (all in logical px) ----
+function rect(x,y,w,h,c){ ctx.fillStyle=c; ctx.fillRect(x*SS,y*SS,w*SS,h*SS); }
+function hline(x,y,w,c){ rect(x,y,w,1,c); }
+function vline(x,y,h,c){ rect(x,y,1,h,c); }
+function line(x0,y0,x1,y1,c){
+  ctx.strokeStyle=c; ctx.lineWidth=SS; ctx.lineCap='butt'; ctx.beginPath();
+  ctx.moveTo((x0+0.5)*SS,(y0+0.5)*SS); ctx.lineTo((x1+0.5)*SS,(y1+0.5)*SS); ctx.stroke();
+}
+function fillCircle(x,y,r,c){ ctx.fillStyle=c; ctx.beginPath(); ctx.arc((x+0.5)*SS,(y+0.5)*SS,r*SS,0,7); ctx.fill(); }
+function drawCircle(x,y,r,c){ ctx.strokeStyle=c; ctx.lineWidth=SS; ctx.beginPath(); ctx.arc((x+0.5)*SS,(y+0.5)*SS,r*SS,0,7); ctx.stroke(); }
+function fillTri(x0,y0,x1,y1,x2,y2,c){
+  ctx.fillStyle=c; ctx.beginPath();
+  ctx.moveTo(x0*SS,y0*SS); ctx.lineTo(x1*SS,y1*SS); ctx.lineTo(x2*SS,y2*SS); ctx.closePath(); ctx.fill();
+}
+// GFX 5x7 font: 6*size advance, top-left origin
+function text(x,y,str,size,c){
+  ctx.fillStyle=c; ctx.textBaseline='top';
+  ctx.font = 'bold ' + (7*size*SS) + 'px "Consolas","Courier New",monospace';
+  for(let i=0;i<str.length;i++) ctx.fillText(str[i], (x+i*6*size)*SS, y*SS);
+}
+
+// ===================== firmware constants & helpers =====================
+const STATUS_X=232, STATUS_W=88, CONTENT_W=230;
+const ANIM_X=4, ANIM_W=224, ANIM_Y=86, ANIM_H=80;
+const SAMPLE=[10,20,50,75,100,150];
+const SENSORS=false;                  // SENSOR_INPUTS_ENABLED = false in firmware
+const menuItems=["START/STOP","Settings"];
+
+const S = {                           // live UI state
+  mode:'MENU', menuIndex:0, settingsIndex:2, editing:false,
+  running:false, state:'IDLE', hold:true, angleX10:70,
+  park:70, center:260, arm:250, sampleIndex:4,
+  sweepTimeMs:4000, sweepType:1, profile:0
+};
+
+const waferMm = () => SAMPLE[S.sampleIndex];
+function calcSweepX10(){
+  let r=(waferMm()*0.5)/S.arm; r=Math.max(0,Math.min(1,r));
+  let sweep=2*Math.asin(r)*180/Math.PI;
+  return Math.max(10,Math.min(1800,Math.round(sweep*10)));
+}
+function travelSweepX10(){ const f=calcSweepX10(); return S.sweepType===0 ? Math.floor((f+1)/2) : f; }
+function degStr(d){ return (d/10|0)+'.'+Math.abs(d%10); }
+
+// ===================== screen renderers =====================
+function drawIcon(id,x,y,c){
+  if(id===0){ fillTri(x,y+1, x,y+17, x+14,y+9, c); }
+  else if(id===1){
+    rect(x,y+2,16,2,c); rect(x,y+8,16,2,c); rect(x,y+14,16,2,c);
+    fillCircle(x+4,y+3,3,c); fillCircle(x+12,y+9,3,c); fillCircle(x+8,y+15,3,c);
+  }
+}
+function menuRow(i,y,sel){
+  const bg=sel?C.blue:C.black, ic=sel?C.white:C.cyan;
+  rect(6,y-2,CONTENT_W-12,28,bg);
+  if(i===0 && S.running) rect(9,y+3,14,14,ic); else drawIcon(i,8,y+2,ic);
+  text(36,y,menuItems[i],3,C.white);
+}
+function armAnim(){
+  const axisY=ANIM_Y+ANIM_H/2, maxRpx=ANIM_H/2-8, armTopY=ANIM_Y+4, headH=7, tipY=axisY;
+  const toRad=Math.PI/180, cDeg=S.center/10, pDeg=S.park/10, wR=waferMm()/2;
+  const parkOff=S.arm*Math.sin((pDeg-cDeg)*toRad);
+  const lo=Math.min(parkOff,-wR), hi=Math.max(parkOff,wR), span=Math.max(hi-lo,1);
+  const scale=Math.min((ANIM_W-16)/span, maxRpx/(wR>1?wR:1));
+  const drawnW=Math.round(span*scale), startX=ANIM_X+Math.floor((ANIM_W-drawnW)/2);
+  const rPx=Math.round(wR*scale), waferCx=startX+Math.round((0-lo)*scale), parkX=startX+Math.round((parkOff-lo)*scale);
+
+  // static scene
+  rect(ANIM_X,ANIM_Y-2,ANIM_W,ANIM_H+2,C.black);
+  hline(ANIM_X,ANIM_Y-4,ANIM_W,C.grey60);
+  const axL=Math.min(parkX,waferCx-rPx)-4, axR=waferCx+rPx+4;
+  hline(axL,axisY,axR-axL,C.grey60);
+  drawCircle(waferCx,axisY,rPx,C.cyan); fillCircle(waferCx,axisY,2,C.cyan);
+  vline(parkX,axisY-6,13,C.green); text(parkX-2,axisY+10,"P",1,C.green);
+
+  // live arm
+  const armOff=S.arm*Math.sin((S.angleX10/10-cDeg)*toRad);
+  let armX=startX+Math.round((armOff-lo)*scale);
+  armX=Math.max(startX,Math.min(startX+drawnW,armX));
+  rect(armX-1,armTopY,2,(tipY-headH)-armTopY,C.red);
+  fillTri(armX-4,tipY-headH, armX+4,tipY-headH, armX,tipY, C.red);
+}
+function statusColumn(){
+  const x=STATUS_X+6;
+  rect(STATUS_X,0,STATUS_W,H,C.black); vline(STATUS_X,0,H,C.grey70);
+  text(x,5,"STATUS",1,C.cyan);
+  if(!SENSORS) text(x,15,"DEBUG ON",1,C.magenta);
+  text(x,24,"STATE",1,C.white); text(x,64,"ANGLE",1,C.white);
+  text(x,106,"SPRAY",1,C.white); text(x,126,"FLOW",1,C.white); text(x,146,"HOLD",1,C.white);
+  text(x,36,S.state,2,C.yellow);
+  const ang=degStr(S.angleX10);
+  text(x,76,ang,2,C.yellow); text(x+ang.length*12,76," deg",1,C.yellow);
+  text(x+38,106,SENSORS?"OFF":"DIS",1,SENSORS?C.red:C.magenta);
+  text(x+38,126,SENSORS?"NO":"DIS",1,SENSORS?C.red:C.magenta);
+  text(x+38,146,S.hold?"PARK":"RUN",1,S.hold?C.green:C.white);
+}
+function drawMenu(){
+  rect(0,0,W,H,C.black);
+  // ultrasonic wave logo
+  const w=C.wave;
+  line(8,12,11,6,w); line(11,6,14,12,w); line(14,12,17,6,w);
+  line(17,6,20,12,w); line(20,12,23,6,w); line(23,6,26,12,w);
+  text(32,2,"MEGASONIC",2,w);
+  for(let i=0;i<2;i++) menuRow(i,22+i*28,i===S.menuIndex);
+  armAnim();
+  statusColumn();
+}
+function settingsRow(i,y,sel,edit){
+  const labels=["Time   ","Wafer  ","Path   ","Profile","Angle  ","< Back "];
+  const bg=edit?C.editgreen:(sel?C.blue:C.black);
+  rect(0,y-2,CONTENT_W,22,bg);
+  let s=labels[i];
+  if(i<5){
+    s+=": ";
+    if(i===0) s+=(S.sweepTimeMs/1000).toFixed(1)+"s   ";
+    else if(i===1) s+=waferMm()+"mm  ";
+    else if(i===2) s+=(S.sweepType===0?"Back-Ctr":"Back-Frt");
+    else if(i===3) s+=(S.profile===0?"Linear ":S.profile===1?"Harm   ":"InvDist");
+    else if(i===4) s+=degStr(travelSweepX10())+"deg ";
+  }
+  text(6,y,s,2,C.white);
+}
+function drawSettings(){
+  rect(0,0,W,H,C.black);
+  text(6,3,"SETTINGS",2,C.cyan);
+  for(let i=0;i<6;i++)
+    settingsRow(i,22+i*24, i===S.settingsIndex, S.editing && i===S.settingsIndex && i<5 && i!==4);
+  statusColumn();
+}
+function drawAbout(){
+  rect(0,0,W,H,C.black);
+  text(8,3,"MEGASONIC v1.1",2,C.cyan);
+  text(8,22,"RP2040 earlephilhower",2,C.white);
+  text(8,40,"GMT147SPI 172x320",2,C.white);
+  text(8,58,"Authors: LK & AG",2,C.white);
+  text(8,76,"Driver Status:",2,C.cyan);
+  text(8,94,"OT:NO  OTPW:NO  ",2,C.white);
+  text(8,114,"CS:16  SG:120  ",2,C.white);
+  text(8,134,"STST:NO  ERR:NO ",2,C.white);
+  text(8,154,"Press to return",2,C.yellow);
+}
+function render(){
+  if(S.mode==='MENU') drawMenu();
+  else if(S.mode==='SETTINGS') drawSettings();
+  else drawAbout();
+}
+
+// ===================== auto tour timeline =====================
+const phases=[
+  {n:'idle',     d:2500},
+  {n:'home',     d:1200},
+  {n:'spray',    d:6500},
+  {n:'park',     d:1500},
+  {n:'settings', d:6000},
+  {n:'about',    d:3000},
+];
+const TOTAL=phases.reduce((a,p)=>a+p.d,0);
+let auto=true, t0=performance.now();
+
+function sweepBounds(){
+  const cDeg=S.center/10, half=calcSweepX10()/20;          // half of full sweep, in deg
+  const left=cDeg-half, fwd=(S.sweepType===0?cDeg:cDeg+half);
+  return {left,fwd};
+}
+function tick(now){
+  if(auto){
+    let t=(now-t0)%TOTAL, acc=0, ph=phases[0], lt=t;
+    for(const p of phases){ if(t<acc+p.d){ph=p; lt=t-acc; break;} acc+=p.d; }
+    const f=lt/ph.d;
+    if(ph.n==='idle'){ S.mode='MENU'; S.running=false; S.state='IDLE'; S.hold=true; S.menuIndex=0; S.angleX10=S.park; }
+    else if(ph.n==='home'){ S.mode='MENU'; S.running=true; S.state='HOME'; S.hold=false;
+      const b=sweepBounds(); S.angleX10=Math.round((S.park/10 + (b.left-S.park/10)*f)*10); }
+    else if(ph.n==='spray'){ S.mode='MENU'; S.running=true; S.state='SPRAY'; S.hold=false;
+      const b=sweepBounds(), p=(lt/2400)%1, wv=p<0.5?p*2:2-2*p;
+      S.angleX10=Math.round((b.left+(b.fwd-b.left)*wv)*10); }
+    else if(ph.n==='park'){ S.mode='MENU'; S.running=false; S.state='PARK'; S.hold=true;
+      const b=sweepBounds(); S.angleX10=Math.round((b.left + (S.park/10-b.left)*f)*10); }
+    else if(ph.n==='settings'){ S.mode='SETTINGS'; S.running=false; S.state='IDLE'; S.hold=true;
+      S.angleX10=S.park; S.settingsIndex=2; S.editing=true; S.sweepType=(lt%3000<1500)?1:0; }  // show angle ×2
+    else if(ph.n==='about'){ S.mode='ABOUT'; }
+    syncSlider();
+  }
+  render();
+  requestAnimationFrame(tick);
+}
+
+// ===================== manual controls =====================
+function stopAuto(){ auto=false; document.getElementById('bAuto').classList.remove('on'); }
+document.getElementById('bAuto').onclick=(e)=>{
+  auto=!auto; e.target.classList.toggle('on',auto); if(auto) t0=performance.now();
+};
+document.querySelectorAll('button[data-mode]').forEach(b=>b.onclick=()=>{ stopAuto(); S.mode=b.dataset.mode; });
+document.getElementById('bRun').onclick=()=>{ stopAuto(); S.running=!S.running;
+  S.state=S.running?'SPRAY':'PARK'; S.hold=!S.running; S.mode='MENU'; };
+document.getElementById('bPath').onclick=()=>{ stopAuto(); S.sweepType^=1; S.mode='SETTINGS'; S.editing=true; S.settingsIndex=2; };
+const slider=document.getElementById('angle'), slbl=document.getElementById('angleLbl');
+slider.oninput=()=>{ stopAuto(); S.angleX10=+slider.value; S.mode='MENU'; slbl.innerHTML=degStr(S.angleX10)+'&deg;'; };
+function syncSlider(){ slider.value=S.angleX10; slbl.innerHTML=degStr(S.angleX10)+'&deg;'; }
+
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

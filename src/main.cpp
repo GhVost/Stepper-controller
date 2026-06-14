@@ -1,24 +1,27 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <EEPROM.h>
 #include <TMCStepper.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <pico/mutex.h>
 
 // ============= PIN DEFINITIONS =============
-const int TMC_CS   = 17;
-const int TMC_MOSI = 19;
-const int TMC_MISO = 16;
-const int TMC_SCK  = 18;
+const int TMC_CS   = 13;
+const int TMC_MOSI = 11;
+const int TMC_MISO = 12;
+const int TMC_SCK  = 10;
 const int TMC_STEP = 14;
 const int TMC_DIR  = 15;
-const int TMC_EN   = 13;
+const int TMC_EN   = 1;
 
-// GMT147SPI 1.47" 172x320 ST7789 — SCK/MOSI shared with TMC2130 on SPI0
+// GMT147SPI 1.47" 172x320 ST7789 on SPI0
 const int LCD_CS  = 9;
-const int LCD_DC  = 10;
-const int LCD_RST = 11;
+const int LCD_DC  = 5;
+const int LCD_RST = 6;
 const int LCD_BL  = 20;
+const int LCD_MOSI = 19;
+const int LCD_SCK  = 18;
 
 // KY-040 rotary encoder: CLK=A, DT=B, SW=push-button
 const int ENC_A  = 26;
@@ -30,12 +33,31 @@ const int SPRAY_VALVE  = 2;    // HIGH = spray active
 const int FLOW_SENSOR  = 3;    // HIGH = flowing
 const int LED_GREEN    = 8;
 const int LED_YELLOW   = 7;
-const int FAN_PWM      = 12;
+const int FAN_PWM      = 21;
 const int ULTRASONIC   = 4;    // Active-low relay: LOW = ON
 
 // ============= TMC2130 DRIVER =============
 #define R_SENSE 0.11f
 TMC2130Stepper driver(TMC_CS, R_SENSE);
+
+void TMC2130Stepper::beginTransaction() {
+    if (TMC_SW_SPI == nullptr) {
+        SPI1.beginTransaction(SPISettings(spi_speed, MSBFIRST, SPI_MODE3));
+    }
+}
+
+void TMC2130Stepper::endTransaction() {
+    if (TMC_SW_SPI == nullptr) {
+        SPI1.endTransaction();
+    }
+}
+
+uint8_t TMC2130Stepper::transfer(const uint8_t data) {
+    if (TMC_SW_SPI != nullptr) {
+        return TMC_SW_SPI->transfer(data);
+    }
+    return SPI1.transfer(data);
+}
 
 // ============= STATE MACHINE =============
 enum SystemState {
@@ -55,30 +77,61 @@ unsigned long lastStateChange = 0;
 volatile bool homingToStop = false;
 
 // ============= MOTION PARAMETERS =============
-const int STEPS_PER_MM = 1;
-int PARK_MM           = 7;
-int CENTER_MM         = 26;
-int OSCILLATION_STEPS = 16;
-unsigned long OSCILLATION_DELAY  = 10000;
-unsigned long OSCILLATION_CYCLES = 20;
+const int FULL_STEPS_PER_REV = 200;  // typical 1.8 degree NEMA17 motor
+int PARK_DEG_X10       = 70;
+int CENTER_DEG_X10     = 260;
+int ARM_LENGTH_MM      = 250;
+unsigned long SWEEP_TIME_MS = 4000;
+unsigned long OSCILLATION_CYCLES = 4;
 const unsigned long SPRAY_ACTIVE_WAIT = 2000;
+const bool SENSOR_INPUTS_ENABLED = false;  // temporary bypass while spray/flow wiring is absent
 
 // ============= SETTINGS (sweep params) =============
-// Speed 1–10 maps to OSCILLATION_DELAY = (11-speed)*1000 ms
-int sweepSpeed   = 5;
+// Wafer diameter comes from SAMPLE_TABLE; sweep angle is calculated from arm length.
 int sampleIndex  = 4;   // index into SAMPLE_TABLE
-int sweepType    = 0;   // 0=centre↔back, 1=edge→edge
-int sweepProfile = 0;   // 0=linear, 1=harmonic, 2=swing
+int sweepType    = 0;   // 0=back-centre-back, 1=back-front-back
+int sweepProfile = 0;   // 0=linear, 1=harmonic, 2=inverse-distance
 
 const int SAMPLE_TABLE[] = {10, 20, 50, 75, 100, 150};
 const int SAMPLE_COUNT   = 6;
 
+const int SWEEP_PATH_BACK_CENTER = 0;
+const int SWEEP_PATH_BACK_FRONT  = 1;
+const int SWEEP_PROFILE_LINEAR   = 0;
+const int SWEEP_PROFILE_HARMONIC = 1;
+const int SWEEP_PROFILE_INVDIST  = 2;
+
 // ============= SETUP (hardware/driver params) =============
 int driverCurrent    = 600;
-int driverMicrosteps = 16;
+int driverMicrosteps = 256;
+bool motorDirectionInverted = false;
+const float DRIVER_RUN_HOLD_MULTIPLIER = 0.25f;
+const float DRIVER_PARK_HOLD_MULTIPLIER = 0.10f;
+bool driverParkHoldMode = false;
 
 const int MICROSTEP_TABLE[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 const int MICROSTEP_COUNT   = 9;
+
+const uint32_t SETTINGS_MAGIC = 0x4D534743UL;  // "MSGC"
+const uint16_t SETTINGS_VERSION = 5;
+
+struct StoredSettings {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    int16_t parkDegX10;
+    int16_t centerDegX10;
+    int16_t armLengthMm;
+    uint32_t sweepTimeMs;
+    uint32_t oscillationCycles;
+    int16_t sampleIndex;
+    int16_t sweepType;
+    int16_t sweepProfile;
+    int16_t driverCurrent;
+    int16_t driverMicrosteps;
+    int16_t motorDirectionInverted;
+    uint32_t checksum;
+};
 
 volatile uint32_t driverDrvStatus = 0;
 volatile uint32_t driverGStat     = 0;
@@ -94,23 +147,44 @@ volatile int  motorPosition      = 0;
 volatile bool limitSwitchPressed = false;
 volatile bool sprayActive        = false;
 volatile bool flowDetected       = false;
+volatile bool debugMotorHold     = false;
+volatile bool sensorBypassCycleArmed = false;
 
 unsigned long oscillationCount    = 0;
 int           oscillationDir      = -1;
 int           oscillationStepCount = 0;
 
 unsigned long lastMotorUpdate = 0;
+unsigned long lastMotorStepMicros = 0;
 unsigned long lastEncoderRead = 0;
-const unsigned long MOTOR_UPDATE_INTERVAL = 50;
-const unsigned long ENCODER_READ_INTERVAL = 20;
+const unsigned long MOTOR_UPDATE_INTERVAL_US = 500;
+const unsigned long ENCODER_READ_INTERVAL = 1;
+const unsigned long ENCODER_STEP_MIN_INTERVAL = 5;
+const unsigned long ENCODER_BUTTON_DEBOUNCE = 120;
+const uint8_t ENCODER_STABLE_SAMPLES = 1;
+const unsigned long SENSOR_DEBOUNCE = 50;
 
 // ============= DISPLAY / MENU =============
 Adafruit_ST7789 tft = Adafruit_ST7789(LCD_CS, LCD_DC, LCD_RST);
 
+const int STATUS_X = 232;
+const int STATUS_W = 88;
+const int CONTENT_W = STATUS_X - 2;
+
+// Arm-position animation region (basic menu only, under the START/Settings rows)
+const int ANIM_X = 4;
+const int ANIM_W = STATUS_X - 8;   // 224 px wide
+const int ANIM_Y = 86;
+const int ANIM_H = 80;
+
 // Main menu — 4 items, no HOME
 const char* menuItems[] = { "START/STOP", "Settings", "Setup", "About" };
 const int   MENU_COUNT  = 4;
+const int   BASIC_MENU_COUNT = 2;
+const unsigned long LONG_PRESS_MS = 700;   // hold time that counts as a "long" click
+const unsigned long COMBO_GAP_MS  = 400;   // max gap from short-click release to the long press
 volatile int menuIndex  = 0;
+volatile bool advancedMenuUnlocked = false;
 
 enum DisplayMode { DISP_MENU, DISP_SETTINGS, DISP_SETUP, DISP_ABOUT };
 volatile DisplayMode displayMode = DISP_MENU;
@@ -118,13 +192,17 @@ volatile DisplayMode displayMode = DISP_MENU;
 volatile bool menuButtonPressed = false;
 int menuDrawState = -1;  // -1 = full redraw needed
 
-// Settings screen (sweep): Speed, Sample, Sweep, Profile, < Back
-const int SETTINGS_COUNT = 5;
+// Deferred short-click + short/long combo state (toggles advanced menu on the main screen)
+bool          pendingShortClick     = false;
+unsigned long shortClickReleaseTime = 0;
+
+// Settings screen (sweep): Sweep time, wafer diameter, path, profile, calculated angle, < Back
+const int SETTINGS_COUNT = 6;
 volatile int  settingsIndex       = 0;
 volatile bool editingSettings     = false;
 volatile bool settingsNeedsRedraw = false;
 
-// Setup screen (hardware): Park, Centre, Steps, Delay, Cycles, Current, Mstep, < Back
+// Setup screen (hardware): Park angle, Centre angle, arm length, cycles, current, microsteps, < Back
 const int SETUP_COUNT = 8;
 volatile int  setupIndex       = 0;
 volatile bool editingSetup     = false;
@@ -141,22 +219,50 @@ void initSPI();
 void initEncoder();
 void initTMC2130();
 void initDisplay();
+uint32_t settingsChecksum(const StoredSettings& settings);
+bool isValidMicrostep(int value);
+void loadSettings();
+void saveSettings();
+int waferDiameterMm();
+int calculatedSweepDegX10();
+int travelSweepDegX10();
+int sweepLeftSteps();
+int sweepRightSteps();
+int sweepBackSteps();
+int sweepForwardSteps();
+unsigned long sweepStepIntervalUs(int currentSteps, int targetSteps);
+int degX10ToSteps(int degX10);
+int stepsToDegX10(int steps);
+void printDegX10(int degX10);
+int encoderAcceleration(unsigned long intervalMs);
 void readSensors();
 void readEncoder();
 void updateStateMachine();
 void handleState();
+int motorShaftRevSteps();
+int degreesToSteps(int degrees);
+int stepsToDegrees(int steps);
 void motorStep(int direction);
 void motorSetEnable(bool enable);
 void motorMoveTo(int target);
+void motorMoveToBlocking(int target, unsigned int stepDelayUs);
 void handleMenuSelect();
 void adjustSettingsValue(int delta);
 void adjustSetupValue(int delta);
 void applyDriverSettings();
+void setDriverParkHold(bool parkHold);
 void pollDriverStatus();
+void handleSerialDebug();
+void dumpDriverStatus();
+uint32_t rawTmcRead(uint8_t address);
+void debugStepBurst(int direction, int steps, unsigned int stepDelayUs);
 void updateDisplay();
+const char* stateLabel(SystemState state);
+void drawStatusColumn(SystemState state, int posDegX10, bool forceRedraw);
 void drawIcon(int id, int x, int y, uint16_t color);
 void drawMenuRow(int i, int y, bool selected);
 void drawMenu();
+void drawArmAnim(bool fullRedraw, int posDegX10);
 void drawSettingsRow(int i, int y, bool selected, bool editing);
 void drawSettings();
 void drawSetupRow(int i, int y, bool selected, bool editing);
@@ -172,6 +278,7 @@ void setup() {
     { unsigned long t = millis(); while (!Serial && millis() - t < 2000) delay(10); }
     Serial.println("=== Stepper Controller Initializing ===");
 
+    loadSettings();
     initHardware();
     initSPI();
     initTMC2130();
@@ -198,6 +305,8 @@ void loop1() {
 void loop() {
     unsigned long now = millis();
 
+    handleSerialDebug();
+
     if (now - lastEncoderRead >= ENCODER_READ_INTERVAL) {
         readEncoder();
         lastEncoderRead = now;
@@ -219,11 +328,13 @@ void initHardware() {
     pinMode(TMC_STEP, OUTPUT);
     pinMode(TMC_DIR,  OUTPUT);
     pinMode(TMC_EN,   OUTPUT);
+    pinMode(TMC_CS,   OUTPUT);
     digitalWrite(TMC_EN, HIGH);
+    digitalWrite(TMC_CS, HIGH);
 
     pinMode(LIMIT_SWITCH, INPUT_PULLUP);
-    pinMode(SPRAY_VALVE,  INPUT);
-    pinMode(FLOW_SENSOR,  INPUT);
+    pinMode(SPRAY_VALVE,  INPUT_PULLDOWN);
+    pinMode(FLOW_SENSOR,  INPUT_PULLDOWN);
 
     pinMode(LED_GREEN,  OUTPUT);
     pinMode(LED_YELLOW, OUTPUT);
@@ -241,12 +352,18 @@ void initHardware() {
 }
 
 void initSPI() {
-    SPI.setRX(TMC_MISO);
-    SPI.setTX(TMC_MOSI);
-    SPI.setSCK(TMC_SCK);
+    SPI.setTX(LCD_MOSI);
+    SPI.setSCK(LCD_SCK);
     SPI.begin();
+
+    SPI1.setRX(TMC_MISO);
+    SPI1.setTX(TMC_MOSI);
+    SPI1.setSCK(TMC_SCK);
+    SPI1.begin();
+
     mutex_init(&spi_mutex);
-    Serial.printf("SPI initialized: SCK=%d MOSI=%d MISO=%d\n", TMC_SCK, TMC_MOSI, TMC_MISO);
+    Serial.printf("SPI0 LCD initialized: SCK=%d MOSI=%d\n", LCD_SCK, LCD_MOSI);
+    Serial.printf("SPI1 TMC initialized: SCK=%d MOSI=%d MISO=%d\n", TMC_SCK, TMC_MOSI, TMC_MISO);
 }
 
 void initEncoder() {
@@ -257,13 +374,20 @@ void initEncoder() {
 }
 
 void initTMC2130() {
+    driver.setSPISpeed(1000000);
     driver.begin();
     driver.toff(5);
-    driver.rms_current(600);
-    driver.microsteps(16);
+    driver.rms_current(driverCurrent, DRIVER_RUN_HOLD_MULTIPLIER);
+    driver.microsteps(driverMicrosteps);
+    driver.iholddelay(15);
+    driver.TPOWERDOWN(20);
+    driver.intpol(true);
     driver.en_pwm_mode(true);
     driver.pwm_autoscale(true);
-    Serial.println("TMC2130 configured: 600 mA, 16x microsteps, StealthChop");
+    Serial.printf("TMC2130 configured: %d mA, run hold %.0f%%, park hold %.0f%%, %dx microsteps, interpolation, StealthChop\n",
+                  driverCurrent, DRIVER_RUN_HOLD_MULTIPLIER * 100.0f,
+                  DRIVER_PARK_HOLD_MULTIPLIER * 100.0f, driverMicrosteps);
+    dumpDriverStatus();
 }
 
 void initDisplay() {
@@ -275,6 +399,145 @@ void initDisplay() {
     Serial.println("Display initialized (GMT147SPI 1.47\" 172x320)");
 }
 
+// ============= PERSISTENT SETTINGS =============
+uint32_t settingsChecksum(const StoredSettings& settings) {
+    const uint8_t* bytes = (const uint8_t*)&settings;
+    size_t len = sizeof(StoredSettings) - sizeof(settings.checksum);
+    uint32_t hash = 2166136261UL;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+bool isValidMicrostep(int value) {
+    for (int i = 0; i < MICROSTEP_COUNT; i++) {
+        if (MICROSTEP_TABLE[i] == value) return true;
+    }
+    return false;
+}
+
+void loadSettings() {
+    EEPROM.begin(sizeof(StoredSettings));
+
+    StoredSettings stored;
+    EEPROM.get(0, stored);
+
+    bool valid = stored.magic == SETTINGS_MAGIC &&
+                 stored.version == SETTINGS_VERSION &&
+                 stored.size == sizeof(StoredSettings) &&
+                 stored.checksum == settingsChecksum(stored) &&
+                 isValidMicrostep(stored.driverMicrosteps);
+
+    if (!valid) {
+        Serial.println("Settings: using defaults");
+        return;
+    }
+
+    PARK_DEG_X10 = constrain((int)stored.parkDegX10, 10, 1800);
+    CENTER_DEG_X10 = constrain((int)stored.centerDegX10, 10, 1800);
+    ARM_LENGTH_MM = constrain((int)stored.armLengthMm, 50, 1000);
+    SWEEP_TIME_MS = (unsigned long)constrain((long)stored.sweepTimeMs, 500L, 60000L);
+    OSCILLATION_CYCLES = (unsigned long)constrain((long)stored.oscillationCycles, 0L, 100L);
+    sampleIndex = constrain((int)stored.sampleIndex, 0, SAMPLE_COUNT - 1);
+    sweepType = constrain((int)stored.sweepType, 0, 1);
+    sweepProfile = constrain((int)stored.sweepProfile, 0, 2);
+    driverCurrent = constrain((int)stored.driverCurrent, 100, 1500);
+    driverMicrosteps = stored.driverMicrosteps;
+    motorDirectionInverted = stored.motorDirectionInverted != 0;
+
+    Serial.println("Settings: loaded from flash");
+}
+
+void saveSettings() {
+    StoredSettings stored = {};
+    stored.magic = SETTINGS_MAGIC;
+    stored.version = SETTINGS_VERSION;
+    stored.size = sizeof(StoredSettings);
+    stored.parkDegX10 = PARK_DEG_X10;
+    stored.centerDegX10 = CENTER_DEG_X10;
+    stored.armLengthMm = ARM_LENGTH_MM;
+    stored.sweepTimeMs = SWEEP_TIME_MS;
+    stored.oscillationCycles = OSCILLATION_CYCLES;
+    stored.sampleIndex = sampleIndex;
+    stored.sweepType = sweepType;
+    stored.sweepProfile = sweepProfile;
+    stored.driverCurrent = driverCurrent;
+    stored.driverMicrosteps = driverMicrosteps;
+    stored.motorDirectionInverted = motorDirectionInverted ? 1 : 0;
+    stored.checksum = settingsChecksum(stored);
+
+    EEPROM.put(0, stored);
+    if (EEPROM.commit()) {
+        Serial.println("Settings: saved to flash");
+    } else {
+        Serial.println("Settings: save failed");
+    }
+}
+
+int waferDiameterMm() {
+    return SAMPLE_TABLE[sampleIndex];
+}
+
+int calculatedSweepDegX10() {
+    float ratio = ((float)waferDiameterMm() * 0.5f) / (float)ARM_LENGTH_MM;
+    if (ratio < 0.0f) ratio = 0.0f;
+    if (ratio > 1.0f) ratio = 1.0f;
+    float sweep = 2.0f * asinf(ratio) * 180.0f / PI;
+    return constrain((int)(sweep * 10.0f + 0.5f), 10, 1800);
+}
+
+// Angle the arm actually travels: full edge-to-edge for Back-Front,
+// half (edge-to-centre) for Back-Centre.
+int travelSweepDegX10() {
+    int full = calculatedSweepDegX10();
+    return sweepType == SWEEP_PATH_BACK_CENTER ? (full + 1) / 2 : full;
+}
+
+int sweepLeftSteps() {
+    int halfSweepDegX10 = (calculatedSweepDegX10() + 1) / 2;
+    return degX10ToSteps(constrain(CENTER_DEG_X10 - halfSweepDegX10, 10, 1800));
+}
+
+int sweepRightSteps() {
+    int halfSweepDegX10 = (calculatedSweepDegX10() + 1) / 2;
+    return degX10ToSteps(constrain(CENTER_DEG_X10 + halfSweepDegX10, 10, 1800));
+}
+
+int sweepBackSteps() {
+    return sweepLeftSteps();
+}
+
+int sweepForwardSteps() {
+    return sweepType == SWEEP_PATH_BACK_CENTER ? degX10ToSteps(CENTER_DEG_X10) : sweepRightSteps();
+}
+
+unsigned long sweepStepIntervalUs(int currentSteps, int targetSteps) {
+    int startSteps = targetSteps >= currentSteps ? sweepBackSteps() : sweepForwardSteps();
+    int sweepSteps = abs(targetSteps - startSteps);
+    if (sweepSteps <= 0) return MOTOR_UPDATE_INTERVAL_US;
+    float base = (float)(SWEEP_TIME_MS * 1000UL) / (float)sweepSteps;
+    float factor = 1.0f;
+
+    if (sweepProfile == SWEEP_PROFILE_HARMONIC) {
+        int remaining = abs(targetSteps - currentSteps);
+        float progress = 1.0f - ((float)remaining / (float)sweepSteps);
+        float velocity = sinf(PI * constrain(progress, 0.0f, 1.0f));
+        factor = 1.0f / max(velocity, 0.20f);
+    } else if (sweepProfile == SWEEP_PROFILE_INVDIST) {
+        int centerSteps = degX10ToSteps(CENTER_DEG_X10);
+        int maxDistance = max(abs(sweepBackSteps() - centerSteps), abs(sweepForwardSteps() - centerSteps));
+        if (maxDistance > 0) {
+            float distance = (float)abs(currentSteps - centerSteps) / (float)maxDistance;
+            factor = constrain(distance, 0.20f, 1.0f);
+        }
+    }
+
+    unsigned long interval = (unsigned long)(base * factor);
+    return constrain(interval, 100UL, 50000UL);
+}
+
 // ============= SENSORS =============
 void readSensors() {
     static bool          lastLimitRaw    = false;
@@ -283,38 +546,90 @@ void readSensors() {
     if (raw != lastLimitRaw) { lastLimitRaw = raw; lastLimitChange = millis(); }
     if (millis() - lastLimitChange >= 20) limitSwitchPressed = lastLimitRaw;
 
-    sprayActive  = (digitalRead(SPRAY_VALVE) == HIGH);
-    flowDetected = (digitalRead(FLOW_SENSOR) == HIGH);
+    if (!SENSOR_INPUTS_ENABLED) {
+        sprayActive = false;
+        flowDetected = false;
+        return;
+    }
+
+    static bool          lastSprayRaw    = false;
+    static bool          lastFlowRaw     = false;
+    static unsigned long lastSprayChange = 0;
+    static unsigned long lastFlowChange  = 0;
+    unsigned long now = millis();
+
+    bool sprayRaw = (digitalRead(SPRAY_VALVE) == HIGH);
+    bool flowRaw  = (digitalRead(FLOW_SENSOR) == HIGH);
+
+    if (sprayRaw != lastSprayRaw) {
+        lastSprayRaw = sprayRaw;
+        lastSprayChange = now;
+    }
+    if (flowRaw != lastFlowRaw) {
+        lastFlowRaw = flowRaw;
+        lastFlowChange = now;
+    }
+
+    if (now - lastSprayChange >= SENSOR_DEBOUNCE) sprayActive = lastSprayRaw;
+    if (now - lastFlowChange >= SENSOR_DEBOUNCE)  flowDetected = lastFlowRaw;
 }
 
 // ============= ENCODER =============
 void readEncoder() {
-    static int           lastEncoded  = 0;
-    static int           stepAccum    = 0;
-    static unsigned long lastStepTime = 0;
+    static int           lastEncoded      = -1;
+    static int           stableEncoded    = -1;
+    static int           candidateEncoded = -1;
+    static uint8_t       candidateCount   = 0;
+    static int           stepAccum        = 0;
+    static unsigned long lastStepTime     = 0;
 
-    int a = digitalRead(ENC_A), b = digitalRead(ENC_B);
-    int encoded = (a << 1) | b;
-    int sum     = (lastEncoded << 2) | encoded;
-    lastEncoded = encoded;
+    int rawEncoded = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
+    if (stableEncoded < 0) {
+        stableEncoded = rawEncoded;
+        candidateEncoded = rawEncoded;
+        lastEncoded = rawEncoded;
+    }
 
-    if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) stepAccum++;
-    if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) stepAccum--;
+    if (rawEncoded != candidateEncoded) {
+        candidateEncoded = rawEncoded;
+        candidateCount = 1;
+    } else if (candidateCount < ENCODER_STABLE_SAMPLES) {
+        candidateCount++;
+    }
+
+    if (candidateCount >= ENCODER_STABLE_SAMPLES && candidateEncoded != stableEncoded) {
+        stableEncoded = candidateEncoded;
+        int sum = (lastEncoded << 2) | stableEncoded;
+        lastEncoded = stableEncoded;
+
+        if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
+            stepAccum++;
+        } else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
+            stepAccum--;
+        } else {
+            stepAccum = 0;
+        }
+    }
 
     if (abs(stepAccum) >= 4) {
         unsigned long now = millis();
-        if (now - lastStepTime >= 50) {
+        if (now - lastStepTime >= ENCODER_STEP_MIN_INTERVAL) {
+            unsigned long stepInterval = now - lastStepTime;
             int d = stepAccum > 0 ? 1 : -1;
+            int editDelta = d * encoderAcceleration(stepInterval);
             switch (displayMode) {
                 case DISP_MENU:
-                    menuIndex = (menuIndex + d + MENU_COUNT) % MENU_COUNT;
+                    {
+                        int visibleCount = advancedMenuUnlocked ? MENU_COUNT : BASIC_MENU_COUNT;
+                        menuIndex = (menuIndex + d + visibleCount) % visibleCount;
+                    }
                     break;
                 case DISP_SETTINGS:
-                    if (editingSettings) adjustSettingsValue(d);
+                    if (editingSettings) adjustSettingsValue(editDelta);
                     else settingsIndex = constrain(settingsIndex + d, 0, SETTINGS_COUNT - 1);
                     break;
                 case DISP_SETUP:
-                    if (editingSetup) adjustSetupValue(d);
+                    if (editingSetup) adjustSetupValue(editDelta);
                     else setupIndex = constrain(setupIndex + d, 0, SETUP_COUNT - 1);
                     break;
                 case DISP_ABOUT:
@@ -325,14 +640,68 @@ void readEncoder() {
         stepAccum = 0;
     }
 
-    static bool          lastBtn     = HIGH;
-    static unsigned long lastBtnTime = 0;
-    bool btn = digitalRead(ENC_SW);
-    if (lastBtn == HIGH && btn == LOW) {
-        unsigned long now = millis();
-        if (now - lastBtnTime >= 200) { menuButtonPressed = true; lastBtnTime = now; }
+    static bool          stableBtn    = HIGH;
+    static bool          candidateBtn = HIGH;
+    static uint8_t       btnSamples   = 0;
+    static unsigned long lastBtnTime  = 0;
+    static unsigned long pressStart   = 0;
+    static bool          longFired    = false;
+    bool rawBtn = digitalRead(ENC_SW);
+
+    if (rawBtn != candidateBtn) {
+        candidateBtn = rawBtn;
+        btnSamples = 1;
+    } else if (btnSamples < ENCODER_STABLE_SAMPLES) {
+        btnSamples++;
     }
-    lastBtn = btn;
+
+    if (btnSamples >= ENCODER_STABLE_SAMPLES && candidateBtn != stableBtn) {
+        unsigned long now = millis();
+        if (now - lastBtnTime >= ENCODER_BUTTON_DEBOUNCE) {
+            bool oldStableBtn = stableBtn;
+            stableBtn   = candidateBtn;
+            lastBtnTime = now;
+
+            if (oldStableBtn == HIGH && stableBtn == LOW) {
+                // ---- pressed (falling edge) ----
+                pressStart = now;
+                longFired  = false;
+            } else {
+                // ---- released (rising edge) ----
+                if (!longFired) {
+                    if (displayMode == DISP_MENU) {
+                        // defer: a long press may follow to toggle the advanced menu
+                        pendingShortClick     = true;
+                        shortClickReleaseTime = now;
+                    } else {
+                        menuButtonPressed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    unsigned long now = millis();
+
+    // Long press while held: short-click-then-long-press toggles the advanced menu
+    if (stableBtn == LOW && !longFired && now - pressStart >= LONG_PRESS_MS) {
+        longFired = true;
+        if (displayMode == DISP_MENU && pendingShortClick &&
+            pressStart - shortClickReleaseTime <= COMBO_GAP_MS) {
+            advancedMenuUnlocked = !advancedMenuUnlocked;
+            if (!advancedMenuUnlocked && menuIndex >= BASIC_MENU_COUNT) menuIndex = 0;
+            pendingShortClick = false;
+            menuDrawState = -1;
+            Serial.printf("Advanced menu %s\n", advancedMenuUnlocked ? "shown" : "hidden");
+        }
+        // a plain long press otherwise does nothing
+    }
+
+    // No long press followed in time -> execute the deferred short click
+    if (pendingShortClick && stableBtn == HIGH && now - shortClickReleaseTime > COMBO_GAP_MS) {
+        pendingShortClick = false;
+        menuButtonPressed = true;
+    }
 }
 
 // ============= STATE MACHINE =============
@@ -341,7 +710,7 @@ void updateStateMachine() {
 
     switch (currentState) {
         case STATE_IDLE:
-            if (sprayActive) {
+            if (SENSOR_INPUTS_ENABLED && sprayActive) {
                 currentState = STATE_HOMING; lastStateChange = now;
                 Serial.println("→ HOMING");
             }
@@ -363,8 +732,12 @@ void updateStateMachine() {
             break;
 
         case STATE_PARKED:
-            if (motorPosition >= PARK_MM * STEPS_PER_MM) {
-                if (sprayActive && !flowDetected) {
+            if (motorPosition >= degX10ToSteps(PARK_DEG_X10)) {
+                if (!SENSOR_INPUTS_ENABLED && sensorBypassCycleArmed) {
+                    oscillationCount = 0; oscillationDir = -1; oscillationStepCount = 0;
+                    currentState = STATE_SPRAY_ACTIVE; lastStateChange = now;
+                    Serial.println("→ SPRAY_ACTIVE (sensor bypass)");
+                } else if (sprayActive && !flowDetected) {
                     currentState = STATE_WAITING_SPRAY; lastStateChange = now;
                     Serial.println("→ WAITING_SPRAY");
                 } else if (sprayActive && flowDetected) {
@@ -376,7 +749,11 @@ void updateStateMachine() {
             break;
 
         case STATE_WAITING_SPRAY:
-            if (!sprayActive) {
+            if (!SENSOR_INPUTS_ENABLED && sensorBypassCycleArmed) {
+                oscillationCount = 0; oscillationDir = -1; oscillationStepCount = 0;
+                currentState = STATE_SPRAY_ACTIVE; lastStateChange = now;
+                Serial.println("→ SPRAY_ACTIVE (sensor bypass)");
+            } else if (!sprayActive) {
                 currentState = STATE_PARKED; lastStateChange = now;
                 Serial.println("→ PARKED (spray lost)");
             } else if (flowDetected) {
@@ -387,23 +764,27 @@ void updateStateMachine() {
             break;
 
         case STATE_SPRAY_ACTIVE:
-            if (!sprayActive || !flowDetected) {
-                currentState = STATE_IDLE; lastStateChange = now;
-                Serial.println("→ IDLE (spray or flow lost)");
+            if (SENSOR_INPUTS_ENABLED && (!sprayActive || !flowDetected)) {
+                currentState = STATE_PARKED; lastStateChange = now;
+                Serial.println("→ PARKED (spray or flow lost)");
             } else if (now - lastStateChange >= SPRAY_ACTIVE_WAIT &&
-                       motorPosition >= CENTER_MM * STEPS_PER_MM) {
+                       motorPosition == sweepBackSteps()) {
+                oscillationDir = 1;
+                oscillationCount = 0;
+                oscillationStepCount = 0;
                 currentState = STATE_OSCILLATING; lastStateChange = now;
                 Serial.println("→ OSCILLATING");
             }
             break;
 
         case STATE_OSCILLATING:
-            if (!sprayActive || !flowDetected) {
-                currentState = STATE_IDLE; lastStateChange = now;
-                Serial.println("→ IDLE (spray or flow lost)");
-            } else if (oscillationCount >= OSCILLATION_CYCLES) {
-                currentState = STATE_IDLE; lastStateChange = now;
-                Serial.println("→ IDLE (cleaning cycle complete)");
+            if (SENSOR_INPUTS_ENABLED && (!sprayActive || !flowDetected)) {
+                currentState = STATE_PARKED; lastStateChange = now;
+                Serial.println("→ PARKED (spray or flow lost)");
+            } else if (OSCILLATION_CYCLES > 0 && oscillationCount >= OSCILLATION_CYCLES) {
+                sensorBypassCycleArmed = false;
+                currentState = STATE_PARKED; lastStateChange = now;
+                Serial.println("→ PARKED (cleaning cycle complete)");
             }
             break;
 
@@ -415,68 +796,86 @@ void updateStateMachine() {
 // ============= STATE ACTIONS =============
 void handleState() {
     unsigned long now = millis();
+    unsigned long stepNow = micros();
+
+    if (displayMode == DISP_SETUP && editingSetup && setupIndex == 1) {
+        setDriverParkHold(false);
+        motorSetEnable(true);
+        setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
+        setFan(FAN_OFF); setUltrasonic(false);
+        return;
+    }
 
     switch (currentState) {
         case STATE_IDLE:
-            motorSetEnable(false);
+            setDriverParkHold(false);
+            motorSetEnable(debugMotorHold);
             setLED(LED_GREEN, false); setLED(LED_YELLOW, false);
             setFan(FAN_OFF); setUltrasonic(false);
             break;
 
         case STATE_HOMING:
+            setDriverParkHold(false);
             motorSetEnable(true);
             setLED(LED_GREEN, false); setLED(LED_YELLOW, true);
-            if (now - lastMotorUpdate >= MOTOR_UPDATE_INTERVAL) {
-                motorStep(-1); lastMotorUpdate = now;
+            if (stepNow - lastMotorStepMicros >= MOTOR_UPDATE_INTERVAL_US) {
+                motorStep(-1); lastMotorStepMicros = stepNow;
             }
             break;
 
         case STATE_PARKED:
-            if (motorPosition < PARK_MM * STEPS_PER_MM) {
-                motorSetEnable(true);
-                if (now - lastMotorUpdate >= MOTOR_UPDATE_INTERVAL) {
-                    motorStep(1); lastMotorUpdate = now;
+            motorSetEnable(true);
+            if (motorPosition != degX10ToSteps(PARK_DEG_X10)) {
+                setDriverParkHold(false);
+                if (stepNow - lastMotorStepMicros >= MOTOR_UPDATE_INTERVAL_US) {
+                    motorMoveTo(degX10ToSteps(PARK_DEG_X10)); lastMotorStepMicros = stepNow;
                 }
             } else {
-                motorSetEnable(false);
+                setDriverParkHold(true);
             }
             setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
             setFan(FAN_OFF); setUltrasonic(false);
             break;
 
         case STATE_WAITING_SPRAY:
+            setDriverParkHold(false);
             motorSetEnable(false);
             setLED(LED_GREEN, false); setLED(LED_YELLOW, true);
             setFan(FAN_WAITING); setUltrasonic(false);
             break;
 
         case STATE_SPRAY_ACTIVE:
+            setDriverParkHold(false);
             setFan(FAN_FULL); setUltrasonic(true);
             setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
             motorSetEnable(true);
-            if (now - lastMotorUpdate >= MOTOR_UPDATE_INTERVAL) {
-                motorMoveTo(CENTER_MM * STEPS_PER_MM); lastMotorUpdate = now;
+            if (stepNow - lastMotorStepMicros >= MOTOR_UPDATE_INTERVAL_US) {
+                motorMoveTo(sweepBackSteps()); lastMotorStepMicros = stepNow;
             }
             break;
 
         case STATE_OSCILLATING:
+            setDriverParkHold(false);
             motorSetEnable(true);
             setFan(FAN_FULL); setUltrasonic(true);
             setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
-            if (now - lastMotorUpdate >= OSCILLATION_DELAY) {
-                motorStep(oscillationDir);
-                oscillationStepCount++;
-                lastMotorUpdate = now;
-                if (oscillationStepCount >= OSCILLATION_STEPS) {
-                    oscillationStepCount = 0;
-                    oscillationDir       = -oscillationDir;
-                    oscillationCount++;
-                    Serial.printf("Sweep %lu/%lu\n", oscillationCount, OSCILLATION_CYCLES);
+            {
+                int target = oscillationDir > 0 ? sweepForwardSteps() : sweepBackSteps();
+                if (stepNow - lastMotorStepMicros < sweepStepIntervalUs(motorPosition, target)) break;
+                motorMoveTo(target);
+                lastMotorStepMicros = stepNow;
+                if (motorPosition == target) {
+                    if (oscillationDir < 0) {
+                        oscillationCount++;
+                        Serial.printf("Sweep %lu/%lu\n", oscillationCount, OSCILLATION_CYCLES);
+                    }
+                    oscillationDir = -oscillationDir;
                 }
             }
             break;
 
         case STATE_ERROR:
+            setDriverParkHold(false);
             motorSetEnable(false); setFan(FAN_OFF); setUltrasonic(false);
             setLED(LED_GREEN, false);
             setLED(LED_YELLOW, (millis() % 1000) < 500);
@@ -486,20 +885,38 @@ void handleState() {
 
 // ============= MENU ACTIONS =============
 void handleMenuSelect() {
+    int visibleCount = advancedMenuUnlocked ? MENU_COUNT : BASIC_MENU_COUNT;
+    if (displayMode == DISP_MENU && menuIndex >= visibleCount) {
+        menuIndex = 0;
+        menuDrawState = -1;
+        return;
+    }
+
     if (displayMode == DISP_SETTINGS) {
-        if (editingSettings)                       { editingSettings = false; }
+        if (editingSettings)                       { editingSettings = false; saveSettings(); }
         else if (settingsIndex == SETTINGS_COUNT - 1) {
+            saveSettings();
             settingsIndex = 0; displayMode = DISP_MENU; menuDrawState = -1;
+        } else if (settingsIndex == 4) {
+            Serial.printf("Calculated sweep angle: %.1f deg\n", calculatedSweepDegX10() * 0.1f);
         } else                                     { editingSettings = true; }
         return;
     }
 
     if (displayMode == DISP_SETUP) {
-        if (editingSetup)                    { editingSetup = false; }
+        if (editingSetup)                    { editingSetup = false; saveSettings(); }
         else if (setupIndex == SETUP_COUNT - 1) {
             applyDriverSettings();
+            saveSettings();
             setupIndex = 0; displayMode = DISP_MENU; menuDrawState = -1;
-        } else                               { editingSetup = true; }
+        } else {
+            if (setupIndex == 1) {
+                CENTER_DEG_X10 = constrain(stepsToDegX10(motorPosition), 10, 1800);
+                setupNeedsRedraw = true;
+                Serial.printf("Setup: Centre live jog starts at %.1f deg\n", CENTER_DEG_X10 * 0.1f);
+            }
+            editingSetup = true;
+        }
         return;
     }
 
@@ -511,14 +928,25 @@ void handleMenuSelect() {
         case 0:  // START / STOP
             if (currentState == STATE_IDLE) {
                 homingToStop = false;
+                sensorBypassCycleArmed = !SENSOR_INPUTS_ENABLED;
                 currentState = STATE_HOMING; lastStateChange = millis();
                 Serial.println("Menu: START → HOMING");
+            } else if (currentState == STATE_PARKED) {
+                if (!SENSOR_INPUTS_ENABLED) {
+                    sensorBypassCycleArmed = true;
+                    oscillationCount = 0; oscillationDir = -1; oscillationStepCount = 0;
+                    currentState = STATE_SPRAY_ACTIVE; lastStateChange = millis();
+                    Serial.println("Menu: START → SPRAY_ACTIVE (sensor bypass)");
+                } else {
+                    Serial.println("Menu: already parked");
+                }
+            } else if (currentState == STATE_ERROR) {
+                Serial.println("Menu: ERROR state latched");
             } else {
-                // Abort: home to limit switch, then IDLE
-                homingToStop = true;
-                motorSetEnable(true);
-                currentState = STATE_HOMING; lastStateChange = millis();
-                Serial.println("Menu: STOP → homing to limit");
+                homingToStop = false;
+                sensorBypassCycleArmed = false;
+                currentState = STATE_PARKED; lastStateChange = millis();
+                Serial.println("Menu: STOP → PARKED");
             }
             break;
 
@@ -540,19 +968,19 @@ void handleMenuSelect() {
 
 // Adjust Settings (sweep) parameter by encoder delta
 void adjustSettingsValue(int delta) {
+    int singleStep = delta > 0 ? 1 : -1;
     switch (settingsIndex) {
         case 0:
-            sweepSpeed = constrain(sweepSpeed + delta, 1, 10);
-            OSCILLATION_DELAY = (unsigned long)(11 - sweepSpeed) * 1000UL;
+            SWEEP_TIME_MS = (unsigned long)constrain((long)SWEEP_TIME_MS + delta * 500L, 500L, 60000L);
             break;
         case 1:
-            sampleIndex = constrain(sampleIndex + delta, 0, SAMPLE_COUNT - 1);
+            sampleIndex = (sampleIndex + singleStep + SAMPLE_COUNT) % SAMPLE_COUNT;
             break;
         case 2:
-            sweepType = constrain(sweepType + delta, 0, 1);
+            sweepType = (sweepType + singleStep + 2) % 2;
             break;
         case 3:
-            sweepProfile = constrain(sweepProfile + delta, 0, 2);
+            sweepProfile = (sweepProfile + singleStep + 3) % 3;
             break;
     }
 }
@@ -560,31 +988,52 @@ void adjustSettingsValue(int delta) {
 // Adjust Setup (hardware) parameter by encoder delta
 void adjustSetupValue(int delta) {
     switch (setupIndex) {
-        case 0: PARK_MM = constrain(PARK_MM + delta, 1, 50); break;
-        case 1: CENTER_MM = constrain(CENTER_MM + delta, 1, 150); break;
-        case 2: OSCILLATION_STEPS = constrain(OSCILLATION_STEPS + delta, 1, 200); break;
-        case 3: OSCILLATION_DELAY = (unsigned long)constrain(
-                    (long)OSCILLATION_DELAY + delta * 1000L, 1000L, 60000L); break;
-        case 4: OSCILLATION_CYCLES = (unsigned long)constrain(
-                    (long)OSCILLATION_CYCLES + delta, 1L, 100L); break;
-        case 5: driverCurrent = constrain(driverCurrent + delta * 50, 100, 1500); break;
-        case 6: {
+        case 0: PARK_DEG_X10 = constrain(PARK_DEG_X10 + delta, 10, 1800); break;
+        case 1:
+            CENTER_DEG_X10 = constrain(CENTER_DEG_X10 + delta, 10, 1800);
+            motorMoveToBlocking(degX10ToSteps(CENTER_DEG_X10), MOTOR_UPDATE_INTERVAL_US);
+            break;
+        case 2: ARM_LENGTH_MM = constrain(ARM_LENGTH_MM + delta * 5, 50, 1000); break;
+        case 3: OSCILLATION_CYCLES = (unsigned long)constrain(
+                    (long)OSCILLATION_CYCLES + delta, 0L, 100L); break;
+        case 4: driverCurrent = constrain(driverCurrent + delta * 50, 100, 1500); break;
+        case 5: {
+            int singleStep = delta > 0 ? 1 : -1;
             int idx = 4;
             for (int i = 0; i < MICROSTEP_COUNT; i++)
                 if (MICROSTEP_TABLE[i] == driverMicrosteps) { idx = i; break; }
-            idx = constrain(idx + delta, 0, MICROSTEP_COUNT - 1);
+            idx = (idx + singleStep + MICROSTEP_COUNT) % MICROSTEP_COUNT;
             driverMicrosteps = MICROSTEP_TABLE[idx];
             break;
         }
+        case 6:
+            motorDirectionInverted = !motorDirectionInverted;
+            break;
     }
 }
 
 void applyDriverSettings() {
     mutex_enter_blocking(&spi_mutex);
-    driver.rms_current(driverCurrent);
+    driver.rms_current(driverCurrent, driverParkHoldMode ? DRIVER_PARK_HOLD_MULTIPLIER : DRIVER_RUN_HOLD_MULTIPLIER);
     driver.microsteps(driverMicrosteps);
+    driver.intpol(true);
     mutex_exit(&spi_mutex);
-    Serial.printf("Driver applied: %d mA, %dx microsteps\n", driverCurrent, driverMicrosteps);
+    Serial.printf("Driver applied: %d mA, hold %.0f%%, %dx microsteps\n",
+                  driverCurrent,
+                  (driverParkHoldMode ? DRIVER_PARK_HOLD_MULTIPLIER : DRIVER_RUN_HOLD_MULTIPLIER) * 100.0f,
+                  driverMicrosteps);
+}
+
+void setDriverParkHold(bool parkHold) {
+    if (driverParkHoldMode == parkHold) return;
+
+    driverParkHoldMode = parkHold;
+    mutex_enter_blocking(&spi_mutex);
+    driver.rms_current(driverCurrent, parkHold ? DRIVER_PARK_HOLD_MULTIPLIER : DRIVER_RUN_HOLD_MULTIPLIER);
+    mutex_exit(&spi_mutex);
+    Serial.printf("Driver hold mode: %s hold %.0f%%\n",
+                  parkHold ? "park" : "run",
+                  (parkHold ? DRIVER_PARK_HOLD_MULTIPLIER : DRIVER_RUN_HOLD_MULTIPLIER) * 100.0f);
 }
 
 void pollDriverStatus() {
@@ -598,9 +1047,234 @@ void pollDriverStatus() {
     }
 }
 
+// ============= SERIAL DEBUG =============
+void handleSerialDebug() {
+    while (Serial.available() > 0) {
+        char c = Serial.read();
+        switch (c) {
+            case 'd':
+            case 'D':
+                dumpDriverStatus();
+                break;
+            case 'e':
+            case 'E':
+                debugMotorHold = true;
+                motorSetEnable(true);
+                Serial.println("DBG: motor enabled (EN=LOW)");
+                break;
+            case 'x':
+            case 'X':
+                debugMotorHold = false;
+                motorSetEnable(false);
+                Serial.println("DBG: motor disabled (EN=HIGH)");
+                break;
+            case '+':
+                debugMotorHold = true;
+                motorSetEnable(true);
+                motorStep(1);
+                Serial.printf("DBG: step + pos=%d\n", motorPosition);
+                break;
+            case '-':
+                debugMotorHold = true;
+                motorSetEnable(true);
+                motorStep(-1);
+                Serial.printf("DBG: step - pos=%d\n", motorPosition);
+                break;
+            case 'f':
+            case 'F':
+                debugStepBurst(1, 400, 1000);
+                break;
+            case 'b':
+            case 'B':
+                debugStepBurst(-1, 400, 1000);
+                break;
+            case 'r':
+            case 'R': {
+                int revSteps = motorShaftRevSteps();
+                Serial.printf("DBG: one shaft revolution = %d microsteps at %dx\n",
+                              revSteps, driverMicrosteps);
+                debugStepBurst(1, revSteps, 150);
+                break;
+            }
+            case '?':
+                Serial.println("DBG commands: d=dump TMC, e=enable, x=disable, +=one forward, -=one back, f=400 forward, b=400 back, r=one shaft rev");
+                break;
+        }
+    }
+}
+
+void dumpDriverStatus() {
+    uint32_t gstat = 0;
+    uint32_t drvStatus = 0;
+    uint32_t rawGstat = 0;
+    uint32_t rawIoin = 0;
+    uint32_t rawDrvStatus = 0;
+    uint32_t rawChopconf = 0;
+
+    mutex_enter_blocking(&spi_mutex);
+    gstat = driver.GSTAT();
+    drvStatus = driver.DRV_STATUS();
+    mutex_exit(&spi_mutex);
+
+    rawGstat = rawTmcRead(0x01);
+    rawIoin = rawTmcRead(0x04);
+    rawChopconf = rawTmcRead(0x6C);
+    rawDrvStatus = rawTmcRead(0x6F);
+
+    driverGStat = gstat;
+    driverDrvStatus = drvStatus;
+
+    Serial.println("=== TMC2130 DEBUG ===");
+    Serial.printf("Pins: CS=%d SCK=%d MOSI=%d MISO=%d STEP=%d DIR=%d EN=%d\n",
+                  TMC_CS, TMC_SCK, TMC_MOSI, TMC_MISO, TMC_STEP, TMC_DIR, TMC_EN);
+    Serial.printf("EN pin: %s\n", digitalRead(TMC_EN) == LOW ? "LOW enabled" : "HIGH disabled");
+    Serial.printf("GSTAT:     0x%08lX\n", (unsigned long)gstat);
+    Serial.printf("DRV_STAT:  0x%08lX\n", (unsigned long)drvStatus);
+    Serial.printf("RAW GSTAT: 0x%08lX\n", (unsigned long)rawGstat);
+    Serial.printf("RAW IOIN:  0x%08lX version=0x%02lX\n",
+                  (unsigned long)rawIoin, (unsigned long)((rawIoin >> 24) & 0xFF));
+    Serial.printf("RAW CHOP:  0x%08lX toff=%lu mres=%lu\n",
+                  (unsigned long)rawChopconf,
+                  (unsigned long)(rawChopconf & 0x0F),
+                  (unsigned long)((rawChopconf >> 24) & 0x0F));
+    Serial.printf("RAW DRV:   0x%08lX\n", (unsigned long)rawDrvStatus);
+
+    if (gstat == 0xFFFFFFFFUL || drvStatus == 0xFFFFFFFFUL ||
+        rawGstat == 0xFFFFFFFFUL || rawIoin == 0xFFFFFFFFUL || rawDrvStatus == 0xFFFFFFFFUL) {
+        Serial.println("SPI: suspicious all-ones read; check CS/MISO/SCK/MOSI wiring and driver VCC_IO.");
+    } else if (gstat == 0 && drvStatus == 0 && rawGstat == 0 && rawIoin == 0 && rawDrvStatus == 0) {
+        Serial.println("SPI: all-zero read; check driver power, CS wiring, and SPI mode/jumpers.");
+    } else {
+        Serial.println("SPI: non-zero register data received.");
+    }
+
+    Serial.printf("GSTAT bits: reset=%d drv_err=%d uv_cp=%d\n",
+                  (int)(gstat & 0x01), (int)((gstat >> 1) & 0x01), (int)((gstat >> 2) & 0x01));
+    Serial.printf("IOIN bits: step=%d dir=%d drv_enn=%d cfg5=%d cfg4=%d\n",
+                  (int)(rawIoin & 0x01),
+                  (int)((rawIoin >> 1) & 0x01),
+                  (int)((rawIoin >> 4) & 0x01),
+                  (int)((rawIoin >> 3) & 0x01),
+                  (int)((rawIoin >> 2) & 0x01));
+    Serial.printf("Config: irun=%d ihold=%d toff=%d microsteps=%d stealth=%d pwm_auto=%d\n",
+                  driver.irun(), driver.ihold(), driver.toff(),
+                  driver.microsteps(), driver.en_pwm_mode(), driver.pwm_autoscale());
+    Serial.printf("DRV bits: stst=%d olb=%d ola=%d s2gb=%d s2ga=%d otpw=%d ot=%d cs_actual=%lu sg=%lu\n",
+                  (int)((drvStatus >> 31) & 0x01),
+                  (int)((drvStatus >> 30) & 0x01),
+                  (int)((drvStatus >> 29) & 0x01),
+                  (int)((drvStatus >> 28) & 0x01),
+                  (int)((drvStatus >> 27) & 0x01),
+                  (int)((drvStatus >> 26) & 0x01),
+                  (int)((drvStatus >> 25) & 0x01),
+                  (unsigned long)((drvStatus >> 16) & 0x1F),
+                  (unsigned long)(drvStatus & 0x3FF));
+    if ((drvStatus >> 29) & 0x03) {
+        Serial.println("DRV: open-load on motor outputs; check VM power and both motor coil pairs.");
+    }
+    Serial.println("Commands: d=dump, e=enable, x=disable, +=one forward, -=one back, f=400 forward, b=400 back");
+}
+
+uint32_t rawTmcRead(uint8_t address) {
+    uint32_t out = 0;
+
+    mutex_enter_blocking(&spi_mutex);
+    SPI1.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+
+    digitalWrite(LCD_CS, HIGH);
+    digitalWrite(TMC_CS, LOW);
+    SPI1.transfer(address & 0x7F);
+    SPI1.transfer(0x00);
+    SPI1.transfer(0x00);
+    SPI1.transfer(0x00);
+    SPI1.transfer(0x00);
+    digitalWrite(TMC_CS, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(TMC_CS, LOW);
+    SPI1.transfer(address & 0x7F);
+    out  = (uint32_t)SPI1.transfer(0x00) << 24;
+    out |= (uint32_t)SPI1.transfer(0x00) << 16;
+    out |= (uint32_t)SPI1.transfer(0x00) << 8;
+    out |= (uint32_t)SPI1.transfer(0x00);
+    digitalWrite(TMC_CS, HIGH);
+
+    SPI1.endTransaction();
+    mutex_exit(&spi_mutex);
+    return out;
+}
+
+void debugStepBurst(int direction, int steps, unsigned int stepDelayUs) {
+    debugMotorHold = true;
+    motorSetEnable(true);
+    bool dirLevel = direction > 0;
+    if (motorDirectionInverted) dirLevel = !dirLevel;
+    digitalWrite(TMC_DIR, dirLevel ? HIGH : LOW);
+    delayMicroseconds(20);
+
+    for (int i = 0; i < steps; i++) {
+        digitalWrite(TMC_STEP, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(TMC_STEP, LOW);
+        delayMicroseconds(stepDelayUs);
+        motorPosition += (direction > 0) ? 1 : -1;
+    }
+
+    Serial.printf("DBG: burst %c %d steps pos=%d\n",
+                  direction > 0 ? '+' : '-', steps, motorPosition);
+    dumpDriverStatus();
+}
+
 // ============= MOTOR =============
+int motorShaftRevSteps() {
+    return FULL_STEPS_PER_REV * driverMicrosteps;
+}
+
+int degreesToSteps(int degrees) {
+    long steps = (long)degrees * FULL_STEPS_PER_REV * driverMicrosteps;
+    return (int)((steps + 180L) / 360L);
+}
+
+int degX10ToSteps(int degX10) {
+    long steps = (long)degX10 * FULL_STEPS_PER_REV * driverMicrosteps;
+    return (int)((steps + 1800L) / 3600L);
+}
+
+int stepsToDegrees(int steps) {
+    long denom = (long)FULL_STEPS_PER_REV * driverMicrosteps;
+    long numerator = (long)steps * 360L;
+    if (numerator >= 0) {
+        return (int)((numerator + denom / 2) / denom);
+    }
+    return (int)((numerator - denom / 2) / denom);
+}
+
+int stepsToDegX10(int steps) {
+    long denom = (long)FULL_STEPS_PER_REV * driverMicrosteps;
+    long numerator = (long)steps * 3600L;
+    if (numerator >= 0) {
+        return (int)((numerator + denom / 2) / denom);
+    }
+    return (int)((numerator - denom / 2) / denom);
+}
+
+void printDegX10(int degX10) {
+    tft.print(degX10 / 10);
+    tft.print(".");
+    tft.print(abs(degX10 % 10));
+}
+
+int encoderAcceleration(unsigned long intervalMs) {
+    if (intervalMs <= 25) return 10;
+    if (intervalMs <= 50) return 5;
+    if (intervalMs <= 100) return 2;
+    return 1;
+}
+
 void motorStep(int direction) {
-    digitalWrite(TMC_DIR,  direction > 0 ? HIGH : LOW);
+    bool dirLevel = direction > 0;
+    if (motorDirectionInverted) dirLevel = !dirLevel;
+    digitalWrite(TMC_DIR, dirLevel ? HIGH : LOW);
     digitalWrite(TMC_STEP, HIGH); delayMicroseconds(10);
     digitalWrite(TMC_STEP, LOW);  delayMicroseconds(10);
     motorPosition += (direction > 0) ? 1 : -1;
@@ -615,10 +1289,136 @@ void motorMoveTo(int target) {
     else if (motorPosition > target) motorStep(-1);
 }
 
+void motorMoveToBlocking(int target, unsigned int stepDelayUs) {
+    setDriverParkHold(false);
+    motorSetEnable(true);
+    while (motorPosition != target) {
+        motorMoveTo(target);
+        delayMicroseconds(stepDelayUs);
+    }
+}
+
 // ============= OUTPUTS =============
 void setLED(int ledPin, bool state) { digitalWrite(ledPin, state ? HIGH : LOW); }
 void setFan(int speed) { analogWrite(FAN_PWM, constrain(speed, 0, 255)); }
 void setUltrasonic(bool on) { digitalWrite(ULTRASONIC, on ? LOW : HIGH); }
+
+const char* stateLabel(SystemState state) {
+    switch (state) {
+        case STATE_IDLE:          return "IDLE";
+        case STATE_HOMING:        return "HOME";
+        case STATE_PARKED:        return "PARK";
+        case STATE_WAITING_SPRAY: return "WAIT";
+        case STATE_SPRAY_ACTIVE:  return "SPRAY";
+        case STATE_OSCILLATING:   return "OSC";
+        case STATE_ERROR:         return "ERROR";
+    }
+    return "----";
+}
+
+void drawStatusColumn(SystemState state, int posDegX10, bool forceRedraw) {
+    static SystemState drawnState = (SystemState)-1;
+    static int drawnPosDegX10 = -9999;
+    static bool drawnSpray = false;
+    static bool drawnFlow = false;
+    static bool drawnHold = false;
+
+    int x = STATUS_X + 6;
+    int valueW = STATUS_W - 8;
+
+    if (forceRedraw) {
+        tft.fillRect(STATUS_X, 0, STATUS_W, tft.height(), ST77XX_BLACK);
+        tft.drawFastVLine(STATUS_X, 0, tft.height(), tft.color565(70, 70, 70));
+
+        tft.setTextWrap(false);
+        tft.setTextSize(1);
+        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+        tft.setCursor(x, 5);
+        tft.print("STATUS");
+        if (!SENSOR_INPUTS_ENABLED) {
+            tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+            tft.setCursor(x, 15);
+            tft.print("DEBUG ON");
+        }
+
+        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(x, 24);
+        tft.print("STATE");
+        tft.setCursor(x, 64);
+        tft.print("ANGLE");
+        tft.setCursor(x, 106);
+        tft.print("SPRAY");
+        tft.setCursor(x, 126);
+        tft.print("FLOW");
+        tft.setCursor(x, 146);
+        tft.print("HOLD");
+
+        drawnState = (SystemState)-1;
+        drawnPosDegX10 = -9999;
+        drawnSpray = !sprayActive;
+        drawnFlow = !flowDetected;
+        drawnHold = !driverParkHoldMode;
+    }
+
+    if (forceRedraw || state != drawnState) {
+        tft.fillRect(x, 36, valueW, 18, ST77XX_BLACK);
+        tft.setTextSize(2);
+        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+        tft.setCursor(x, 36);
+        tft.print(stateLabel(state));
+        drawnState = state;
+    }
+
+    if (forceRedraw || posDegX10 != drawnPosDegX10) {
+        tft.fillRect(x, 76, valueW, 18, ST77XX_BLACK);
+        tft.setTextSize(2);
+        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+        tft.setCursor(x, 76);
+        printDegX10(posDegX10);
+        tft.setTextSize(1);
+        tft.print(" deg");
+        drawnPosDegX10 = posDegX10;
+    }
+
+    if (forceRedraw || sprayActive != drawnSpray) {
+        tft.fillRect(x + 38, 106, valueW - 38, 8, ST77XX_BLACK);
+        tft.setTextSize(1);
+        if (SENSOR_INPUTS_ENABLED) {
+            tft.setTextColor(sprayActive ? ST77XX_GREEN : ST77XX_RED, ST77XX_BLACK);
+            tft.setCursor(x + 38, 106);
+            tft.print(sprayActive ? "ON" : "OFF");
+        } else {
+            tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+            tft.setCursor(x + 38, 106);
+            tft.print("DIS");
+        }
+        drawnSpray = sprayActive;
+    }
+
+    if (forceRedraw || flowDetected != drawnFlow) {
+        tft.fillRect(x + 38, 126, valueW - 38, 8, ST77XX_BLACK);
+        tft.setTextSize(1);
+        if (SENSOR_INPUTS_ENABLED) {
+            tft.setTextColor(flowDetected ? ST77XX_GREEN : ST77XX_RED, ST77XX_BLACK);
+            tft.setCursor(x + 38, 126);
+            tft.print(flowDetected ? "YES" : "NO");
+        } else {
+            tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+            tft.setCursor(x + 38, 126);
+            tft.print("DIS");
+        }
+        drawnFlow = flowDetected;
+    }
+
+    if (forceRedraw || driverParkHoldMode != drawnHold) {
+        tft.fillRect(x + 38, 146, valueW - 38, 8, ST77XX_BLACK);
+        tft.setTextSize(1);
+        tft.setTextColor(driverParkHoldMode ? ST77XX_GREEN : ST77XX_WHITE, ST77XX_BLACK);
+        tft.setCursor(x + 38, 146);
+        tft.print(driverParkHoldMode ? "PARK" : "RUN");
+        drawnHold = driverParkHoldMode;
+    }
+}
 
 // ============= DISPLAY =============
 
@@ -657,7 +1457,7 @@ void drawMenuRow(int i, int y, bool selected) {
     uint16_t bg   = selected ? ST77XX_BLUE : ST77XX_BLACK;
     uint16_t icnc = selected ? ST77XX_WHITE : ST77XX_CYAN;
 
-    tft.fillRect(6, y - 2, tft.width() - 12, 28, bg);
+    tft.fillRect(6, y - 2, CONTENT_W - 12, 28, bg);
 
     // Item 0: show stop square (■) when motor is running, play triangle otherwise
     if (i == 0 && currentState != STATE_IDLE) {
@@ -678,7 +1478,12 @@ void drawMenu() {
     //   Items         y=22,50,78,106  step=28  (textSize 3, 24px)
     //   Status bar    y=150
 
+    int visibleCount = advancedMenuUnlocked ? MENU_COUNT : BASIC_MENU_COUNT;
     int mi = menuIndex;  // snapshot to avoid race with Core 0
+    if (mi >= visibleCount) {
+        mi = 0;
+        menuIndex = 0;
+    }
 
     if (menuDrawState == -1) {
         tft.fillScreen(ST77XX_BLACK);
@@ -697,23 +1502,119 @@ void drawMenu() {
         tft.setCursor(32, 2);
         tft.print("MEGASONIC");
 
-        for (int i = 0; i < MENU_COUNT; i++)
+        for (int i = 0; i < visibleCount; i++)
             drawMenuRow(i, 22 + i * 28, i == mi);
 
     } else if (menuDrawState != mi) {
-        drawMenuRow(menuDrawState, 22 + menuDrawState * 28, false);
+        if (menuDrawState >= 0 && menuDrawState < visibleCount) {
+            drawMenuRow(menuDrawState, 22 + menuDrawState * 28, false);
+        }
         drawMenuRow(mi,            22 + mi             * 28, true);
     }
 
     menuDrawState = mi;
 }
 
+// ============= ARM POSITION ANIMATION (basic menu) =============
+// Top-down sketch under the START/Settings rows: the wafer as a circle (size ∝ wafer
+// diameter), the park position as a green tick, and the live arm position as a red
+// down-arrow. Geometry: arm-tip horizontal offset from wafer centre =
+// ARM_LENGTH * sin(angle - centre), so the sweep extremes land on the wafer edges.
+void drawArmAnim(bool fullRedraw, int posDegX10) {
+    const int axisY   = ANIM_Y + ANIM_H / 2;   // 126: wafer centre / arrow-tip line
+    const int maxRpx  = ANIM_H / 2 - 8;        // vertical room for the wafer radius
+    const int armTopY = ANIM_Y + 4;
+    const int headH   = 7;                      // arrowhead height
+    const int tipY    = axisY;                  // arrow points down onto the plane
+    const uint16_t gray = tft.color565(60, 60, 60);
+
+    static int   prevArmX    = -1;
+    static int   lastAnimDeg = -9999;           // whole degrees, for the 1° flicker gate
+    static int   cPark = -1, cCenter = -1, cArm = -1, cWafer = -1;
+    static int   waferCx = 0, radiusPx = 0, parkX = 0, startX = 0, drawnW = 0;
+    static float sScale = 1.0f, sLo = 0.0f;
+
+    const float toRad     = 3.14159265f / 180.0f;
+    const float centerDeg = CENTER_DEG_X10 * 0.1f;
+
+    // Static layout depends only on park / centre / arm length / wafer settings.
+    bool redrawStatic = fullRedraw || cPark != PARK_DEG_X10 || cCenter != CENTER_DEG_X10 ||
+                        cArm != ARM_LENGTH_MM || cWafer != sampleIndex;
+
+    if (redrawStatic) {
+        cPark = PARK_DEG_X10; cCenter = CENTER_DEG_X10;
+        cArm = ARM_LENGTH_MM; cWafer = sampleIndex;
+
+        float parkDeg = PARK_DEG_X10 * 0.1f;
+        float waferR  = waferDiameterMm() * 0.5f;
+        float parkOff = ARM_LENGTH_MM * sinf((parkDeg - centerDeg) * toRad);
+
+        float lo = fminf(parkOff, -waferR);
+        float hi = fmaxf(parkOff,  waferR);
+        float spanMm = hi - lo; if (spanMm < 1.0f) spanMm = 1.0f;
+
+        float scaleW = (ANIM_W - 16) / spanMm;
+        float scaleH = (float)maxRpx / (waferR > 1.0f ? waferR : 1.0f);
+        sScale = fminf(scaleW, scaleH);
+        sLo    = lo;
+
+        drawnW   = (int)lroundf(spanMm * sScale);
+        startX   = ANIM_X + (ANIM_W - drawnW) / 2;
+        radiusPx = (int)lroundf(waferR * sScale);
+        waferCx  = startX + (int)lroundf((0.0f    - lo) * sScale);
+        parkX    = startX + (int)lroundf((parkOff - lo) * sScale);
+
+        // Clear region and paint the static scene.
+        tft.fillRect(ANIM_X, ANIM_Y - 2, ANIM_W, ANIM_H + 2, ST77XX_BLACK);
+        tft.drawFastHLine(ANIM_X, ANIM_Y - 4, ANIM_W, gray);            // separator
+        int axL = min(parkX, waferCx - radiusPx) - 4;
+        int axR = waferCx + radiusPx + 4;
+        tft.drawFastHLine(axL, axisY, axR - axL, gray);                 // sweep axis
+        tft.drawCircle(waferCx, axisY, radiusPx, ST77XX_CYAN);          // wafer
+        tft.fillCircle(waferCx, axisY, 2, ST77XX_CYAN);                 // wafer centre dot
+        tft.drawFastVLine(parkX, axisY - 6, 13, ST77XX_GREEN);          // park tick
+        tft.setTextSize(1);
+        tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+        tft.setCursor(parkX - 2, axisY + 10);
+        tft.print("P");
+
+        prevArmX = -1; lastAnimDeg = -9999;   // force the arrow to repaint
+    }
+
+    // Live arm position.
+    float armOff = ARM_LENGTH_MM * sinf((posDegX10 * 0.1f - centerDeg) * toRad);
+    int   armX   = startX + (int)lroundf((armOff - sLo) * sScale);
+    armX = constrain(armX, startX, startX + drawnW);
+
+    // Flicker gate: only move the arrow once the angle has changed by ≥ 1°.
+    int curDeg = (posDegX10 + (posDegX10 >= 0 ? 5 : -5)) / 10;
+    if (!redrawStatic && abs(curDeg - lastAnimDeg) < 1 && prevArmX >= 0) return;
+    lastAnimDeg = curDeg;
+    if (armX == prevArmX) return;
+
+    // Erase the old arrow, then restore the static scene it crossed.
+    if (prevArmX >= 0) {
+        tft.fillRect(prevArmX - 5, armTopY, 11, tipY - armTopY + 1, ST77XX_BLACK);
+        int axL = min(parkX, waferCx - radiusPx) - 4;
+        int axR = waferCx + radiusPx + 4;
+        tft.drawFastHLine(axL, axisY, axR - axL, gray);
+        tft.drawCircle(waferCx, axisY, radiusPx, ST77XX_CYAN);
+        tft.fillCircle(waferCx, axisY, 2, ST77XX_CYAN);
+        tft.drawFastVLine(parkX, axisY - 6, 13, ST77XX_GREEN);
+    }
+
+    // Draw the arrow (red): vertical shaft + downward head onto the wafer plane.
+    tft.fillRect(armX - 1, armTopY, 2, (tipY - headH) - armTopY, ST77XX_RED);
+    tft.fillTriangle(armX - 4, tipY - headH, armX + 4, tipY - headH, armX, tipY, ST77XX_RED);
+    prevArmX = armX;
+}
+
 // ============= SETTINGS SCREEN (sweep params) =============
 void drawSettingsRow(int i, int y, bool selected, bool editing) {
-    const char* labels[] = { "Speed  ", "Sample ", "Sweep  ", "Profile", "< Back " };
+    const char* labels[] = { "Time   ", "Wafer  ", "Path   ", "Profile", "Angle  ", "< Back " };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
-    tft.fillRect(0, y - 2, tft.width(), 26, bg);
+    tft.fillRect(0, y - 2, CONTENT_W, 22, bg);
     tft.setTextColor(ST77XX_WHITE, bg);
     tft.setTextSize(2);
     tft.setCursor(6, y);
@@ -722,20 +1623,24 @@ void drawSettingsRow(int i, int y, bool selected, bool editing) {
         tft.print(": ");
         switch (i) {
             case 0:
-                tft.print(sweepSpeed);
-                tft.print("    ");
+                tft.print(SWEEP_TIME_MS / 1000.0f, 1);
+                tft.print("s   ");
                 break;
             case 1:
                 tft.print(SAMPLE_TABLE[sampleIndex]);
                 tft.print("mm  ");
                 break;
             case 2:
-                tft.print(sweepType == 0 ? "Ctr<->Bk" : "Edge->Ed");
+                tft.print(sweepType == SWEEP_PATH_BACK_CENTER ? "Back-Ctr" : "Back-Frt");
                 break;
             case 3:
-                if      (sweepProfile == 0) tft.print("Linear  ");
-                else if (sweepProfile == 1) tft.print("Harmonic");
-                else                        tft.print("Swing   ");
+                if      (sweepProfile == SWEEP_PROFILE_LINEAR)   tft.print("Linear ");
+                else if (sweepProfile == SWEEP_PROFILE_HARMONIC) tft.print("Harm   ");
+                else                                             tft.print("InvDist");
+                break;
+            case 4:
+                printDegX10(travelSweepDegX10());
+                tft.print("deg ");
                 break;
         }
     }
@@ -744,16 +1649,18 @@ void drawSettingsRow(int i, int y, bool selected, bool editing) {
 void drawSettings() {
     static int  lastIdx      = -1;
     static bool lastEdit     = false;
-    static int  lastVals[4]  = {};
+    static int  lastVals[5]  = {};
 
     if (settingsNeedsRedraw) { settingsNeedsRedraw = false; lastIdx = -1; }
 
     int  si = settingsIndex;
     bool ed = editingSettings;
-    int  vals[4] = { sweepSpeed, sampleIndex, sweepType, sweepProfile };
+    int  vals[5] = {
+        (int)(SWEEP_TIME_MS / 100), sampleIndex, sweepType, sweepProfile, travelSweepDegX10()
+    };
 
     bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit);
-    for (int i = 0; i < 4 && !changed; i++) changed = (vals[i] != lastVals[i]);
+    for (int i = 0; i < 5 && !changed; i++) changed = (vals[i] != lastVals[i]);
     if (!changed) return;
 
     if (lastIdx == -1) {
@@ -766,21 +1673,21 @@ void drawSettings() {
     }
 
     for (int i = 0; i < SETTINGS_COUNT; i++)
-        drawSettingsRow(i, 22 + i * 28, i == si, i == si && ed && i < SETTINGS_COUNT - 1);
+        drawSettingsRow(i, 22 + i * 24, i == si, i == si && ed && i < SETTINGS_COUNT - 1 && i != 4);
 
     lastIdx = si; lastEdit = ed;
-    for (int i = 0; i < 4; i++) lastVals[i] = vals[i];
+    for (int i = 0; i < 5; i++) lastVals[i] = vals[i];
 }
 
 // ============= SETUP SCREEN (hardware params) =============
 void drawSetupRow(int i, int y, bool selected, bool editing) {
     const char* labels[] = {
-        "Park   ", "Centre ", "Steps  ", "Delay  ",
-        "Cycles ", "Current", "Mstep  ", "< Back "
+        "Park   ", "Centre ", "Arm    ", "Cycles ",
+        "Current", "Mstep  ", "Invert ", "< Back "
     };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
-    tft.fillRect(0, y - 2, tft.width(), 18, bg);
+    tft.fillRect(0, y - 2, CONTENT_W, 18, bg);
     tft.setTextColor(ST77XX_WHITE, bg);
     tft.setTextSize(2);
     tft.setCursor(6, y);
@@ -788,13 +1695,16 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
     if (i < SETUP_COUNT - 1) {
         tft.print(": ");
         switch (i) {
-            case 0: tft.print(PARK_MM);                     tft.print("mm  ");  break;
-            case 1: tft.print(CENTER_MM);                   tft.print("mm  ");  break;
-            case 2: tft.print(OSCILLATION_STEPS);           tft.print("      "); break;
-            case 3: tft.print(OSCILLATION_DELAY / 1000);    tft.print("s     "); break;
-            case 4: tft.print(OSCILLATION_CYCLES);          tft.print("      "); break;
-            case 5: tft.print(driverCurrent);               tft.print("mA  ");  break;
-            case 6: tft.print(driverMicrosteps);            tft.print("x     "); break;
+            case 0: printDegX10(PARK_DEG_X10);              tft.print("deg ");  break;
+            case 1: printDegX10(CENTER_DEG_X10);            tft.print("deg ");  break;
+            case 2: tft.print(ARM_LENGTH_MM);               tft.print("mm  ");  break;
+            case 3:
+                if (OSCILLATION_CYCLES == 0) tft.print("inf   ");
+                else { tft.print(OSCILLATION_CYCLES); tft.print("      "); }
+                break;
+            case 4: tft.print(driverCurrent);               tft.print("mA  ");  break;
+            case 5: tft.print(driverMicrosteps);            tft.print("x     "); break;
+            case 6: tft.print(motorDirectionInverted ? "ON    " : "OFF   "); break;
         }
     }
 }
@@ -809,9 +1719,8 @@ void drawSetup() {
     int  si = setupIndex;
     bool ed = editingSetup;
     int  vals[7] = {
-        PARK_MM, CENTER_MM, OSCILLATION_STEPS,
-        (int)(OSCILLATION_DELAY / 1000), (int)OSCILLATION_CYCLES,
-        driverCurrent, driverMicrosteps
+        PARK_DEG_X10, CENTER_DEG_X10, ARM_LENGTH_MM, (int)OSCILLATION_CYCLES,
+        driverCurrent, driverMicrosteps, motorDirectionInverted ? 1 : 0
     };
 
     bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit);
@@ -853,7 +1762,7 @@ void drawAbout() {
         tft.setTextWrap(false);
         tft.setTextColor(ST77XX_CYAN,  ST77XX_BLACK);
         tft.setTextSize(2);
-        tft.setCursor(8, 3);   tft.print("MEGASONIC v1.0");
+        tft.setCursor(8, 3);   tft.print("MEGASONIC v1.1");
         tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
         tft.setCursor(8, 22);  tft.print("RP2040 earlephilhower");
         tft.setCursor(8, 40);  tft.print("GMT147SPI 172x320");
@@ -868,9 +1777,9 @@ void drawAbout() {
     if (ds == lastDrvSt && gs == lastGStat) return;
     lastDrvSt = ds; lastGStat = gs;
 
-    bool     ot     = (ds >> 30) & 1;
-    bool     otpw   = (ds >> 29) & 1;
-    bool     stst   = (ds >> 24) & 1;
+    bool     stst   = (ds >> 31) & 1;
+    bool     ot     = (ds >> 25) & 1;
+    bool     otpw   = (ds >> 26) & 1;
     bool     drverr = (gs >> 1)  & 1;
     uint8_t  cs     = (ds >> 16) & 0x1F;
     uint16_t sg     = ds & 0x3FF;
@@ -897,31 +1806,52 @@ void drawAbout() {
 // ============= UPDATE DISPLAY (Core 1) =============
 void updateDisplay() {
     static SystemState lastState       = (SystemState)-1;
-    static int         lastPos         = -1;
+    static int         lastPosDegX10   = -9999;
     static int         lastMenu        = -1;
     static bool        lastRunning     = false;
+    static bool        lastSpray       = false;
+    static bool        lastFlow        = false;
+    static bool        lastHold        = false;
     static DisplayMode lastDisplayMode = DISP_MENU;
 
     DisplayMode dm    = displayMode;
     int         mi    = menuIndex;
     SystemState state = currentState;
     int         pos   = motorPosition;
+    int         posDegX10 = stepsToDegX10(pos);
+    bool statusChanged = (state != lastState || posDegX10 != lastPosDegX10 ||
+                          sprayActive != lastSpray || flowDetected != lastFlow ||
+                          driverParkHoldMode != lastHold);
 
     if (dm != DISP_MENU) {
+        bool modeChanged = (dm != lastDisplayMode);
         mutex_enter_blocking(&spi_mutex);
-        if      (dm == DISP_SETTINGS) drawSettings();
-        else if (dm == DISP_SETUP)    drawSetup();
-        else                          drawAbout();
+        if (dm == DISP_SETTINGS) {
+            drawSettings();
+            if (modeChanged || statusChanged) drawStatusColumn(state, posDegX10, modeChanged);
+        } else if (dm == DISP_SETUP) {
+            drawSetup();
+            if (modeChanged || statusChanged) drawStatusColumn(state, posDegX10, modeChanged);
+        } else {
+            drawAbout();
+        }
         mutex_exit(&spi_mutex);
+        if (modeChanged || statusChanged) {
+            lastState = state; lastPosDegX10 = posDegX10;
+            lastSpray = sprayActive; lastFlow = flowDetected; lastHold = driverParkHoldMode;
+        }
         lastDisplayMode = dm;
         return;
     }
 
     if (lastDisplayMode != DISP_MENU) {
         lastState   = (SystemState)-1;
-        lastPos     = -1;
+        lastPosDegX10 = -9999;
         lastMenu    = -1;
         lastRunning = false;
+        lastSpray   = false;
+        lastFlow    = false;
+        lastHold    = false;
         lastDisplayMode = DISP_MENU;
     }
 
@@ -934,34 +1864,29 @@ void updateDisplay() {
     }
 
     bool menuChanged  = (mi    != lastMenu);
-    bool statusChanged = (state != lastState || pos != lastPos);
+    bool forceStatusRedraw = (menuChanged && menuDrawState == -1);
 
-    if (!menuChanged && !statusChanged) return;
+    if (!menuChanged && !statusChanged && !forceStatusRedraw) return;
 
     mutex_enter_blocking(&spi_mutex);
 
+    bool animFull = false;
     if (menuChanged) {
+        animFull = (menuDrawState == -1);   // full-screen repaint about to happen
         drawMenu();
         lastMenu = mi;
     }
 
-    if (statusChanged) {
-        tft.setTextSize(2);
-        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-        tft.setCursor(6, 150);
-        tft.print("State:");
-        switch (state) {
-            case STATE_IDLE:          tft.print("IDLE  "); break;
-            case STATE_HOMING:        tft.print("HOMING"); break;
-            case STATE_PARKED:        tft.print("PARKED"); break;
-            case STATE_WAITING_SPRAY: tft.print("WAIT  "); break;
-            case STATE_SPRAY_ACTIVE:  tft.print("SPRAY "); break;
-            case STATE_OSCILLATING:   tft.print("OSC   "); break;
-            case STATE_ERROR:         tft.print("ERROR "); break;
-        }
-        tft.print(" Pos:"); tft.print(pos); tft.print("   ");
+    // Arm-position animation lives under the two basic rows (no room once advanced).
+    if (!advancedMenuUnlocked) {
+        drawArmAnim(animFull, posDegX10);
+    }
 
-        lastState = state; lastPos = pos;
+    if (statusChanged || forceStatusRedraw) {
+        drawStatusColumn(state, posDegX10, forceStatusRedraw);
+
+        lastState = state; lastPosDegX10 = posDegX10;
+        lastSpray = sprayActive; lastFlow = flowDetected; lastHold = driverParkHoldMode;
 
         Serial.print("State:");
         switch (state) {
@@ -973,8 +1898,8 @@ void updateDisplay() {
             case STATE_OSCILLATING:   Serial.print("OSCILLATING");  break;
             case STATE_ERROR:         Serial.print("ERROR");        break;
         }
-        Serial.printf(" | Pos:%d | Spray:%s | Flow:%s\n",
-            pos, sprayActive ? "ON" : "OFF", flowDetected ? "YES" : "NO");
+        Serial.printf(" | Pos:%d steps (%.1f deg) | Spray:%s | Flow:%s\n",
+            pos, posDegX10 * 0.1f, sprayActive ? "ON" : "OFF", flowDetected ? "YES" : "NO");
     }
 
     mutex_exit(&spi_mutex);
