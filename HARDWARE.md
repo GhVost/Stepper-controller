@@ -141,8 +141,8 @@ Flow Sensor  ─────── 3      INPUT_PULLDOWN   External 0 / 3.3 V si
                                              HIGH = liquid flowing.
 ```
 
-> Spray/flow are only read when the **Safety** setting is `ON`. In the default `DEBUG`
-> mode they are ignored and forced inactive in firmware.
+> Spray/flow are only read when **Debug** is `OFF`. In the default Debug `ON` mode they
+> are ignored and forced inactive in firmware.
 
 ### Outputs
 
@@ -204,8 +204,8 @@ width is derived from the selected wafer diameter and the arm length
 - [ ] **TMC2130**: serial shows "TMC2130 configured…"; About screen shows live status
 - [ ] **Motor**: spins during HOMING (EN GPIO 1 goes LOW)
 - [ ] **Limit switch**: GPIO 28 drops to 0 V when pressed
-- [ ] **Spray valve** (Safety = ON): GPIO 2 reads 3.3 V when active
-- [ ] **Flow sensor** (Safety = ON): GPIO 3 reads 3.3 V when flowing
+- [ ] **Spray valve** (Debug = OFF): GPIO 2 reads 3.3 V when active
+- [ ] **Flow sensor** (Debug = OFF): GPIO 3 reads 3.3 V when flowing
 - [ ] **LEDs**: green/yellow follow the state table
 - [ ] **Fan PWM**: duty varies with state on GPIO 21
 - [ ] **Ultrasonic relay**: GPIO 4 drops to 0 V while the arm is over the wafer
@@ -220,7 +220,7 @@ width is derived from the selected wafer diameter and the arm length
 | Motor won't move | EN not LOW | Check GPIO 1; `motorSetEnable(true)` in active states |
 | TMC SPI dead | Pin/bus mismatch | Verify SPI1 on GPIO 10/11/12/13 and 3.3 V VCC_IO |
 | LCD blank | Wrong CS/DC/RES | Check GPIO 9/5/6; ensure BL (GPIO 20) is HIGH |
-| Sensor always inactive | Safety = DEBUG | Set Safety = ON in Setup to read GPIO 2/3 |
+| Sensor always inactive | Debug = ON | Set Debug = OFF in Setup to read GPIO 2/3 |
 | Sensor floating | No source | Inputs use pull-downs; drive with a real 0/3.3 V signal |
 | ERROR after start | Driver fault / home timeout | Check About status + limit wiring; press START to retry |
 | Motor runs hot | Current too high | Lower Current in Setup |

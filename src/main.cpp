@@ -112,6 +112,8 @@ const int SWEEP_PATH_BACK_FRONT  = 1;
 const int SWEEP_PROFILE_LINEAR   = 0;
 const int SWEEP_PROFILE_HARMONIC = 1;
 const int SWEEP_PROFILE_INVDIST  = 2;
+const int SWEEP_ENDPOINT_RAMP_DEG_X10 = 10;  // 1.0 degree accel/decel segment
+const double SWEEP_ENDPOINT_SLOW_FACTOR = 3.0;
 
 // ============= SETUP (hardware/driver params) =============
 int driverCurrent    = 600;
@@ -126,6 +128,7 @@ const int MICROSTEP_COUNT   = 9;
 
 const uint32_t SETTINGS_MAGIC = 0x4D534743UL;  // "MSGC"
 const uint16_t SETTINGS_VERSION = 6;
+const size_t EEPROM_BYTES = 4096;
 
 // Auto-save: every Setup/Settings change is persisted, but writes are debounced so a
 // burst of encoder steps becomes a single flash write (wear protection). EEPROM.commit()
@@ -177,8 +180,16 @@ int           oscillationStepCount = 0;
 
 unsigned long lastMotorUpdate = 0;
 unsigned long lastMotorStepMicros = 0;
+bool          sweepTimingActive = false;
+int           sweepTimingStartSteps = 0;
+int           sweepTimingTargetSteps = 0;
+unsigned long sweepTimingStartMicros = 0;
+double        sweepTimingCompletedFactorSum = 0.0;
+double        sweepTimingLegFactorSum = 1.0;
+double        sweepTimingBaseUs = 1.0;
 unsigned long lastEncoderRead = 0;
 const unsigned long MOTOR_UPDATE_INTERVAL_US = 500;
+const unsigned long MIN_SWEEP_STEP_INTERVAL_US = 100;
 const unsigned long ENCODER_READ_INTERVAL = 1;
 const unsigned long ENCODER_STEP_MIN_INTERVAL = 5;
 const unsigned long ENCODER_BUTTON_DEBOUNCE = 120;
@@ -223,7 +234,7 @@ volatile int  settingsIndex       = 0;
 volatile bool editingSettings     = false;
 volatile bool settingsNeedsRedraw = false;
 
-// Setup screen (hardware): Park, Centre, Arm, Cycles, Current, Mstep, Invert, Safety, < Back
+// Setup screen (hardware): Park, Centre, Arm, Cycles, Current, Mstep, Invert, Debug, < Back
 const int SETUP_COUNT = 9;
 volatile int  setupIndex       = 0;
 volatile bool editingSetup     = false;
@@ -252,7 +263,12 @@ int sweepLeftSteps();
 int sweepRightSteps();
 int sweepBackSteps();
 int sweepForwardSteps();
-unsigned long sweepStepIntervalUs(int currentSteps, int targetSteps);
+double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps);
+double sweepLegFactorSum(int startSteps, int targetSteps);
+unsigned long minimumSweepTimeMs();
+bool enforceMinimumSweepTime(bool persist);
+void resetSweepTiming();
+bool sweepStepDue(unsigned long nowUs, int currentSteps, int targetSteps);
 int degX10ToSteps(int degX10);
 int stepsToDegX10(int steps);
 void printDegX10(int degX10);
@@ -448,19 +464,26 @@ bool isValidMicrostep(int value) {
 }
 
 void loadSettings() {
-    EEPROM.begin(sizeof(StoredSettings));
+    EEPROM.begin(EEPROM_BYTES);
 
     StoredSettings stored;
     EEPROM.get(0, stored);
 
-    bool valid = stored.magic == SETTINGS_MAGIC &&
-                 stored.version == SETTINGS_VERSION &&
-                 stored.size == sizeof(StoredSettings) &&
-                 stored.checksum == settingsChecksum(stored) &&
-                 isValidMicrostep(stored.driverMicrosteps);
+    bool validMagic = stored.magic == SETTINGS_MAGIC;
+    bool validVersion = stored.version > 0 && stored.version <= SETTINGS_VERSION;
+    bool validSize = stored.size == sizeof(StoredSettings);
+    bool validChecksum = stored.checksum == settingsChecksum(stored);
+    bool validMicrosteps = isValidMicrostep(stored.driverMicrosteps);
+    bool valid = validMagic && validVersion && validSize && validChecksum && validMicrosteps;
 
     if (!valid) {
-        Serial.println("Settings: using defaults");
+        Serial.printf("Settings: using defaults (magic=%d version=%u size=%u checksum=%d microsteps=%d)\n",
+                      validMagic ? 1 : 0,
+                      stored.version,
+                      stored.size,
+                      validChecksum ? 1 : 0,
+                      validMicrosteps ? 1 : 0);
+        saveSettings();
         return;
     }
 
@@ -476,8 +499,9 @@ void loadSettings() {
     driverMicrosteps = stored.driverMicrosteps;
     motorDirectionInverted = stored.motorDirectionInverted != 0;
     SENSOR_INPUTS_ENABLED = stored.sensorInputsEnabled != 0;
+    enforceMinimumSweepTime(true);
 
-    Serial.println("Settings: loaded from flash");
+    Serial.printf("Settings: loaded from flash (v%u)\n", stored.version);
 }
 
 void saveSettings() {
@@ -552,29 +576,145 @@ int sweepForwardSteps() {
     return sweepType == SWEEP_PATH_BACK_CENTER ? degX10ToSteps(CENTER_DEG_X10) : sweepRightSteps();
 }
 
-unsigned long sweepStepIntervalUs(int currentSteps, int targetSteps) {
-    int startSteps = targetSteps >= currentSteps ? sweepBackSteps() : sweepForwardSteps();
+double sweepEndpointRampFactor(int currentSteps, int startSteps, int targetSteps) {
     int sweepSteps = abs(targetSteps - startSteps);
-    if (sweepSteps <= 0) return MOTOR_UPDATE_INTERVAL_US;
-    float base = (float)(SWEEP_TIME_MS * 1000UL) / (float)sweepSteps;
-    float factor = 1.0f;
+    int rampSteps = degX10ToSteps(SWEEP_ENDPOINT_RAMP_DEG_X10);
+    if (sweepSteps <= 0 || rampSteps <= 0) return 1.0;
+
+    rampSteps = min(rampSteps, max(1, sweepSteps / 2));
+    int progressSteps = abs(currentSteps - startSteps);
+    int edgeDistance = min(progressSteps, max(0, sweepSteps - progressSteps));
+    if (edgeDistance >= rampSteps) return 1.0;
+
+    double x = (double)edgeDistance / (double)rampSteps;
+    double smooth = x * x * (3.0 - 2.0 * x);
+    return 1.0 + (SWEEP_ENDPOINT_SLOW_FACTOR - 1.0) * (1.0 - smooth);
+}
+
+double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
+    int sweepSteps = abs(targetSteps - startSteps);
+    if (sweepSteps <= 0) return 1.0f;
 
     if (sweepProfile == SWEEP_PROFILE_HARMONIC) {
-        int remaining = abs(targetSteps - currentSteps);
-        float progress = 1.0f - ((float)remaining / (float)sweepSteps);
-        float velocity = sinf(PI * constrain(progress, 0.0f, 1.0f));
-        factor = 1.0f / max(velocity, 0.20f);
-    } else if (sweepProfile == SWEEP_PROFILE_INVDIST) {
+        double progress = (double)abs(currentSteps - startSteps) / (double)sweepSteps;
+        if (progress < 0.0) progress = 0.0;
+        if (progress > 1.0) progress = 1.0;
+        double velocity = sin(PI * progress);
+        if (velocity < 0.20) velocity = 0.20;
+        return 1.0 / velocity;
+    }
+
+    if (sweepProfile == SWEEP_PROFILE_INVDIST) {
         int centerSteps = degX10ToSteps(CENTER_DEG_X10);
         int maxDistance = max(abs(sweepBackSteps() - centerSteps), abs(sweepForwardSteps() - centerSteps));
         if (maxDistance > 0) {
-            float distance = (float)abs(currentSteps - centerSteps) / (float)maxDistance;
-            factor = constrain(distance, 0.20f, 1.0f);
+            double distance = (double)abs(currentSteps - centerSteps) / (double)maxDistance;
+            if (distance < 0.20) distance = 0.20;
+            if (distance > 1.0) distance = 1.0;
+            return distance * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
         }
     }
 
-    unsigned long interval = (unsigned long)(base * factor);
-    return constrain(interval, 100UL, 50000UL);
+    return sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
+}
+
+double sweepLegFactorSum(int startSteps, int targetSteps) {
+    int sweepSteps = abs(targetSteps - startSteps);
+    if (sweepSteps <= 0) return 1.0f;
+
+    int direction = targetSteps > startSteps ? 1 : -1;
+    double sum = 0.0;
+    for (int i = 0; i < sweepSteps; i++) {
+        sum += sweepProfileFactor(startSteps + i * direction, startSteps, targetSteps);
+    }
+    return sum > 1.0 ? sum : 1.0;
+}
+
+unsigned long minimumSweepTimeMs() {
+    int backSteps = sweepBackSteps();
+    int forwardSteps = sweepForwardSteps();
+    if (backSteps == forwardSteps) return 500UL;
+
+    double forwardSum = sweepLegFactorSum(backSteps, forwardSteps);
+    double returnSum = sweepLegFactorSum(forwardSteps, backSteps);
+    double fullCycleFactorSum = forwardSum + returnSum;
+    double minFactor = 1.0;
+
+    if (sweepProfile == SWEEP_PROFILE_INVDIST) {
+        minFactor = 0.20;
+    }
+
+    double minTimeMs =
+        (fullCycleFactorSum * (double)MIN_SWEEP_STEP_INTERVAL_US / minFactor) / 1000.0;
+    unsigned long roundedMs = (unsigned long)(minTimeMs + 0.999);
+    return constrain(roundedMs, 500UL, 60000UL);
+}
+
+bool enforceMinimumSweepTime(bool persist) {
+    unsigned long minimumMs = minimumSweepTimeMs();
+    if (SWEEP_TIME_MS >= minimumMs) return false;
+
+    SWEEP_TIME_MS = minimumMs;
+    Serial.printf("Settings: Time raised to %.3fs minimum for this sweep/profile\n",
+                  SWEEP_TIME_MS / 1000.0f);
+    resetSweepTiming();
+    if (persist) {
+        saveSettings();
+    } else {
+        markSettingsDirty();
+    }
+    return true;
+}
+
+void resetSweepTiming() {
+    sweepTimingActive = false;
+}
+
+static void beginSweepLegTiming(unsigned long nowUs, int startSteps, int targetSteps) {
+    double fullCycleFactorSum = sweepLegFactorSum(sweepBackSteps(), sweepForwardSteps()) +
+                                sweepLegFactorSum(sweepForwardSteps(), sweepBackSteps());
+    if (fullCycleFactorSum < 1.0) fullCycleFactorSum = 1.0;
+
+    sweepTimingActive = true;
+    sweepTimingStartSteps = startSteps;
+    sweepTimingTargetSteps = targetSteps;
+    sweepTimingStartMicros = nowUs;
+    sweepTimingCompletedFactorSum = 0.0;
+    sweepTimingLegFactorSum = sweepLegFactorSum(startSteps, targetSteps);
+    sweepTimingBaseUs = ((double)SWEEP_TIME_MS * 1000.0) / fullCycleFactorSum;
+}
+
+bool sweepStepDue(unsigned long nowUs, int currentSteps, int targetSteps) {
+    if (currentSteps == targetSteps) return true;
+
+    bool targetChanged = !sweepTimingActive || targetSteps != sweepTimingTargetSteps;
+    if (targetChanged) {
+        unsigned long startUs = nowUs;
+        if (sweepTimingActive && currentSteps == sweepTimingTargetSteps) {
+            unsigned long previousLegDuration =
+                (unsigned long)(sweepTimingBaseUs * sweepTimingLegFactorSum + 0.5);
+            startUs = sweepTimingStartMicros + previousLegDuration;
+        }
+        beginSweepLegTiming(startUs, currentSteps, targetSteps);
+    }
+
+    int legDirection = sweepTimingTargetSteps > sweepTimingStartSteps ? 1 : -1;
+    int completedSteps = abs(currentSteps - sweepTimingStartSteps);
+    int legSteps = abs(sweepTimingTargetSteps - sweepTimingStartSteps);
+    int expectedSteps = sweepTimingStartSteps + completedSteps * legDirection;
+    if (completedSteps >= legSteps || currentSteps != expectedSteps) {
+        beginSweepLegTiming(nowUs, currentSteps, targetSteps);
+    }
+
+    double nextFactor = sweepProfileFactor(currentSteps, sweepTimingStartSteps, sweepTimingTargetSteps);
+    unsigned long dueUs =
+        sweepTimingStartMicros +
+        (unsigned long)(sweepTimingBaseUs * (sweepTimingCompletedFactorSum + nextFactor) + 0.5);
+
+    if ((long)(nowUs - dueUs) < 0) return false;
+
+    sweepTimingCompletedFactorSum += nextFactor;
+    return true;
 }
 
 // ============= SENSORS =============
@@ -894,6 +1034,8 @@ void handleState() {
         return;
     }
 
+    if (currentState != STATE_OSCILLATING) resetSweepTiming();
+
     switch (currentState) {
         case STATE_IDLE:
             setDriverParkHold(false);
@@ -949,7 +1091,7 @@ void handleState() {
             setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
             {
                 int target = oscillationDir > 0 ? sweepForwardSteps() : sweepBackSteps();
-                if (stepNow - lastMotorStepMicros < sweepStepIntervalUs(motorPosition, target)) break;
+                if (!sweepStepDue(stepNow, motorPosition, target)) break;
                 motorMoveTo(target);
                 lastMotorStepMicros = stepNow;
                 if (motorPosition == target) {
@@ -1076,6 +1218,7 @@ void adjustSettingsValue(int delta) {
             sweepProfile = (sweepProfile + singleStep + 3) % 3;
             break;
     }
+    enforceMinimumSweepTime(false);
     markSettingsDirty();
 }
 
@@ -1107,6 +1250,7 @@ void adjustSetupValue(int delta) {
             SENSOR_INPUTS_ENABLED = !SENSOR_INPUTS_ENABLED;
             break;
     }
+    enforceMinimumSweepTime(false);
     markSettingsDirty();
 }
 
@@ -1373,9 +1517,10 @@ void printDegX10(int degX10) {
 }
 
 int encoderAcceleration(unsigned long intervalMs) {
-    if (intervalMs <= 25) return 10;
-    if (intervalMs <= 50) return 5;
-    if (intervalMs <= 100) return 2;
+    if (intervalMs <= 20) return 25;
+    if (intervalMs <= 40) return 10;
+    if (intervalMs <= 80) return 5;
+    if (intervalMs <= 150) return 2;
     return 1;
 }
 
@@ -1829,7 +1974,7 @@ void drawSettings() {
 void drawSetupRow(int i, int y, bool selected, bool editing) {
     const char* labels[] = {
         "Park   ", "Centre ", "Arm    ", "Cycles ",
-        "Current", "Mstep  ", "Invert ", "Safety ", "< Back "
+        "Current", "Mstep  ", "Invert ", "Debug  ", "< Back "
     };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
@@ -1851,7 +1996,7 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
             case 4: tft.print(driverCurrent);               tft.print("mA  ");  break;
             case 5: tft.print(driverMicrosteps);            tft.print("x     "); break;
             case 6: tft.print(motorDirectionInverted ? "ON    " : "OFF   "); break;
-            case 7: tft.print(SENSOR_INPUTS_ENABLED ? "ON    " : "DEBUG "); break;
+            case 7: tft.print(SENSOR_INPUTS_ENABLED ? "OFF   " : "ON    "); break;
         }
     }
 }

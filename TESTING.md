@@ -45,8 +45,8 @@ Initialization complete!
 ```
 
 After startup, state/position lines are emitted by Core 1 **only on change**. With
-**Safety = DEBUG** (default) the cycle is driven from the menu; with **Safety = ON** it
-responds to the spray/flow inputs.
+**Debug = ON** (default) the cycle is driven from the menu and spray/flow are ignored;
+with **Debug = OFF** it responds to the spray/flow inputs.
 
 ---
 
@@ -68,8 +68,8 @@ briefly pulling GPIO 2 to 3.3 V.
 
 ### Phase 2: Sensors
 
-> Set **Safety = ON** in Setup to read the spray/flow inputs; in DEBUG they are forced
-> inactive in firmware.
+> Set **Debug = OFF** in Setup to read the spray/flow inputs; in Debug ON they are
+> forced inactive in firmware.
 
 **Limit Switch (GPIO 28)**
 ```
@@ -132,7 +132,7 @@ on GPIO 10/11/12/13, VCC_IO, and `R_SENSE`.
 | 5 | Cycles complete | `→ PARKED (cleaning cycle complete)` → `→ IDLE` |
 | — | Menu STOP at any time | `Menu: STOP → PARK then disable` → IDLE |
 
-**Sensor mode (Safety = ON):**
+**Sensor mode (Debug = OFF):**
 
 | Step | Action | Expected |
 |------|--------|----------|
@@ -147,8 +147,9 @@ on GPIO 10/11/12/13, VCC_IO, and `R_SENSE`.
 - **HOMING**: arm steps toward the limit; if the endstop is not found within 70° of
   travel the firmware aborts to `ERROR`.
 - **PARKED**: arm steps to the park angle, then drops to park-hold current.
-- **OSCILLATING**: arm sweeps between the sweep start and end; each return sweep logs
-  `Sweep N/<cycles>`. Total time ≈ `cycles × SWEEP_TIME_MS` (plus profile shaping).
+- **OSCILLATING**: arm sweeps between the sweep start and end; each return to the back
+  logs `Sweep N/<cycles>`. Total time is approximately `cycles x SWEEP_TIME_MS`; each
+  `SWEEP_TIME_MS` is one full back-forward-back cycle.
 - **Direction**: if motion is reversed, toggle **Invert** in Setup
   (`motorDirectionInverted`).
 
@@ -199,7 +200,7 @@ on GPIO 10/11/12/13, VCC_IO, and `R_SENSE`.
   DEBUG mode + START.
 
 ### Sensors ignored
-- Safety is `DEBUG`. Set it to `ON` in Setup to read GPIO 2/3.
+- Debug is `ON`. Set it to `OFF` in Setup to read GPIO 2/3.
 
 ### Fan always off
 - `setFan()` uses `analogWrite(FAN_PWM, …)` on GPIO 21 — verify the fan driver input.
@@ -212,8 +213,9 @@ on GPIO 10/11/12/13, VCC_IO, and `R_SENSE`.
 - Check SPI1 wiring (GPIO 10/11/12/13), 3.3 V VCC_IO, and `R_SENSE` (default 0.11 Ω).
 
 ### Settings not persisting
-- Edits auto-save after 2.5 s of quiet; power-cycling immediately after an edit may lose
-  it. A `SETTINGS_VERSION` bump intentionally resets stored values to defaults once.
+- Settings are stored in RP2040 flash EEPROM emulation. Empty/corrupt flash is
+  initialized with defaults, and compatible older setting records are accepted across
+  firmware updates.
 
 ### Display flicker / two rows highlighted
 - Rendering runs on Core 1 and snapshots volatile state per call; flicker usually means a

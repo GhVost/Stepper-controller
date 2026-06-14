@@ -9,9 +9,10 @@ interval timers. Core 1 owns the LCD.
 
 Two things shape the behaviour throughout:
 
-- **Operating mode** — the **Safety** setting (`SENSOR_INPUTS_ENABLED`). When `ON`,
-  the spray valve and flow sensor gate the cycle. When `DEBUG` (the default), those
-  inputs are ignored and the cycle is driven from the menu (`sensorBypassCycleArmed`).
+- **Operating mode** — the **Debug** setting. When Debug is `OFF`
+  (`SENSOR_INPUTS_ENABLED = true`), the spray valve and flow sensor gate the cycle.
+  When Debug is `ON` (the default), those inputs are ignored and the cycle is driven
+  from the menu (`sensorBypassCycleArmed`).
 - **Position knowledge** — `needsHoming`. Whenever the motor is de-energised the
   position is considered unknown, so the controller **re-homes before every run**.
   Homing clears the flag once the limit switch is reached.
@@ -135,8 +136,9 @@ moves to the sweep start (`sweepBackSteps()`); waits `SPRAY_ACTIVE_WAIT` (2 s).
 ### STATE_OSCILLATING
 **Entry**: from `SPRAY_ACTIVE` once at the sweep start and settled.
 **Actions**: alternates between the sweep start and end; step interval comes from
-`SWEEP_TIME_MS` shaped by the velocity profile; `oscillationCount` increments after each
-return sweep. Fan 100 %, generator ON over the wafer, green LED on.
+`SWEEP_TIME_MS` shaped by the velocity profile; one `SWEEP_TIME_MS` is a full
+back-forward-back cycle, and `oscillationCount` increments after each return to the back.
+Fan 100 %, generator ON over the wafer, green LED on.
 **Exit**: `oscillationCount >= OSCILLATION_CYCLES` (when > 0) → `PARKED` (cycle complete);
 (sensor mode) spray or flow lost → `PARKED`.
 
@@ -176,8 +178,8 @@ undervoltage) detected by `pollDriverStatus()`, or a home-search timeout.
 int  PARK_DEG_X10   = 70;     // 7.0° park angle (near the limit)
 int  CENTER_DEG_X10 = 260;    // 26.0° sweep centre (over the wafer)
 int  ARM_LENGTH_MM  = 250;    // arm length (transducer radius)
-unsigned long SWEEP_TIME_MS      = 4000;  // ms per directional sweep
-unsigned long OSCILLATION_CYCLES = 4;     // sweeps per cycle (0 = run forever)
+unsigned long SWEEP_TIME_MS      = 4000;  // ms per full back-forward-back cycle
+unsigned long OSCILLATION_CYCLES = 4;     // full cycles to run (0 = run forever)
 const unsigned long SPRAY_ACTIVE_WAIT      = 2000; // ms settle before oscillation
 const unsigned long MOTOR_UPDATE_INTERVAL_US = 500; // µs per step (homing/parking)
 const int           HOMING_MAX_DEG_X10     = 700;  // 70° home-search limit
@@ -197,7 +199,7 @@ void loop() {
     handleSerialDebug();
     readEncoder();            // ~1 ms cadence; 4-transition accumulator + acceleration
     if (menuButtonPressed) handleMenuSelect();
-    readSensors();            // limit always; spray/flow only when Safety = ON
+    readSensors();            // limit always; spray/flow only when Debug = OFF
     updateStateMachine();     // evaluate transitions
     handleState();            // drive motor, LEDs, fan, generator
     pollDriverStatus();       // every 500 ms; latches faults

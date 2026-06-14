@@ -65,8 +65,8 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 - **Advanced menu** (Setup, About): short-click then long-press to toggle.
 - **Settings** (sweep): Time, Wafer, Path, Profile, Angle (read-only), < Back.
 - **Setup** (hardware): Park, Centre (live jog), Arm, Cycles, Current, Mstep, Invert,
-  Safety (ON/DEBUG), < Back.
-- Edits auto-save to flash (debounced ~2.5 s).
+  Debug (ON = ignore spray/flow, OFF = use safety inputs), < Back.
+- Edits persist to RP2040 flash EEPROM emulation and are reloaded at boot.
 
 ---
 
@@ -89,7 +89,7 @@ START always re-homes first (position is unknown whenever the motor was disabled
 | PARKED | Until at park angle, then branch |
 | WAITING_SPRAY | Until flow detected or spray lost (sensor mode) |
 | SPRAY_ACTIVE | ≥ 2 s + time to reach the sweep start |
-| OSCILLATING | `OSCILLATION_CYCLES` sweeps × `SWEEP_TIME_MS` (0 cycles = forever) |
+| OSCILLATING | `OSCILLATION_CYCLES` full back-forward-back cycles × `SWEEP_TIME_MS` (0 cycles = forever) |
 
 ### LED Indicators
 
@@ -122,7 +122,7 @@ motorMoveTo(int target);      // call repeatedly — one step toward target
 degX10ToSteps(int degX10);    // angle (0.1°) → microsteps
 
 // Sensors / input
-readSensors();                // limit always; spray/flow only when Safety = ON
+readSensors();                // limit always; spray/flow only when Debug = OFF
 readEncoder();                // navigation, value edit, menu unlock combo
 
 // Outputs
@@ -146,8 +146,8 @@ saveSettings() / loadSettings();  // flash persistence (versioned + checksummed)
 PARK_DEG_X10      = 70      // 7.0° park angle near the limit
 CENTER_DEG_X10    = 260     // 26.0° sweep centre over the wafer
 ARM_LENGTH_MM     = 250     // arm length (transducer radius)
-SWEEP_TIME_MS     = 4000    // ms per directional sweep
-OSCILLATION_CYCLES = 4      // sweeps per cycle (0 = forever)
+SWEEP_TIME_MS     = 4000    // ms per full back-forward-back cycle
+OSCILLATION_CYCLES = 4      // full cycles to run (0 = forever)
 SPRAY_ACTIVE_WAIT = 2000    // ms settle before oscillation
 ```
 
@@ -216,7 +216,7 @@ int           driverMicrosteps   = 128;   // resolution (no recalibration needed
 | TMC2130 SPI config | ✅ Done | SPI1; run/park hold modes; fault polling |
 | Driver fault handling | ✅ Done | OT / S2G / charge-pump UV → park + ERROR |
 | Encoder + menu UI | ✅ Done | Navigation, edit, basic/advanced unlock |
-| Persistent settings | ✅ Done | Versioned, checksummed, debounced auto-save |
+| Persistent settings | ✅ Done | Versioned, checksummed, compatible flash records |
 | Error recovery | ✅ Done | START clears the latch and re-homes |
 | LCD display | ✅ Done | GMT147SPI 172×320, 20 MHz HW SPI, ~20 fps, arm animation |
 | StallGuard load detection | 🔄 Future | Hardware supports it |

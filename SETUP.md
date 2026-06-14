@@ -123,10 +123,10 @@ const int FULL_STEPS_PER_REV = 200;   // 1.8° NEMA17
 int  PARK_DEG_X10   = 70;             // 7.0° park angle
 int  CENTER_DEG_X10 = 260;            // 26.0° sweep centre
 int  ARM_LENGTH_MM  = 250;            // arm length (transducer radius)
-unsigned long SWEEP_TIME_MS      = 4000;  // ms per directional sweep
-unsigned long OSCILLATION_CYCLES = 4;     // sweeps per cycle (0 = forever)
+unsigned long SWEEP_TIME_MS      = 4000;  // ms per full back-forward-back cycle
+unsigned long OSCILLATION_CYCLES = 4;     // full cycles to run (0 = forever)
 const unsigned long SPRAY_ACTIVE_WAIT = 2000;
-bool SENSOR_INPUTS_ENABLED = false;   // false = DEBUG (sensors bypassed)
+bool SENSOR_INPUTS_ENABLED = false;   // false = Debug ON (spray/flow bypassed)
 ```
 
 ### State Machine
@@ -144,11 +144,12 @@ disable), `faultLatched` (driver fault), `homingToStop` (abort path), and
 
 ### Persistent Settings
 
-`StoredSettings` is written to flash via the `EEPROM` emulation, tagged with a magic
-(`"MSGC"`), a version (`SETTINGS_VERSION`), a size, and an FNV-1a checksum. Edits call
-`markSettingsDirty()`; `loop()` commits them after `SETTINGS_SAVE_DELAY` (2.5 s) of quiet
-so a burst of encoder steps becomes one flash write. A version/size/checksum mismatch
-falls back to defaults.
+`StoredSettings` is written to flash via the RP2040 `EEPROM` emulation, tagged with a
+magic (`"MSGC"`), a version (`SETTINGS_VERSION`), a size, and an FNV-1a checksum.
+Compatible older records are accepted, while empty/corrupt flash is initialized with
+defaults. Edits call `markSettingsDirty()`; `loop()` commits them after
+`SETTINGS_SAVE_DELAY` (2.5 s) of quiet so a burst of encoder steps becomes one flash
+write.
 
 ---
 
@@ -173,7 +174,7 @@ using the live microstep setting.
 ### Sensors / Input
 
 **`readSensors()`** — debounces the limit switch always; reads spray/flow only when
-`SENSOR_INPUTS_ENABLED`, otherwise forces them inactive.
+`SENSOR_INPUTS_ENABLED`, otherwise forces them inactive for Debug mode.
 
 **`readEncoder()`** — 4-transition quadrature accumulator with acceleration; routes the
 delta to the active screen (menu navigation, value edit) and handles the click /

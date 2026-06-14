@@ -15,8 +15,8 @@ selected wafer diameter and the arm length.
 - **Rotary encoder UI** – KY-040 quadrature + push-button; full menu, in-place value editing, and a basic/advanced menu unlock
 - **Angle-based motion** – park and centre angles in degrees; sweep angle computed from wafer Ø and arm length
 - **Configurable sweep** – sweep time, wafer diameter, path (back-centre / back-front), and velocity profile (linear / harmonic / inverse-distance)
-- **Persistent settings** – all parameters auto-saved to flash (debounced, wear-protected) and reloaded at boot
-- **Two operating modes** – sensor-driven (spray valve + flow sensor) or a sensor-bypass **DEBUG** mode driven from the menu
+- **Persistent settings** – all parameters stored in flash EEPROM emulation and reloaded at boot
+- **Two operating modes** – sensor-driven (spray valve + flow sensor) or a menu-driven **Debug** bypass mode
 - **Safety** – re-home before every run, home-search timeout, ultrasonic energised only while the arm is over the wafer, park-then-disable stop, and a recoverable ERROR state
 
 ## Quick Start
@@ -69,11 +69,13 @@ value, **click** to select / enter-edit / confirm.
 - **Settings** (sweep): sweep time, wafer diameter, path, velocity profile, and the
   calculated sweep angle (read-only).
 - **Setup** (hardware): park angle, centre angle (live jog while editing), arm length,
-  cycles, driver current, microsteps, direction invert, and the **Safety** toggle
-  (`ON` = sensors active, `DEBUG` = sensors bypassed).
+  cycles, driver current, microsteps, direction invert, and the **Debug** toggle
+  (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active).
 - **About**: firmware version and live TMC2130 driver status.
 
-All Settings/Setup edits are persisted to flash automatically (debounced ~2.5 s).
+Settings are stored in RP2040 flash EEPROM emulation and reloaded at boot. Empty or
+corrupt flash is initialized with defaults; compatible older records are accepted and
+rewritten with the current version when saved.
 
 ## System States
 
@@ -138,9 +140,9 @@ See [HARDWARE.md](HARDWARE.md) for complete wiring details.
 
 ## Sensor Behavior
 
-Sensors are only read when **Safety** is `ON` (`SENSOR_INPUTS_ENABLED`). In the default
-`DEBUG` mode the spray/flow inputs are ignored and the cycle is driven entirely from the
-menu.
+Spray/flow sensors are read when **Debug** is `OFF` (`SENSOR_INPUTS_ENABLED = true`).
+In the default Debug `ON` mode the spray/flow inputs are ignored and the cycle is driven
+entirely from the menu.
 
 ### Limit Switch (GPIO 28)
 - **Purpose**: home/reference position detection
@@ -173,8 +175,8 @@ const int FULL_STEPS_PER_REV = 200;   // 1.8° NEMA17
 int  PARK_DEG_X10   = 70;             // 7.0° — park angle near the limit
 int  CENTER_DEG_X10 = 260;            // 26.0° — sweep centre (over wafer)
 int  ARM_LENGTH_MM  = 250;            // arm length (transducer radius)
-unsigned long SWEEP_TIME_MS    = 4000; // time for one directional sweep
-unsigned long OSCILLATION_CYCLES = 4;  // sweeps per cycle (0 = run forever)
+unsigned long SWEEP_TIME_MS    = 4000; // time for one full back-forward-back cycle
+unsigned long OSCILLATION_CYCLES = 4;  // full cycles to run (0 = run forever)
 ```
 
 The **sweep angle** is computed from the selected wafer diameter and the arm length so
@@ -211,7 +213,7 @@ The ultrasonic generator is energised **only while the arm tip is over the wafer
 - [x] LCD UI — hardware SPI 20 MHz, partial redraw, ~20 fps on Core 1, arm-position animation
 - [x] Rotary encoder — 4-transition accumulator debounce, acceleration, basic/advanced menu unlock
 - [x] On-device Settings/Setup editors
-- [x] Persistent settings in flash (versioned, checksummed, debounced auto-save)
+- [x] Persistent settings in flash (versioned, checksummed, compatible record loading)
 - [x] Recoverable ERROR state (START re-homes and clears the fault latch)
 
 ### 🔄 Possible future work
@@ -225,7 +227,7 @@ The ultrasonic generator is energised **only while the arm tip is over the wafer
 | No serial output | Baud mismatch | Use 115200 baud |
 | Motor won't move | EN pin HIGH | Check GPIO 1 is LOW when enabled |
 | Won't start in DEBUG mode | Not at a known position | Use START — it re-homes first |
-| Stuck in IDLE (sensor mode) | Spray sensor LOW | Check GPIO 2 reads HIGH, or set Safety = DEBUG |
+| Stuck in IDLE (sensor mode) | Spray sensor LOW | Check GPIO 2 reads HIGH, or set Debug = ON |
 | ERROR right after start | Driver fault or home not found | Check TMC2130 (About screen) and limit switch wiring; press START to retry |
 | Stuck in HOMING | Limit never pressed | Check GPIO 28; home search times out after 70° → ERROR |
 | LCD not showing | Wrong pins or lib | See HARDWARE.md (LCD is on SPI0: SCK 18, SDA 19) |
