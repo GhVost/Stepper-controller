@@ -76,6 +76,18 @@ unsigned long lastStateChange = 0;
 // When true: after reaching limit switch go IDLE instead of PARKED (abort path)
 volatile bool homingToStop = false;
 
+// Home search safety: abort if the endstop is not found within this much arm travel.
+const int HOMING_MAX_DEG_X10 = 700;     // 70.0 degrees of real arm motion
+volatile int homingStartPos  = 0;       // motorPosition captured when homing begins
+
+// Position is unknown (motor was disabled / never homed): re-home before a run.
+// Set whenever the motor is de-energised; cleared once homing reaches the limit.
+volatile bool needsHoming   = true;
+// Park the arm, then disable the motor and return to IDLE (normal stop / end of cycle).
+volatile bool stopRequested = false;
+// A driver fault was detected: park the arm, then disable the motor and latch ERROR.
+volatile bool faultLatched  = false;
+
 // ============= MOTION PARAMETERS =============
 const int FULL_STEPS_PER_REV = 200;  // typical 1.8 degree NEMA17 motor
 int PARK_DEG_X10       = 70;
@@ -84,7 +96,7 @@ int ARM_LENGTH_MM      = 250;
 unsigned long SWEEP_TIME_MS = 4000;
 unsigned long OSCILLATION_CYCLES = 4;
 const unsigned long SPRAY_ACTIVE_WAIT = 2000;
-const bool SENSOR_INPUTS_ENABLED = false;  // temporary bypass while spray/flow wiring is absent
+bool SENSOR_INPUTS_ENABLED = false;  // false = bypass/debug safety inputs (toggle in Setup)
 
 // ============= SETTINGS (sweep params) =============
 // Wafer diameter comes from SAMPLE_TABLE; sweep angle is calculated from arm length.
@@ -113,7 +125,14 @@ const int MICROSTEP_TABLE[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 const int MICROSTEP_COUNT   = 9;
 
 const uint32_t SETTINGS_MAGIC = 0x4D534743UL;  // "MSGC"
-const uint16_t SETTINGS_VERSION = 5;
+const uint16_t SETTINGS_VERSION = 6;
+
+// Auto-save: every Setup/Settings change is persisted, but writes are debounced so a
+// burst of encoder steps becomes a single flash write (wear protection). EEPROM.commit()
+// also skips the write entirely when the stored bytes are unchanged.
+volatile bool settingsDirty      = false;
+unsigned long lastSettingsChange = 0;
+const unsigned long SETTINGS_SAVE_DELAY = 2500;  // ms of quiet before committing to flash
 
 struct StoredSettings {
     uint32_t magic;
@@ -130,6 +149,7 @@ struct StoredSettings {
     int16_t driverCurrent;
     int16_t driverMicrosteps;
     int16_t motorDirectionInverted;
+    int16_t sensorInputsEnabled;
     uint32_t checksum;
 };
 
@@ -149,6 +169,7 @@ volatile bool sprayActive        = false;
 volatile bool flowDetected       = false;
 volatile bool debugMotorHold     = false;
 volatile bool sensorBypassCycleArmed = false;
+volatile bool ultrasonicActive   = false;   // generator on/off, for the LCD lightning sign
 
 unsigned long oscillationCount    = 0;
 int           oscillationDir      = -1;
@@ -202,8 +223,8 @@ volatile int  settingsIndex       = 0;
 volatile bool editingSettings     = false;
 volatile bool settingsNeedsRedraw = false;
 
-// Setup screen (hardware): Park angle, Centre angle, arm length, cycles, current, microsteps, < Back
-const int SETUP_COUNT = 8;
+// Setup screen (hardware): Park, Centre, Arm, Cycles, Current, Mstep, Invert, Safety, < Back
+const int SETUP_COUNT = 9;
 volatile int  setupIndex       = 0;
 volatile bool editingSetup     = false;
 volatile bool setupNeedsRedraw = false;
@@ -226,6 +247,7 @@ void saveSettings();
 int waferDiameterMm();
 int calculatedSweepDegX10();
 int travelSweepDegX10();
+bool armOverWafer();
 int sweepLeftSteps();
 int sweepRightSteps();
 int sweepBackSteps();
@@ -263,6 +285,7 @@ void drawIcon(int id, int x, int y, uint16_t color);
 void drawMenuRow(int i, int y, bool selected);
 void drawMenu();
 void drawArmAnim(bool fullRedraw, int posDegX10);
+void drawCircleClipped(int cx, int cy, int r, int yTop, int yBot, uint16_t color);
 void drawSettingsRow(int i, int y, bool selected, bool editing);
 void drawSettings();
 void drawSetupRow(int i, int y, bool selected, bool editing);
@@ -321,6 +344,12 @@ void loop() {
     updateStateMachine();
     handleState();
     pollDriverStatus();
+
+    // Debounced auto-save: commit pending Setup/Settings changes once the encoder has
+    // been quiet for SETTINGS_SAVE_DELAY (coalesces a burst of steps into one write).
+    if (settingsDirty && now - lastSettingsChange >= SETTINGS_SAVE_DELAY) {
+        saveSettings();
+    }
 }
 
 // ============= HARDWARE INIT =============
@@ -446,6 +475,7 @@ void loadSettings() {
     driverCurrent = constrain((int)stored.driverCurrent, 100, 1500);
     driverMicrosteps = stored.driverMicrosteps;
     motorDirectionInverted = stored.motorDirectionInverted != 0;
+    SENSOR_INPUTS_ENABLED = stored.sensorInputsEnabled != 0;
 
     Serial.println("Settings: loaded from flash");
 }
@@ -466,6 +496,7 @@ void saveSettings() {
     stored.driverCurrent = driverCurrent;
     stored.driverMicrosteps = driverMicrosteps;
     stored.motorDirectionInverted = motorDirectionInverted ? 1 : 0;
+    stored.sensorInputsEnabled = SENSOR_INPUTS_ENABLED ? 1 : 0;
     stored.checksum = settingsChecksum(stored);
 
     EEPROM.put(0, stored);
@@ -474,6 +505,14 @@ void saveSettings() {
     } else {
         Serial.println("Settings: save failed");
     }
+    settingsDirty = false;
+}
+
+// Mark settings changed; the debounced auto-save in loop() commits them once the
+// encoder has been quiet for SETTINGS_SAVE_DELAY (avoids a flash write per step).
+void markSettingsDirty() {
+    settingsDirty = true;
+    lastSettingsChange = millis();
 }
 
 int waferDiameterMm() {
@@ -707,20 +746,55 @@ void readEncoder() {
 // ============= STATE MACHINE =============
 void updateStateMachine() {
     unsigned long now = millis();
+    int parkSteps = degX10ToSteps(PARK_DEG_X10);
+
+    // Driver fault: park first if actively sweeping (motor energised, position known),
+    // otherwise latch ERROR straight away.
+    if (faultLatched) {
+        if (currentState == STATE_SPRAY_ACTIVE || currentState == STATE_OSCILLATING) {
+            currentState = STATE_PARKED; lastStateChange = now;
+            Serial.println("FAULT → PARKED (will disable)");
+        } else if (currentState == STATE_WAITING_SPRAY) {
+            needsHoming = true;
+            currentState = STATE_ERROR; lastStateChange = now;
+            Serial.println("FAULT → ERROR (motor disabled)");
+        }
+    }
 
     switch (currentState) {
         case STATE_IDLE:
-            if (SENSOR_INPUTS_ENABLED && sprayActive) {
+            if (faultLatched) {
+                needsHoming = true;
+                currentState = STATE_ERROR; lastStateChange = now;
+                Serial.println("→ ERROR (driver fault)");
+            } else if (SENSOR_INPUTS_ENABLED && sprayActive) {
+                homingStartPos = motorPosition;
                 currentState = STATE_HOMING; lastStateChange = now;
                 Serial.println("→ HOMING");
             }
             break;
 
         case STATE_HOMING:
+            // Safety: endstop must be found within HOMING_MAX_DEG_X10 of real travel.
+            if (!limitSwitchPressed &&
+                (homingStartPos - motorPosition) >= degX10ToSteps(HOMING_MAX_DEG_X10)) {
+                motorSetEnable(false);
+                needsHoming = true;
+                currentState = STATE_ERROR; lastStateChange = now;
+                Serial.println("→ ERROR (home endstop not found within 70°)");
+                break;
+            }
             if (limitSwitchPressed) {
                 motorPosition = 0;
-                if (homingToStop) {
+                needsHoming = false;                    // position re-established
+                if (faultLatched) {
+                    needsHoming = true;
+                    motorSetEnable(false);
+                    currentState = STATE_ERROR; lastStateChange = now;
+                    Serial.println("→ ERROR (homed, motor disabled)");
+                } else if (homingToStop) {
                     homingToStop = false;
+                    needsHoming = true;
                     motorSetEnable(false);
                     currentState = STATE_IDLE; lastStateChange = now;
                     Serial.println("→ IDLE (aborted, parked at limit)");
@@ -732,8 +806,17 @@ void updateStateMachine() {
             break;
 
         case STATE_PARKED:
-            if (motorPosition >= degX10ToSteps(PARK_DEG_X10)) {
-                if (!SENSOR_INPUTS_ENABLED && sensorBypassCycleArmed) {
+            // Park is reached at the park setpoint (≤ PARK_DEG_X10, a small angle).
+            if (motorPosition == parkSteps) {
+                if (faultLatched) {
+                    needsHoming = true;
+                    currentState = STATE_ERROR; lastStateChange = now;
+                    Serial.println("→ ERROR (parked, motor disabled)");
+                } else if (stopRequested) {
+                    stopRequested = false; needsHoming = true;
+                    currentState = STATE_IDLE; lastStateChange = now;
+                    Serial.println("→ IDLE (parked, motor disabled)");
+                } else if (!SENSOR_INPUTS_ENABLED && sensorBypassCycleArmed) {
                     oscillationCount = 0; oscillationDir = -1; oscillationStepCount = 0;
                     currentState = STATE_SPRAY_ACTIVE; lastStateChange = now;
                     Serial.println("→ SPRAY_ACTIVE (sensor bypass)");
@@ -744,6 +827,11 @@ void updateStateMachine() {
                     oscillationCount = 0; oscillationDir = -1; oscillationStepCount = 0;
                     currentState = STATE_SPRAY_ACTIVE; lastStateChange = now;
                     Serial.println("→ SPRAY_ACTIVE");
+                } else {
+                    // Parked with nothing pending: disable the motor and idle.
+                    needsHoming = true;
+                    currentState = STATE_IDLE; lastStateChange = now;
+                    Serial.println("→ IDLE (parked, motor disabled)");
                 }
             }
             break;
@@ -846,7 +934,7 @@ void handleState() {
 
         case STATE_SPRAY_ACTIVE:
             setDriverParkHold(false);
-            setFan(FAN_FULL); setUltrasonic(true);
+            setFan(FAN_FULL); setUltrasonic(armOverWafer());   // generator only over the wafer
             setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
             motorSetEnable(true);
             if (stepNow - lastMotorStepMicros >= MOTOR_UPDATE_INTERVAL_US) {
@@ -857,7 +945,7 @@ void handleState() {
         case STATE_OSCILLATING:
             setDriverParkHold(false);
             motorSetEnable(true);
-            setFan(FAN_FULL); setUltrasonic(true);
+            setFan(FAN_FULL); setUltrasonic(armOverWafer());   // generator only over the wafer
             setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
             {
                 int target = oscillationDir > 0 ? sweepForwardSteps() : sweepBackSteps();
@@ -926,12 +1014,15 @@ void handleMenuSelect() {
 
     switch (menuIndex) {
         case 0:  // START / STOP
-            if (currentState == STATE_IDLE) {
-                homingToStop = false;
+            if (currentState == STATE_IDLE || currentState == STATE_ERROR) {
+                // START: always home first to re-establish position, then park + run.
+                faultLatched = false; stopRequested = false; homingToStop = false;
                 sensorBypassCycleArmed = !SENSOR_INPUTS_ENABLED;
+                homingStartPos = motorPosition;
                 currentState = STATE_HOMING; lastStateChange = millis();
                 Serial.println("Menu: START → HOMING");
-            } else if (currentState == STATE_PARKED) {
+            } else if (currentState == STATE_PARKED && !needsHoming) {
+                // Already parked with known position: start the cleaning cycle.
                 if (!SENSOR_INPUTS_ENABLED) {
                     sensorBypassCycleArmed = true;
                     oscillationCount = 0; oscillationDir = -1; oscillationStepCount = 0;
@@ -940,13 +1031,15 @@ void handleMenuSelect() {
                 } else {
                     Serial.println("Menu: already parked");
                 }
-            } else if (currentState == STATE_ERROR) {
-                Serial.println("Menu: ERROR state latched");
             } else {
+                // STOP: park the arm, then disable the motor.
                 homingToStop = false;
                 sensorBypassCycleArmed = false;
-                currentState = STATE_PARKED; lastStateChange = millis();
-                Serial.println("Menu: STOP → PARKED");
+                stopRequested = true;
+                if (currentState != STATE_HOMING) {
+                    currentState = STATE_PARKED; lastStateChange = millis();
+                }
+                Serial.println("Menu: STOP → PARK then disable");
             }
             break;
 
@@ -983,6 +1076,7 @@ void adjustSettingsValue(int delta) {
             sweepProfile = (sweepProfile + singleStep + 3) % 3;
             break;
     }
+    markSettingsDirty();
 }
 
 // Adjust Setup (hardware) parameter by encoder delta
@@ -1009,7 +1103,11 @@ void adjustSetupValue(int delta) {
         case 6:
             motorDirectionInverted = !motorDirectionInverted;
             break;
+        case 7:
+            SENSOR_INPUTS_ENABLED = !SENSOR_INPUTS_ENABLED;
+            break;
     }
+    markSettingsDirty();
 }
 
 void applyDriverSettings() {
@@ -1044,6 +1142,16 @@ void pollDriverStatus() {
         driverDrvStatus = driver.DRV_STATUS();
         driverGStat     = driver.GSTAT();
         mutex_exit(&spi_mutex);
+    }
+
+    // Failure detection: overtemperature, short-to-ground, or charge-pump undervoltage.
+    bool ot   = (driverDrvStatus >> 25) & 1;                 // overtemp shutdown
+    bool s2g  = (driverDrvStatus >> 27) & 1 || (driverDrvStatus >> 28) & 1;  // short to GND
+    bool uvcp = (driverGStat >> 2) & 1;                      // charge-pump undervoltage
+    if ((ot || s2g || uvcp) && !faultLatched &&
+        currentState != STATE_IDLE && currentState != STATE_ERROR) {
+        faultLatched = true;
+        Serial.printf("FAULT: OT=%d S2G=%d UVCP=%d → park + disable\n", ot, s2g, uvcp);
     }
 }
 
@@ -1301,7 +1409,14 @@ void motorMoveToBlocking(int target, unsigned int stepDelayUs) {
 // ============= OUTPUTS =============
 void setLED(int ledPin, bool state) { digitalWrite(ledPin, state ? HIGH : LOW); }
 void setFan(int speed) { analogWrite(FAN_PWM, constrain(speed, 0, 255)); }
-void setUltrasonic(bool on) { digitalWrite(ULTRASONIC, on ? LOW : HIGH); }
+void setUltrasonic(bool on) { digitalWrite(ULTRASONIC, on ? LOW : HIGH); ultrasonicActive = on; }
+
+// True when the arm tip is over the wafer disk (within ±half-sweep of centre),
+// i.e. |currentAngle - centre| <= half the calculated sweep.
+bool armOverWafer() {
+    int half = (calculatedSweepDegX10() + 1) / 2;
+    return abs(stepsToDegX10(motorPosition) - CENTER_DEG_X10) <= half;
+}
 
 const char* stateLabel(SystemState state) {
     switch (state) {
@@ -1515,23 +1630,42 @@ void drawMenu() {
     menuDrawState = mi;
 }
 
+// Circle outline (Bresenham midpoint) clipped to a vertical [yTop, yBot] window,
+// so an oversized wafer can be cropped top and bottom instead of overflowing.
+void drawCircleClipped(int cx, int cy, int r, int yTop, int yBot, uint16_t color) {
+    int x = 0, y = r, d = 3 - 2 * r;
+    while (x <= y) {
+        const int px[8] = { cx + x, cx - x, cx + x, cx - x, cx + y, cx - y, cx + y, cx - y };
+        const int py[8] = { cy + y, cy + y, cy - y, cy - y, cy + x, cy + x, cy - x, cy - x };
+        for (int i = 0; i < 8; i++)
+            if (py[i] >= yTop && py[i] <= yBot && px[i] >= 0 && px[i] < 320)
+                tft.drawPixel(px[i], py[i], color);
+        if (d < 0) d += 4 * x + 6; else { d += 4 * (x - y) + 10; y--; }
+        x++;
+    }
+}
+
 // ============= ARM POSITION ANIMATION (basic menu) =============
 // Top-down sketch under the START/Settings rows: the wafer as a circle (size ∝ wafer
 // diameter), the park position as a green tick, and the live arm position as a red
 // down-arrow. Geometry: arm-tip horizontal offset from wafer centre =
 // ARM_LENGTH * sin(angle - centre), so the sweep extremes land on the wafer edges.
+// The scale is fixed to the largest selectable wafer (150 mm) so the circle is drawn
+// as large as possible; it is cropped top and bottom by the [yTop, yBot] window.
 void drawArmAnim(bool fullRedraw, int posDegX10) {
-    const int axisY   = ANIM_Y + ANIM_H / 2;   // 126: wafer centre / arrow-tip line
-    const int maxRpx  = ANIM_H / 2 - 8;        // vertical room for the wafer radius
-    const int armTopY = ANIM_Y + 4;
-    const int headH   = 7;                      // arrowhead height
-    const int tipY    = axisY;                  // arrow points down onto the plane
+    const int axisY   = ANIM_Y + ANIM_H / 2;        // 126: wafer centre / arrow-tip line
+    const int yTop    = ANIM_Y;                      // crop window top
+    const int yBot    = ANIM_Y + ANIM_H - 1;         // crop window bottom
+    const int armTopY = ANIM_Y + 2;
+    const int headH   = 7;                            // arrowhead height
+    const int tipY    = axisY;                        // arrow points down onto the plane
     const uint16_t gray = tft.color565(60, 60, 60);
 
     static int   prevArmX    = -1;
-    static int   lastAnimDeg = -9999;           // whole degrees, for the 1° flicker gate
+    static int   lastAnimDeg = -9999;                // whole degrees, for the 1° flicker gate
+    static bool  prevPulse   = false;                // last lightning-sign blink state
     static int   cPark = -1, cCenter = -1, cArm = -1, cWafer = -1;
-    static int   waferCx = 0, radiusPx = 0, parkX = 0, startX = 0, drawnW = 0;
+    static int   waferCx = 0, radiusPx = 0, parkX = 0, startX = 0, drawnW = 0, axL = 0, axR = 0;
     static float sScale = 1.0f, sLo = 0.0f;
 
     const float toRad     = 3.14159265f / 180.0f;
@@ -1545,17 +1679,17 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
         cPark = PARK_DEG_X10; cCenter = CENTER_DEG_X10;
         cArm = ARM_LENGTH_MM; cWafer = sampleIndex;
 
-        float parkDeg = PARK_DEG_X10 * 0.1f;
-        float waferR  = waferDiameterMm() * 0.5f;
-        float parkOff = ARM_LENGTH_MM * sinf((parkDeg - centerDeg) * toRad);
+        float parkDeg   = PARK_DEG_X10 * 0.1f;
+        float waferR    = waferDiameterMm() * 0.5f;
+        float waferRmax = SAMPLE_TABLE[SAMPLE_COUNT - 1] * 0.5f;   // 150 mm wafer
+        float parkOff   = ARM_LENGTH_MM * sinf((parkDeg - centerDeg) * toRad);
 
-        float lo = fminf(parkOff, -waferR);
-        float hi = fmaxf(parkOff,  waferR);
+        // Fixed scale sized for the largest wafer so the circle fills the width;
+        // taller-than-the-window circles are cropped top/bottom by drawCircleClipped.
+        float lo = fminf(parkOff, -waferRmax);
+        float hi = fmaxf(parkOff,  waferRmax);
         float spanMm = hi - lo; if (spanMm < 1.0f) spanMm = 1.0f;
-
-        float scaleW = (ANIM_W - 16) / spanMm;
-        float scaleH = (float)maxRpx / (waferR > 1.0f ? waferR : 1.0f);
-        sScale = fminf(scaleW, scaleH);
+        sScale = (ANIM_W - 16) / spanMm;
         sLo    = lo;
 
         drawnW   = (int)lroundf(spanMm * sScale);
@@ -1563,14 +1697,14 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
         radiusPx = (int)lroundf(waferR * sScale);
         waferCx  = startX + (int)lroundf((0.0f    - lo) * sScale);
         parkX    = startX + (int)lroundf((parkOff - lo) * sScale);
+        axL = max(ANIM_X,       min(parkX, waferCx - radiusPx) - 4);
+        axR = min(STATUS_X - 2, waferCx + radiusPx + 4);
 
         // Clear region and paint the static scene.
         tft.fillRect(ANIM_X, ANIM_Y - 2, ANIM_W, ANIM_H + 2, ST77XX_BLACK);
         tft.drawFastHLine(ANIM_X, ANIM_Y - 4, ANIM_W, gray);            // separator
-        int axL = min(parkX, waferCx - radiusPx) - 4;
-        int axR = waferCx + radiusPx + 4;
         tft.drawFastHLine(axL, axisY, axR - axL, gray);                 // sweep axis
-        tft.drawCircle(waferCx, axisY, radiusPx, ST77XX_CYAN);          // wafer
+        drawCircleClipped(waferCx, axisY, radiusPx, yTop, yBot, ST77XX_CYAN);
         tft.fillCircle(waferCx, axisY, 2, ST77XX_CYAN);                 // wafer centre dot
         tft.drawFastVLine(parkX, axisY - 6, 13, ST77XX_GREEN);          // park tick
         tft.setTextSize(1);
@@ -1578,7 +1712,7 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
         tft.setCursor(parkX - 2, axisY + 10);
         tft.print("P");
 
-        prevArmX = -1; lastAnimDeg = -9999;   // force the arrow to repaint
+        prevArmX = -1; lastAnimDeg = -9999; prevPulse = false;  // force the arrow to repaint
     }
 
     // Live arm position.
@@ -1586,27 +1720,39 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
     int   armX   = startX + (int)lroundf((armOff - sLo) * sScale);
     armX = constrain(armX, startX, startX + drawnW);
 
-    // Flicker gate: only move the arrow once the angle has changed by ≥ 1°.
-    int curDeg = (posDegX10 + (posDegX10 >= 0 ? 5 : -5)) / 10;
-    if (!redrawStatic && abs(curDeg - lastAnimDeg) < 1 && prevArmX >= 0) return;
-    lastAnimDeg = curDeg;
-    if (armX == prevArmX) return;
+    // Generator lightning sign blinks ~2 Hz while the ultrasonic generator is on.
+    bool pulseOn = ultrasonicActive && ((millis() / 250) & 1);
 
-    // Erase the old arrow, then restore the static scene it crossed.
+    // Redraw the arrow when it moved ≥1° (flicker gate) or when the pulse toggled.
+    int  curDeg    = (posDegX10 + (posDegX10 >= 0 ? 5 : -5)) / 10;
+    bool angleStep = redrawStatic || abs(curDeg - lastAnimDeg) >= 1;
+    bool moved     = angleStep && (armX != prevArmX);
+    if (!redrawStatic && !moved && pulseOn == prevPulse && prevArmX >= 0) return;
+    if (angleStep) lastAnimDeg = curDeg;
+
+    // Erase the old arrow + sign within the crop window, then restore the scene.
     if (prevArmX >= 0) {
-        tft.fillRect(prevArmX - 5, armTopY, 11, tipY - armTopY + 1, ST77XX_BLACK);
-        int axL = min(parkX, waferCx - radiusPx) - 4;
-        int axR = waferCx + radiusPx + 4;
+        tft.fillRect(prevArmX - 5, yTop, 17, (tipY + 1) - yTop, ST77XX_BLACK);
         tft.drawFastHLine(axL, axisY, axR - axL, gray);
-        tft.drawCircle(waferCx, axisY, radiusPx, ST77XX_CYAN);
+        drawCircleClipped(waferCx, axisY, radiusPx, yTop, yBot, ST77XX_CYAN);
         tft.fillCircle(waferCx, axisY, 2, ST77XX_CYAN);
         tft.drawFastVLine(parkX, axisY - 6, 13, ST77XX_GREEN);
     }
 
-    // Draw the arrow (red): vertical shaft + downward head onto the wafer plane.
-    tft.fillRect(armX - 1, armTopY, 2, (tipY - headH) - armTopY, ST77XX_RED);
+    // Draw the arrow (red): tall shaft from the crop top + downward head onto the plane.
+    tft.fillRect(armX - 1, yTop, 2, (tipY - headH) - yTop, ST77XX_RED);
     tft.fillTriangle(armX - 4, tipY - headH, armX + 4, tipY - headH, armX, tipY, ST77XX_RED);
-    prevArmX = armX;
+
+    // Pulsing lightning bolt next to the arrow while the generator is energised.
+    if (pulseOn) {
+        int bx = armX + 5, by = yTop + 1;
+        tft.drawLine(bx + 3, by,     bx,     by + 5,  ST77XX_YELLOW);
+        tft.drawLine(bx,     by + 5, bx + 4, by + 5,  ST77XX_YELLOW);
+        tft.drawLine(bx + 4, by + 5, bx + 1, by + 11, ST77XX_YELLOW);
+        tft.drawLine(bx + 2, by,     bx - 1, by + 5,  ST77XX_YELLOW);  // thicken upper stroke
+    }
+    prevPulse = pulseOn;
+    prevArmX  = armX;
 }
 
 // ============= SETTINGS SCREEN (sweep params) =============
@@ -1683,7 +1829,7 @@ void drawSettings() {
 void drawSetupRow(int i, int y, bool selected, bool editing) {
     const char* labels[] = {
         "Park   ", "Centre ", "Arm    ", "Cycles ",
-        "Current", "Mstep  ", "Invert ", "< Back "
+        "Current", "Mstep  ", "Invert ", "Safety ", "< Back "
     };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
@@ -1705,6 +1851,7 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
             case 4: tft.print(driverCurrent);               tft.print("mA  ");  break;
             case 5: tft.print(driverMicrosteps);            tft.print("x     "); break;
             case 6: tft.print(motorDirectionInverted ? "ON    " : "OFF   "); break;
+            case 7: tft.print(SENSOR_INPUTS_ENABLED ? "ON    " : "DEBUG "); break;
         }
     }
 }
@@ -1712,19 +1859,20 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
 void drawSetup() {
     static int  lastIdx     = -1;
     static bool lastEdit    = false;
-    static int  lastVals[7] = {};
+    static int  lastVals[8] = {};
 
     if (setupNeedsRedraw) { setupNeedsRedraw = false; lastIdx = -1; }
 
     int  si = setupIndex;
     bool ed = editingSetup;
-    int  vals[7] = {
+    int  vals[8] = {
         PARK_DEG_X10, CENTER_DEG_X10, ARM_LENGTH_MM, (int)OSCILLATION_CYCLES,
-        driverCurrent, driverMicrosteps, motorDirectionInverted ? 1 : 0
+        driverCurrent, driverMicrosteps, motorDirectionInverted ? 1 : 0,
+        SENSOR_INPUTS_ENABLED ? 1 : 0
     };
 
     bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit);
-    for (int i = 0; i < 7 && !changed; i++) changed = (vals[i] != lastVals[i]);
+    for (int i = 0; i < 8 && !changed; i++) changed = (vals[i] != lastVals[i]);
     if (!changed) return;
 
     if (lastIdx == -1) {
@@ -1737,10 +1885,10 @@ void drawSetup() {
     }
 
     for (int i = 0; i < SETUP_COUNT; i++)
-        drawSetupRow(i, 22 + i * 18, i == si, i == si && ed && i < SETUP_COUNT - 1);
+        drawSetupRow(i, 20 + i * 16, i == si, i == si && ed && i < SETUP_COUNT - 1);
 
     lastIdx = si; lastEdit = ed;
-    for (int i = 0; i < 7; i++) lastVals[i] = vals[i];
+    for (int i = 0; i < 8; i++) lastVals[i] = vals[i];
 }
 
 // ============= ABOUT SCREEN =============
@@ -1866,7 +2014,9 @@ void updateDisplay() {
     bool menuChanged  = (mi    != lastMenu);
     bool forceStatusRedraw = (menuChanged && menuDrawState == -1);
 
-    if (!menuChanged && !statusChanged && !forceStatusRedraw) return;
+    // Keep ticking while the generator is on so the lightning sign can blink.
+    bool pulseTick = !advancedMenuUnlocked && ultrasonicActive;
+    if (!menuChanged && !statusChanged && !forceStatusRedraw && !pulseTick) return;
 
     mutex_enter_blocking(&spi_mutex);
 
