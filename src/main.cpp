@@ -646,13 +646,16 @@ double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
     }
 
     if (sweepProfile == SWEEP_PROFILE_INVDIST) {
+        // Cosecant: speed is lowest at the wafer centre and rises with distance from it,
+        // so the step interval is inversely proportional to that distance (≈ 1/sin → csc).
+        // Keyed off |position − centre|, so it behaves the same for either sweep type.
         int centerSteps = degX10ToSteps(CENTER_DEG_X10);
         int maxDistance = max(abs(sweepBackSteps() - centerSteps), abs(sweepForwardSteps() - centerSteps));
         if (maxDistance > 0) {
-            double distance = (double)abs(currentSteps - centerSteps) / (double)maxDistance;
-            if (distance < 0.20) distance = 0.20;
+            double distance = (double)abs(currentSteps - centerSteps) / (double)maxDistance;  // 0 centre … 1 edge
+            if (distance < 0.10) distance = 0.10;   // clamp so the arm still creeps through the centre
             if (distance > 1.0) distance = 1.0;
-            return distance * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
+            return (1.0 / distance) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
         }
     }
 
@@ -679,11 +682,7 @@ unsigned long minimumSweepTimeMs() {
     double forwardSum = sweepLegFactorSum(backSteps, forwardSteps);
     double returnSum = sweepLegFactorSum(forwardSteps, backSteps);
     double fullCycleFactorSum = forwardSum + returnSum;
-    double minFactor = 1.0;
-
-    if (sweepProfile == SWEEP_PROFILE_INVDIST) {
-        minFactor = 0.20;
-    }
+    double minFactor = 1.0;   // smallest profile factor (fastest step) is ~1.0 for every profile
 
     double minTimeMs =
         (fullCycleFactorSum * (double)MIN_SWEEP_STEP_INTERVAL_US / minFactor) / 1000.0;

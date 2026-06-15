@@ -193,8 +193,8 @@ sweep = 2 · asin( (wafer_diameter / 2) / arm_length )
 
 - **Sweep type** `Edge↔(•)`: arm travels edge → centre (half the sweep).
 - **Sweep type** `Edge↔Edge`: arm travels edge → edge (full sweep).
-- **Speed profile**: `Sine`, `Sawtooth`, or `Cosecant` — three velocity-shaping modes
-  applied across each sweep.
+- **Speed profile**: `Sine`, `Sawtooth`, or `Cosecant` — velocity-shaping across each sweep
+  (`Cosecant` is slowest at the wafer centre and fastest at the edges, for either sweep type).
 
 The ultrasonic generator is energised **only while the arm tip is over the wafer disk**.
 
