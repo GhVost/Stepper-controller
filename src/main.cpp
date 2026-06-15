@@ -112,8 +112,22 @@ const int SWEEP_PATH_BACK_FRONT  = 1;
 const int SWEEP_PROFILE_LINEAR   = 0;
 const int SWEEP_PROFILE_HARMONIC = 1;
 const int SWEEP_PROFILE_INVDIST  = 2;
-const int SWEEP_ENDPOINT_RAMP_DEG_X10 = 10;  // 1.0 degree accel/decel segment
 const double SWEEP_ENDPOINT_SLOW_FACTOR = 3.0;
+
+// Endpoint ramp: the width (in degrees) over which the arm decelerates to a stop at
+// each reversal is derived from motionAccelDegS2 and the sweep's actual peak speed
+// (see beginSweepLegTiming). motionJerkDegS3 blends the ramp's smoothstep shape
+// between a sharper cubic (high jerk) and a smoother quintic "smootherstep" (low jerk).
+double motionAccelDegS2 = 100.0;   // deg/s^2, endpoint deceleration
+double motionJerkDegS3  = 4000.0;  // deg/s^3, endpoint ramp shape
+const double JERK_BLEND_LOW_DEG_S3  = 1000.0;   // at/below: fully quintic (smoothest)
+const double JERK_BLEND_HIGH_DEG_S3 = 8000.0;   // at/above: fully cubic (sharpest)
+const double MOTION_ACCEL_MIN_DEG_S2  = 10.0;
+const double MOTION_ACCEL_MAX_DEG_S2  = 2000.0;
+const double MOTION_ACCEL_STEP_DEG_S2 = 10.0;
+const double MOTION_JERK_MIN_DEG_S3  = 200.0;
+const double MOTION_JERK_MAX_DEG_S3  = 20000.0;
+const double MOTION_JERK_STEP_DEG_S3 = 200.0;
 
 // ============= SETUP (hardware/driver params) =============
 int driverCurrent    = 600;
@@ -127,7 +141,7 @@ const int MICROSTEP_TABLE[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 const int MICROSTEP_COUNT   = 9;
 
 const uint32_t SETTINGS_MAGIC = 0x4D534743UL;  // "MSGC"
-const uint16_t SETTINGS_VERSION = 6;
+const uint16_t SETTINGS_VERSION = 7;
 const size_t EEPROM_BYTES = 4096;
 
 // Auto-save: every Setup/Settings change is persisted, but writes are debounced so a
@@ -153,6 +167,8 @@ struct StoredSettings {
     int16_t driverMicrosteps;
     int16_t motorDirectionInverted;
     int16_t sensorInputsEnabled;
+    int16_t motionAccelDegS2;
+    int16_t motionJerkDegS3;
     uint32_t checksum;
 };
 
@@ -185,6 +201,7 @@ int           sweepTimingTargetSteps = 0;
 unsigned long sweepTimingStartMicros = 0;
 double        sweepTimingCompletedFactorSum = 0.0;
 double        sweepTimingBaseUs = 1.0;
+int           activeRampSteps = 0;  // endpoint ramp width for the current leg, set by beginSweepLegTiming
 unsigned long lastEncoderRead = 0;
 volatile bool    encoderButtonEdgePending = false;
 volatile bool    encoderButtonRawState = HIGH;
@@ -298,8 +315,10 @@ int sweepLeftSteps();
 int sweepRightSteps();
 int sweepBackSteps();
 int sweepForwardSteps();
-double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps);
-double sweepLegFactorSum(int startSteps, int targetSteps);
+double sweepEndpointRampFactor(int currentSteps, int startSteps, int targetSteps, int rampSteps);
+double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps, int rampSteps);
+double sweepLegFactorSum(int startSteps, int targetSteps, int rampSteps);
+int computeRampSteps(double baseUsNoRamp);
 unsigned long minimumSweepTimeMs();
 bool enforceMinimumSweepTime(bool persist);
 void resetSweepTiming();
@@ -548,6 +567,8 @@ void loadSettings() {
     driverMicrosteps = stored.driverMicrosteps;
     motorDirectionInverted = stored.motorDirectionInverted != 0;
     SENSOR_INPUTS_ENABLED = stored.sensorInputsEnabled != 0;
+    motionAccelDegS2 = constrain((double)stored.motionAccelDegS2, MOTION_ACCEL_MIN_DEG_S2, MOTION_ACCEL_MAX_DEG_S2);
+    motionJerkDegS3 = constrain((double)stored.motionJerkDegS3, MOTION_JERK_MIN_DEG_S3, MOTION_JERK_MAX_DEG_S3);
     enforceMinimumSweepTime(true);
 
     Serial.printf("Settings: loaded from flash (v%u)\n", stored.version);
@@ -570,6 +591,8 @@ void saveSettings() {
     stored.driverMicrosteps = driverMicrosteps;
     stored.motorDirectionInverted = motorDirectionInverted ? 1 : 0;
     stored.sensorInputsEnabled = SENSOR_INPUTS_ENABLED ? 1 : 0;
+    stored.motionAccelDegS2 = (int16_t)(motionAccelDegS2 + 0.5);
+    stored.motionJerkDegS3 = (int16_t)(motionJerkDegS3 + 0.5);
     stored.checksum = settingsChecksum(stored);
 
     EEPROM.put(0, stored);
@@ -636,9 +659,8 @@ int sweepForwardSteps() {
     return sweepType == SWEEP_PATH_BACK_CENTER ? degX10ToSteps(CENTER_DEG_X10) : sweepRightSteps();
 }
 
-double sweepEndpointRampFactor(int currentSteps, int startSteps, int targetSteps) {
+double sweepEndpointRampFactor(int currentSteps, int startSteps, int targetSteps, int rampSteps) {
     int sweepSteps = abs(targetSteps - startSteps);
-    int rampSteps = degX10ToSteps(SWEEP_ENDPOINT_RAMP_DEG_X10);
     if (sweepSteps <= 0 || rampSteps <= 0) return 1.0;
 
     rampSteps = min(rampSteps, max(1, sweepSteps / 2));
@@ -647,11 +669,16 @@ double sweepEndpointRampFactor(int currentSteps, int startSteps, int targetSteps
     if (edgeDistance >= rampSteps) return 1.0;
 
     double x = (double)edgeDistance / (double)rampSteps;
-    double smooth = x * x * (3.0 - 2.0 * x);
+    double smoothCubic = x * x * (3.0 - 2.0 * x);                          // C1, sharper
+    double smoothQuintic = x * x * x * (x * (x * 6.0 - 15.0) + 10.0);      // C2, smoother
+    double jerkBlend = constrain(
+        (motionJerkDegS3 - JERK_BLEND_LOW_DEG_S3) / (JERK_BLEND_HIGH_DEG_S3 - JERK_BLEND_LOW_DEG_S3),
+        0.0, 1.0);
+    double smooth = jerkBlend * smoothCubic + (1.0 - jerkBlend) * smoothQuintic;
     return 1.0 + (SWEEP_ENDPOINT_SLOW_FACTOR - 1.0) * (1.0 - smooth);
 }
 
-double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
+double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps, int rampSteps) {
     int sweepSteps = abs(targetSteps - startSteps);
     if (sweepSteps <= 0) return 1.0f;
 
@@ -666,7 +693,7 @@ double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
             if (distance > 1.0) distance = 1.0;
             double velocity = cos(PI / 2.0 * distance);  // 1 at centre … 0 at edge
             if (velocity < 0.20) velocity = 0.20;
-            return (1.0 / velocity) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
+            return (1.0 / velocity) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps, rampSteps);
         }
     }
 
@@ -685,23 +712,37 @@ double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
             if (distance > 1.0) distance = 1.0;
             double edgeDistance = 1.0 - distance;     // 1 centre … 0 edge
             if (edgeDistance < 0.10) edgeDistance = 0.10;   // clamp so the arm still moves at the edge
-            return (1.0 / edgeDistance) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
+            return (1.0 / edgeDistance) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps, rampSteps);
         }
     }
 
-    return sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
+    return sweepEndpointRampFactor(currentSteps, startSteps, targetSteps, rampSteps);
 }
 
-double sweepLegFactorSum(int startSteps, int targetSteps) {
+double sweepLegFactorSum(int startSteps, int targetSteps, int rampSteps) {
     int sweepSteps = abs(targetSteps - startSteps);
     if (sweepSteps <= 0) return 1.0f;
 
     int direction = targetSteps > startSteps ? 1 : -1;
     double sum = 0.0;
     for (int i = 0; i < sweepSteps; i++) {
-        sum += sweepProfileFactor(startSteps + i * direction, startSteps, targetSteps);
+        sum += sweepProfileFactor(startSteps + i * direction, startSteps, targetSteps, rampSteps);
     }
     return sum > 1.0 ? sum : 1.0;
+}
+
+// Steps over which the arm decelerates from the leg's peak speed to a stop, given the
+// no-ramp baseline dwell time at the peak-speed point (the centre, where factor == 1).
+int computeRampSteps(double baseUsNoRamp) {
+    if (baseUsNoRamp <= 0.0 || motionAccelDegS2 <= 0.0) return 0;
+
+    double stepsPerDeg = (double)(FULL_STEPS_PER_REV * driverMicrosteps) / 360.0;
+    if (stepsPerDeg <= 0.0) return 0;
+
+    double degreesPerStep = 1.0 / stepsPerDeg;
+    double peakSpeedDegS = degreesPerStep * 1.0e6 / baseUsNoRamp;
+    double rampDeg = (peakSpeedDegS * peakSpeedDegS) / (2.0 * motionAccelDegS2);
+    return max(0, (int)(rampDeg * stepsPerDeg + 0.5));
 }
 
 unsigned long minimumSweepTimeMs() {
@@ -709,8 +750,12 @@ unsigned long minimumSweepTimeMs() {
     int forwardSteps = sweepForwardSteps();
     if (backSteps == forwardSteps) return 500UL;
 
-    double forwardSum = sweepLegFactorSum(backSteps, forwardSteps);
-    double returnSum = sweepLegFactorSum(forwardSteps, backSteps);
+    // Use rampSteps=0 here: the real ramp width depends on SWEEP_TIME_MS (via the peak
+    // speed), which this function exists to bound, so a no-ramp estimate avoids the
+    // circularity. The ramp only shortens the fastest-step factor sum slightly, so this
+    // remains a safe (slightly conservative) minimum.
+    double forwardSum = sweepLegFactorSum(backSteps, forwardSteps, 0);
+    double returnSum = sweepLegFactorSum(forwardSteps, backSteps, 0);
     double fullCycleFactorSum = forwardSum + returnSum;
     double minFactor = 1.0;   // smallest profile factor (fastest step) is ~1.0 for every profile
 
@@ -741,8 +786,20 @@ void resetSweepTiming() {
 }
 
 static void beginSweepLegTiming(unsigned long nowUs, int startSteps, int targetSteps) {
-    double fullCycleFactorSum = sweepLegFactorSum(sweepBackSteps(), sweepForwardSteps()) +
-                                sweepLegFactorSum(sweepForwardSteps(), sweepBackSteps());
+    int backSteps = sweepBackSteps();
+    int forwardSteps = sweepForwardSteps();
+
+    // Pass 1: no-ramp baseline, to estimate the leg's peak speed (at the centre, where
+    // the profile factor is at its minimum of 1.0).
+    double fullCycleFactorSumNoRamp = sweepLegFactorSum(backSteps, forwardSteps, 0) +
+                                       sweepLegFactorSum(forwardSteps, backSteps, 0);
+    if (fullCycleFactorSumNoRamp < 1.0) fullCycleFactorSumNoRamp = 1.0;
+    double baseUsNoRamp = ((double)SWEEP_TIME_MS * 1000.0) / fullCycleFactorSumNoRamp;
+    activeRampSteps = computeRampSteps(baseUsNoRamp);
+
+    // Pass 2: real timing with the accel-derived ramp applied.
+    double fullCycleFactorSum = sweepLegFactorSum(backSteps, forwardSteps, activeRampSteps) +
+                                sweepLegFactorSum(forwardSteps, backSteps, activeRampSteps);
     if (fullCycleFactorSum < 1.0) fullCycleFactorSum = 1.0;
 
     sweepTimingActive = true;
@@ -774,7 +831,7 @@ bool sweepStepDue(unsigned long nowUs, int currentSteps, int targetSteps) {
         beginSweepLegTiming(nowUs, currentSteps, targetSteps);
     }
 
-    double nextFactor = sweepProfileFactor(currentSteps, sweepTimingStartSteps, sweepTimingTargetSteps);
+    double nextFactor = sweepProfileFactor(currentSteps, sweepTimingStartSteps, sweepTimingTargetSteps, activeRampSteps);
     unsigned long dueUs =
         sweepTimingStartMicros +
         (unsigned long)(sweepTimingBaseUs * (sweepTimingCompletedFactorSum + nextFactor) + 0.5);
@@ -1449,8 +1506,36 @@ void handleSerialDebug() {
                 if (encoderReadIntervalMs < 20) encoderReadIntervalMs++;
                 Serial.printf("DBG: encoder read interval = %lums\n", encoderReadIntervalMs);
                 break;
+            case 'a':
+                motionAccelDegS2 = constrain(motionAccelDegS2 - MOTION_ACCEL_STEP_DEG_S2,
+                                              MOTION_ACCEL_MIN_DEG_S2, MOTION_ACCEL_MAX_DEG_S2);
+                resetSweepTiming();
+                markSettingsDirty();
+                Serial.printf("DBG: motion accel = %.0f deg/s^2\n", motionAccelDegS2);
+                break;
+            case 'A':
+                motionAccelDegS2 = constrain(motionAccelDegS2 + MOTION_ACCEL_STEP_DEG_S2,
+                                              MOTION_ACCEL_MIN_DEG_S2, MOTION_ACCEL_MAX_DEG_S2);
+                resetSweepTiming();
+                markSettingsDirty();
+                Serial.printf("DBG: motion accel = %.0f deg/s^2\n", motionAccelDegS2);
+                break;
+            case 'j':
+                motionJerkDegS3 = constrain(motionJerkDegS3 - MOTION_JERK_STEP_DEG_S3,
+                                             MOTION_JERK_MIN_DEG_S3, MOTION_JERK_MAX_DEG_S3);
+                resetSweepTiming();
+                markSettingsDirty();
+                Serial.printf("DBG: motion jerk = %.0f deg/s^3\n", motionJerkDegS3);
+                break;
+            case 'J':
+                motionJerkDegS3 = constrain(motionJerkDegS3 + MOTION_JERK_STEP_DEG_S3,
+                                             MOTION_JERK_MIN_DEG_S3, MOTION_JERK_MAX_DEG_S3);
+                resetSweepTiming();
+                markSettingsDirty();
+                Serial.printf("DBG: motion jerk = %.0f deg/s^3\n", motionJerkDegS3);
+                break;
             case '?':
-                Serial.println("DBG commands: d=dump TMC, e=enable, x=disable, +=one forward, -=one back, f=400 forward, b=400 back, r=one shaft rev, k=toggle encoder diag, [/]=encoder read interval -/+");
+                Serial.println("DBG commands: d=dump TMC, e=enable, x=disable, +=one forward, -=one back, f=400 forward, b=400 back, r=one shaft rev, k=toggle encoder diag, [/]=encoder read interval -/+, a/A=endpoint accel -/+, j/J=endpoint jerk -/+");
                 break;
         }
     }

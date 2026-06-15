@@ -200,7 +200,10 @@ sweep = 2 · asin( (wafer_diameter / 2) / arm_length )
   wafer centre and slow toward the edges (independent of sweep type) — `Sine` follows a
   cosine taper, `Reciprocal` an exponential decay — keeping dwell-time/area roughly
   constant as the wafer spins beneath the arm. All profiles ease in/out at each direction
-  reversal.
+  reversal, with a ramp width derived from the configured **endpoint acceleration** (so
+  faster profiles automatically get a wider deceleration zone) and a shape blended by the
+  configured **endpoint jerk** (smoother/quintic at low jerk, sharper/cubic at high jerk).
+  Both are adjustable over serial (`a`/`A`, `j`/`J`) and persist to flash.
 
 The ultrasonic generator is energised **only while the arm tip is over the wafer disk**.
 
