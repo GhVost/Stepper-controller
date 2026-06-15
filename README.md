@@ -68,8 +68,9 @@ menu from the Sweep Settings / Setup screens (there is no "< Back" row).
 - **Advanced menu**: a short-click immediately followed by a long-press toggles the
   advanced items (`Setup` and `About`) on/off.
 - **Sweep Settings**: sweep time, wafer diameter, **sweep type**, and **speed profile** —
-  each row shows `label : value` with the value highlighted, and the same arm animation sits
-  underneath as on the main menu. The calculated sweep angle is shown in the side status bar.
+  each row shows `label:value` in a large font with the value highlighted, and the arm
+  animation (about a third of the screen height) sits underneath. The calculated sweep angle
+  is shown in the side status bar.
 - **Setup** (hardware): park angle, centre angle (live jog while editing), arm length,
   cycles, driver current, microsteps, direction invert, and the **Debug** toggle
   (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active).

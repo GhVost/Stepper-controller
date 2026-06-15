@@ -109,8 +109,8 @@ function text(x,y,str,size,c){
 function clipRegion(){ ctx.beginPath(); ctx.rect(ANIM_X*SS, ANIM_Y*SS, ANIM_W*SS, ANIM_H*SS); ctx.clip(); }
 
 // ===================== firmware constants & helpers =====================
-const STATUS_X=232, STATUS_W=88, CONTENT_W=230;
-const ANIM_X=4, ANIM_W=224, ANIM_Y=86, ANIM_H=80;
+const STATUS_X=244, STATUS_W=76, CONTENT_W=242;
+const ANIM_X=4, ANIM_W=236, ANIM_Y=90, ANIM_H=57;
 const SAMPLE=[10,20,50,75,100,150];
 const SENSORS=false;                  // SENSOR_INPUTS_ENABLED default (Setup is hidden)
 
@@ -185,23 +185,23 @@ function statusColumn(){
   text(x,158,"FLOW",1,C.white);  text(x+38,158,SENSORS?"NO":"DIS",1,SENSORS?C.red:C.magenta);
 }
 function settingsRow(i,y,sel,edit){
-  const labels=["Sweep time ","Wafer diam.","Sweep type ","Speed prof."];
+  const labels=["Sweep time","Wafer diam.","Sweep type","Speed prof."];
   const bg=edit?C.editgreen:(sel?C.blue:C.black);
-  rect(0,y-2,CONTENT_W,12,bg);
-  const lab=labels[i]+" : ";
-  text(6,y,lab,1,C.white);
+  rect(0,y-2,CONTENT_W,16,bg);
+  const lab=labels[i]+":";
+  text(2,y,lab,2,C.white);
   let val;
   if(i===0) val=(S.sweepTimeMs/1000).toFixed(1)+" s.";
   else if(i===1) val=waferMm()+" mm";
   else if(i===2) val=(S.sweepType===0?"Edge↔(•)":"Edge↔Edge");
   else val=(S.profile===0?"Sine":S.profile===1?"Sawtooth":"Cosecant");
-  text(6+lab.length*6,y,val,1,C.yellow);   // highlight the changeable value
+  text(2+lab.length*12,y,val,2,C.yellow);   // highlight the changeable value
 }
 function drawSettings(){
   rect(0,0,W,H,C.black);
   text(6,3,"SWEEP SETTINGS",2,C.cyan);
   for(let i=0;i<4;i++)
-    settingsRow(i,24+i*15, i===S.settingsIndex, S.editing && i===S.settingsIndex);
+    settingsRow(i,22+i*16, i===S.settingsIndex, S.editing && i===S.settingsIndex);
   armAnim();
   statusColumn();
 }
@@ -231,7 +231,7 @@ function sweepAngleFromPhase(){
 // Oscillation-driven tour: each value is demonstrated for OSC_PER_VALUE full
 // back-forward-back oscillations, and the value (or feature) only changes at a wrap point —
 // i.e. when the arm is back at the wafer edge (armPhase 0) — so there are no mid-sweep jumps.
-const OSC_PER_VALUE = 3;
+const OSC_PER_VALUE = 2;
 
 const FEATURES=[
   { key:'parking', label:'Parking',       row:5, sweeps:false, dur:3800, run:(fr)=>{

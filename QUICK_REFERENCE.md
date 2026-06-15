@@ -65,8 +65,8 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 - **Basic menu**: START/STOP, Settings (+ arm-position animation).
 - **Advanced menu** (Setup, About): short-click then long-press to toggle.
 - **Sweep Settings**: Sweep time, Wafer diam., Sweep type, Speed prof. — each row shows
-  `label : value` (value highlighted) with the arm animation underneath. Speed profiles are
-  Sine / Sawtooth / Cosecant; the sweep angle is in the status bar.
+  `label:value` (large font, value highlighted) with the arm animation (~1/3 screen)
+  underneath. Speed profiles are Sine / Sawtooth / Cosecant; the sweep angle is in the status bar.
 - **Setup** (hardware): Park, Centre (live jog), Arm, Cycles, Current, Mstep, Invert,
   Debug (ON = ignore spray/flow, OFF = use safety inputs).
 - Edits persist to RP2040 flash EEPROM emulation and are reloaded at boot.

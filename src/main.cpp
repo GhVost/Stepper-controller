@@ -204,15 +204,18 @@ const unsigned long SENSOR_DEBOUNCE = 50;
 // ============= DISPLAY / MENU =============
 Adafruit_ST7789 tft = Adafruit_ST7789(LCD_CS, LCD_DC, LCD_RST);
 
-const int STATUS_X = 232;
-const int STATUS_W = 88;
+// Status column narrowed slightly (was 232/88) so the textSize-2 Sweep Settings rows fit
+// their full "label:value" text in the content area to its left.
+const int STATUS_X = 244;
+const int STATUS_W = 76;
 const int CONTENT_W = STATUS_X - 2;
 
-// Arm-position animation region (basic menu only, under the START/Settings rows)
+// Arm-position animation region (main menu + Sweep Settings). ~1/3 of the 172 px screen
+// height, sitting low so the rows above have room for a larger font.
 const int ANIM_X = 4;
 const int ANIM_W = STATUS_X - 8;   // 224 px wide
-const int ANIM_Y = 86;
-const int ANIM_H = 80;
+const int ANIM_Y = 90;
+const int ANIM_H = 57;             // ≈ 1/3 of the screen height
 
 // Main menu — 4 items, no HOME
 const char* menuItems[] = { "START/STOP", "Settings", "Setup", "About" };
@@ -1973,19 +1976,19 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
 }
 
 // ============= SETTINGS SCREEN (sweep params) =============
-// Rows show "label : value" at textSize 1; the changeable value is drawn in yellow so it
-// stands out. The arm animation fits underneath, matching the main-menu layout. (Labels are
-// padded to 11 chars so the colons line up.)
+// Rows show "label:value" at textSize 2 (matching the larger UI), with the changeable
+// value drawn in yellow so it stands out. The space after each title is dropped so the
+// longest line ("Sweep type:Edge↔Edge") just fits the content width left of the status bar.
 void drawSettingsRow(int i, int y, bool selected, bool editing) {
-    const char* labels[] = { "Sweep time ", "Wafer diam.", "Sweep type ", "Speed prof." };
+    const char* labels[] = { "Sweep time", "Wafer diam.", "Sweep type", "Speed prof." };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
-    tft.fillRect(0, y - 2, CONTENT_W, 12, bg);
-    tft.setTextSize(1);
+    tft.fillRect(0, y - 2, CONTENT_W, 16, bg);
+    tft.setTextSize(2);
     tft.setTextColor(ST77XX_WHITE, bg);
-    tft.setCursor(6, y);
+    tft.setCursor(2, y);
     tft.print(labels[i]);
-    tft.print(" : ");
+    tft.print(":");
     tft.setTextColor(ST77XX_YELLOW, bg);   // highlight the changeable value
     switch (i) {
         case 0: tft.print(SWEEP_TIME_MS / 1000.0f, 1); tft.print(" s."); break;
@@ -2020,7 +2023,7 @@ void drawSettings() {
     }
 
     for (int i = 0; i < SETTINGS_COUNT; i++)
-        drawSettingsRow(i, 24 + i * 15, i == si, i == si && ed);
+        drawSettingsRow(i, 22 + i * 16, i == si, i == si && ed);
 
     lastIdx = si; lastEdit = ed;
     for (int i = 0; i < 4; i++) lastVals[i] = vals[i];
