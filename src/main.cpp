@@ -211,11 +211,11 @@ const int STATUS_W = 76;
 const int CONTENT_W = STATUS_X - 2;
 
 // Arm-position animation region (main menu + Sweep Settings). ~1/3 of the 172 px screen
-// height, sitting low so the rows above have room for a larger font.
+// height, anchored at the bottom so the rows above get the taller remaining area.
 const int ANIM_X = 4;
-const int ANIM_W = STATUS_X - 8;   // 224 px wide
-const int ANIM_Y = 90;
+const int ANIM_W = STATUS_X - 8;
 const int ANIM_H = 57;             // ≈ 1/3 of the screen height
+const int ANIM_Y = 172 - ANIM_H;   // 115 — flush to the bottom edge
 
 // Main menu — 4 items, no HOME
 const char* menuItems[] = { "START/STOP", "Settings", "Setup", "About" };
@@ -2023,7 +2023,7 @@ void drawSettings() {
     }
 
     for (int i = 0; i < SETTINGS_COUNT; i++)
-        drawSettingsRow(i, 22 + i * 16, i == si, i == si && ed);
+        drawSettingsRow(i, 26 + i * 22, i == si, i == si && ed);   // spread over the taller field
 
     lastIdx = si; lastEdit = ed;
     for (int i = 0; i < 4; i++) lastVals[i] = vals[i];

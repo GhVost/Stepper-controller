@@ -110,7 +110,7 @@ function clipRegion(){ ctx.beginPath(); ctx.rect(ANIM_X*SS, ANIM_Y*SS, ANIM_W*SS
 
 // ===================== firmware constants & helpers =====================
 const STATUS_X=244, STATUS_W=76, CONTENT_W=242;
-const ANIM_X=4, ANIM_W=236, ANIM_Y=90, ANIM_H=57;
+const ANIM_X=4, ANIM_W=236, ANIM_H=57, ANIM_Y=172-ANIM_H;   // anim flush to bottom (115..172)
 const SAMPLE=[10,20,50,75,100,150];
 const SENSORS=false;                  // SENSOR_INPUTS_ENABLED default (Setup is hidden)
 
@@ -201,7 +201,7 @@ function drawSettings(){
   rect(0,0,W,H,C.black);
   text(6,3,"SWEEP SETTINGS",2,C.cyan);
   for(let i=0;i<4;i++)
-    settingsRow(i,22+i*16, i===S.settingsIndex, S.editing && i===S.settingsIndex);
+    settingsRow(i,26+i*22, i===S.settingsIndex, S.editing && i===S.settingsIndex);
   armAnim();
   statusColumn();
 }
