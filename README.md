@@ -1,5 +1,7 @@
 # MEGASONIC — Stepper Controller for an Ultrasonic Wafer Cleaner
 
+<!-- 🎬 DEMO GIF — drop/upload the firmware-feature animation here -->
+
 RP2040-based controller for a megasonic/ultrasonic wafer cleaner. A NEMA17 arm
 sweeps the ultrasonic transducer across a wafer while a TMC2130 driver, an SPI
 LCD, and a rotary encoder provide a complete on-device UI. Motion is described in
