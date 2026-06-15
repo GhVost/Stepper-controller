@@ -227,21 +227,23 @@ enum DisplayMode { DISP_MENU, DISP_SETTINGS, DISP_SETUP, DISP_ABOUT };
 volatile DisplayMode displayMode = DISP_MENU;
 
 volatile bool menuButtonPressed = false;
+volatile bool longPressBack    = false;  // long press on a sub-screen = back to the menu
 int menuDrawState = -1;  // -1 = full redraw needed
 
 // Deferred short-click + short/long combo state (toggles advanced menu on the main screen)
 bool          pendingShortClick     = false;
 unsigned long shortClickReleaseTime = 0;
 
-// Settings screen (sweep): Time, Wafer, Sweep type, Speed profile, < Back
-// (the calculated sweep angle now lives in the side status bar, not as a row)
-const int SETTINGS_COUNT = 5;
+// Sweep Settings rows: Time, Wafer, Sweep type, Speed profile. No "< Back" row —
+// a long press returns to the menu. Values are shown live in the side status bar.
+const int SETTINGS_COUNT = 4;
 volatile int  settingsIndex       = 0;
 volatile bool editingSettings     = false;
 volatile bool settingsNeedsRedraw = false;
 
-// Setup screen (hardware): Park, Centre, Arm, Cycles, Current, Mstep, Invert, Debug, < Back
-const int SETUP_COUNT = 9;
+// Setup rows: Park, Centre, Arm, Cycles, Current, Mstep, Invert, Debug. No "< Back" row —
+// a long press returns to the menu.
+const int SETUP_COUNT = 8;
 volatile int  setupIndex       = 0;
 volatile bool editingSetup     = false;
 volatile bool setupNeedsRedraw = false;
@@ -295,6 +297,7 @@ void motorSetEnable(bool enable);
 void motorMoveTo(int target);
 void motorMoveToBlocking(int target, unsigned int stepDelayUs);
 void handleMenuSelect();
+void exitToMenu();
 void adjustSettingsValue(int delta);
 void adjustSetupValue(int delta);
 void applyDriverSettings();
@@ -364,6 +367,11 @@ void loop() {
     if (menuButtonPressed) {
         menuButtonPressed = false;
         handleMenuSelect();
+    }
+
+    if (longPressBack) {
+        longPressBack = false;
+        exitToMenu();
     }
 
     readSensors();
@@ -899,18 +907,22 @@ void readEncoder() {
 
     unsigned long now = millis();
 
-    // Long press while held: short-click-then-long-press toggles the advanced menu
+    // Long press while held: on the main menu a short-click-then-long-press toggles the
+    // advanced menu; on a sub-screen a long press means "Back to menu".
     if (stableBtn == LOW && !longFired && now - pressStart >= LONG_PRESS_MS) {
         longFired = true;
-        if (displayMode == DISP_MENU && pendingShortClick &&
-            pressStart - shortClickReleaseTime <= COMBO_GAP_MS) {
-            advancedMenuUnlocked = !advancedMenuUnlocked;
-            if (!advancedMenuUnlocked && menuIndex >= BASIC_MENU_COUNT) menuIndex = 0;
-            pendingShortClick = false;
-            menuDrawState = -1;
-            Serial.printf("Advanced menu %s\n", advancedMenuUnlocked ? "shown" : "hidden");
+        if (displayMode == DISP_MENU) {
+            if (pendingShortClick && pressStart - shortClickReleaseTime <= COMBO_GAP_MS) {
+                advancedMenuUnlocked = !advancedMenuUnlocked;
+                if (!advancedMenuUnlocked && menuIndex >= BASIC_MENU_COUNT) menuIndex = 0;
+                pendingShortClick = false;
+                menuDrawState = -1;
+                Serial.printf("Advanced menu %s\n", advancedMenuUnlocked ? "shown" : "hidden");
+            }
+            // a plain long press on the menu otherwise does nothing
+        } else {
+            longPressBack = true;
         }
-        // a plain long press otherwise does nothing
     }
 
     // No long press followed in time -> execute the deferred short click
@@ -1159,22 +1171,17 @@ void handleMenuSelect() {
         return;
     }
 
+    // Sweep Settings / Setup: a click toggles edit on the selected row; there is no
+    // "< Back" row — a long press of the encoder returns to the menu (see exitToMenu()).
     if (displayMode == DISP_SETTINGS) {
-        if (editingSettings)                          { editingSettings = false; saveSettings(); }
-        else if (settingsIndex == SETTINGS_COUNT - 1) {
-            saveSettings();
-            settingsIndex = 0; displayMode = DISP_MENU; menuDrawState = -1;
-        } else                                        { editingSettings = true; }
+        if (editingSettings) { editingSettings = false; saveSettings(); }
+        else                 { editingSettings = true; }
         return;
     }
 
     if (displayMode == DISP_SETUP) {
-        if (editingSetup)                    { editingSetup = false; saveSettings(); }
-        else if (setupIndex == SETUP_COUNT - 1) {
-            applyDriverSettings();
-            saveSettings();
-            setupIndex = 0; displayMode = DISP_MENU; menuDrawState = -1;
-        } else {
+        if (editingSetup) { editingSetup = false; saveSettings(); }
+        else {
             if (setupIndex == 1) {
                 CENTER_DEG_X10 = constrain(stepsToDegX10(motorPosition), 10, 1800);
                 setupNeedsRedraw = true;
@@ -1234,6 +1241,24 @@ void handleMenuSelect() {
             aboutNeedsRedraw = true; displayMode = DISP_ABOUT;
             break;
     }
+}
+
+// Long press on a sub-screen: save and return to the main menu (replaces the old
+// "< Back" row). Setup also re-applies the driver settings on the way out.
+void exitToMenu() {
+    if (displayMode == DISP_SETTINGS) {
+        editingSettings = false;
+        saveSettings();
+        settingsIndex = 0;
+    } else if (displayMode == DISP_SETUP) {
+        editingSetup = false;
+        applyDriverSettings();
+        saveSettings();
+        setupIndex = 0;
+    }
+    displayMode = DISP_MENU;
+    menuDrawState = -1;
+    Serial.println("Long press → back to menu");
 }
 
 // Adjust Settings (sweep) parameter by encoder delta
@@ -1948,42 +1973,29 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
 }
 
 // ============= SETTINGS SCREEN (sweep params) =============
-// Compact (textSize 1) rows so the list plus the arm animation both fit, matching the
-// main-menu layout. Values are shown inline; the calculated sweep angle is in the status bar.
+// Dropping the "< Back" row freed a line, so the rows are textSize 2 (larger) and show
+// the label only — each value is displayed live in the side status bar. The arm animation
+// still fits underneath, matching the main-menu layout.
 void drawSettingsRow(int i, int y, bool selected, bool editing) {
-    const char* labels[] = { "Time", "Wafer", "Sweep type", "Speed profile", "< Back" };
+    const char* labels[] = { "Time", "Wafer", "Sweep type", "Speed profile" };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
-    tft.fillRect(0, y - 2, CONTENT_W, 12, bg);
+    tft.fillRect(0, y - 2, CONTENT_W, 16, bg);
     tft.setTextColor(ST77XX_WHITE, bg);
-    tft.setTextSize(1);
+    tft.setTextSize(2);
     tft.setCursor(6, y);
     tft.print(labels[i]);
-    if (i < SETTINGS_COUNT - 1) {
-        tft.print(": ");
-        switch (i) {
-            case 0: tft.print(SWEEP_TIME_MS / 1000.0f, 1); tft.print("s"); break;
-            case 1: tft.print(SAMPLE_TABLE[sampleIndex]);  tft.print("mm"); break;
-            case 2: tft.print(sweepTypeLabel());    break;
-            case 3: tft.print(sweepProfileLabel()); break;
-        }
-    }
 }
 
 void drawSettings() {
-    static int  lastIdx      = -1;
-    static bool lastEdit     = false;
-    static int  lastVals[4]  = {};
+    static int  lastIdx  = -1;
+    static bool lastEdit = false;
 
     if (settingsNeedsRedraw) { settingsNeedsRedraw = false; lastIdx = -1; }
 
     int  si = settingsIndex;
     bool ed = editingSettings;
-    int  vals[4] = { (int)(SWEEP_TIME_MS / 100), sampleIndex, sweepType, sweepProfile };
-
-    bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit);
-    for (int i = 0; i < 4 && !changed; i++) changed = (vals[i] != lastVals[i]);
-    if (!changed) return;
+    if (lastIdx != -1 && si == lastIdx && ed == lastEdit) return;
 
     if (lastIdx == -1) {
         tft.fillScreen(ST77XX_BLACK);
@@ -1995,17 +2007,16 @@ void drawSettings() {
     }
 
     for (int i = 0; i < SETTINGS_COUNT; i++)
-        drawSettingsRow(i, 22 + i * 12, i == si, i == si && ed && i < SETTINGS_COUNT - 1);
+        drawSettingsRow(i, 22 + i * 15, i == si, i == si && ed);
 
     lastIdx = si; lastEdit = ed;
-    for (int i = 0; i < 4; i++) lastVals[i] = vals[i];
 }
 
 // ============= SETUP SCREEN (hardware params) =============
 void drawSetupRow(int i, int y, bool selected, bool editing) {
     const char* labels[] = {
         "Park   ", "Centre ", "Arm    ", "Cycles ",
-        "Current", "Mstep  ", "Invert ", "Debug  ", "< Back "
+        "Current", "Mstep  ", "Invert ", "Debug  "
     };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
@@ -2014,21 +2025,19 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
     tft.setTextSize(2);
     tft.setCursor(6, y);
     tft.print(labels[i]);
-    if (i < SETUP_COUNT - 1) {
-        tft.print(": ");
-        switch (i) {
-            case 0: printDegX10(PARK_DEG_X10);              tft.print("deg ");  break;
-            case 1: printDegX10(CENTER_DEG_X10);            tft.print("deg ");  break;
-            case 2: tft.print(ARM_LENGTH_MM);               tft.print("mm  ");  break;
-            case 3:
-                if (OSCILLATION_CYCLES == 0) tft.print("inf   ");
-                else { tft.print(OSCILLATION_CYCLES); tft.print("      "); }
-                break;
-            case 4: tft.print(driverCurrent);               tft.print("mA  ");  break;
-            case 5: tft.print(driverMicrosteps);            tft.print("x     "); break;
-            case 6: tft.print(motorDirectionInverted ? "ON    " : "OFF   "); break;
-            case 7: tft.print(SENSOR_INPUTS_ENABLED ? "OFF   " : "ON    "); break;
-        }
+    tft.print(": ");
+    switch (i) {
+        case 0: printDegX10(PARK_DEG_X10);              tft.print("deg ");  break;
+        case 1: printDegX10(CENTER_DEG_X10);            tft.print("deg ");  break;
+        case 2: tft.print(ARM_LENGTH_MM);               tft.print("mm  ");  break;
+        case 3:
+            if (OSCILLATION_CYCLES == 0) tft.print("inf   ");
+            else { tft.print(OSCILLATION_CYCLES); tft.print("      "); }
+            break;
+        case 4: tft.print(driverCurrent);               tft.print("mA  ");  break;
+        case 5: tft.print(driverMicrosteps);            tft.print("x     "); break;
+        case 6: tft.print(motorDirectionInverted ? "ON    " : "OFF   "); break;
+        case 7: tft.print(SENSOR_INPUTS_ENABLED ? "OFF   " : "ON    "); break;
     }
 }
 
@@ -2061,7 +2070,7 @@ void drawSetup() {
     }
 
     for (int i = 0; i < SETUP_COUNT; i++)
-        drawSetupRow(i, 20 + i * 16, i == si, i == si && ed && i < SETUP_COUNT - 1);
+        drawSetupRow(i, 22 + i * 18, i == si, i == si && ed);
 
     lastIdx = si; lastEdit = ed;
     for (int i = 0; i < 8; i++) lastVals[i] = vals[i];

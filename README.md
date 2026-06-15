@@ -59,16 +59,17 @@ State:IDLE | Pos:0 steps (0.0 deg) | Spray:OFF | Flow:NO
 ## On-Device UI
 
 The encoder drives the whole interface: **rotate** to move the selection or change a
-value, **click** to select / enter-edit / confirm.
+value, **click** to select / enter-edit / confirm, and **long-press** to go back to the
+menu from the Sweep Settings / Setup screens (there is no "< Back" row).
 
 - **Basic menu** (default): `START/STOP` and `Settings`. An arm-position animation under
   the rows shows the wafer (circle), the park tick, the live arm position (red arrow), and
   a blinking lightning sign while the ultrasonic generator is energised.
 - **Advanced menu**: a short-click immediately followed by a long-press toggles the
   advanced items (`Setup` and `About`) on/off.
-- **Sweep Settings**: sweep time, wafer diameter, **sweep type**, and **speed profile**, as
-  a compact list with the same arm animation underneath as the main menu. The calculated
-  sweep angle and the live sweep parameters are shown in the side status bar.
+- **Sweep Settings**: sweep time, wafer diameter, **sweep type**, and **speed profile** —
+  large label rows with the same arm animation underneath as the main menu. The calculated
+  sweep angle and the live parameter values are shown in the side status bar.
 - **Setup** (hardware): park angle, centre angle (live jog while editing), arm length,
   cycles, driver current, microsteps, direction invert, and the **Debug** toggle
   (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active).

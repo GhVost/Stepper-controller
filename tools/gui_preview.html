@@ -185,24 +185,16 @@ function statusColumn(){
   text(x,158,"FLOW",1,C.white);  text(x+38,158,SENSORS?"NO":"DIS",1,SENSORS?C.red:C.magenta);
 }
 function settingsRow(i,y,sel,edit){
-  const labels=["Time","Wafer","Sweep type","Speed profile","< Back"];
+  const labels=["Time","Wafer","Sweep type","Speed profile"];   // value shown in status bar
   const bg=edit?C.editgreen:(sel?C.blue:C.black);
-  rect(0,y-2,CONTENT_W,12,bg);
-  let s=labels[i];
-  if(i<4){
-    s+=": ";
-    if(i===0) s+=(S.sweepTimeMs/1000).toFixed(1)+"s";
-    else if(i===1) s+=waferMm()+"mm";
-    else if(i===2) s+=(S.sweepType===0?"Edge↔(•)":"Edge↔Edge");
-    else if(i===3) s+=(S.profile===0?"Linear":S.profile===1?"Harm":"InvDist");
-  }
-  text(6,y,s,1,C.white);
+  rect(0,y-2,CONTENT_W,16,bg);
+  text(6,y,labels[i],2,C.white);
 }
 function drawSettings(){
   rect(0,0,W,H,C.black);
   text(6,3,"SWEEP SETTINGS",2,C.cyan);
-  for(let i=0;i<5;i++)
-    settingsRow(i,22+i*12, i===S.settingsIndex, S.editing && i===S.settingsIndex && i<4);
+  for(let i=0;i<4;i++)
+    settingsRow(i,22+i*15, i===S.settingsIndex, S.editing && i===S.settingsIndex);
   armAnim();
   statusColumn();
 }
