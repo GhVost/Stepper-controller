@@ -309,7 +309,7 @@ uint32_t rawTmcRead(uint8_t address);
 void debugStepBurst(int direction, int steps, unsigned int stepDelayUs);
 void updateDisplay();
 const char* stateLabel(SystemState state);
-void drawStatusColumn(SystemState state, int posDegX10, bool forceRedraw);
+void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw);
 void drawIcon(int id, int x, int y, uint16_t color);
 void drawMenuRow(int i, int y, bool selected);
 void drawMenu();
@@ -591,9 +591,9 @@ const char* sweepTypeLabel() {
     return sweepType == SWEEP_PATH_BACK_CENTER ? "Edge\x1D(\x07)" : "Edge\x1D" "Edge";
 }
 const char* sweepProfileLabel() {
-    if (sweepProfile == SWEEP_PROFILE_LINEAR)   return "Linear";
-    if (sweepProfile == SWEEP_PROFILE_HARMONIC) return "Harm";
-    return "InvDist";
+    if (sweepProfile == SWEEP_PROFILE_LINEAR)   return "Sine";
+    if (sweepProfile == SWEEP_PROFILE_HARMONIC) return "Sawtooth";
+    return "Cosecant";
 }
 
 int sweepLeftSteps() {
@@ -1638,9 +1638,9 @@ const char* stateLabel(SystemState state) {
 
 // Side status bar. Top half: live STATE + arm ANGLE. Middle: the SWEEP config summary
 // (calculated sweep angle, time, wafer, type, profile). Bottom: spray/flow sensors.
-void drawStatusColumn(SystemState state, int posDegX10, bool forceRedraw) {
+void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     static SystemState drawnState = (SystemState)-1;
-    static int  drawnPosDegX10 = -9999;
+    static int  drawnPosDeg = -9999;
     static bool drawnSpray = false;
     static bool drawnFlow  = false;
     static int  drawnSweepAng = -1, drawnTime = -1, drawnWafer = -1, drawnType = -1, drawnProfile = -1;
@@ -1670,7 +1670,7 @@ void drawStatusColumn(SystemState state, int posDegX10, bool forceRedraw) {
         tft.setCursor(x, 158); tft.print("FLOW");
 
         drawnState = (SystemState)-1;
-        drawnPosDegX10 = -9999;
+        drawnPosDeg = -9999;
         drawnSpray = !sprayActive;
         drawnFlow  = !flowDetected;
         drawnSweepAng = drawnTime = drawnWafer = drawnType = drawnProfile = -1;
@@ -1684,13 +1684,13 @@ void drawStatusColumn(SystemState state, int posDegX10, bool forceRedraw) {
         drawnState = state;
     }
 
-    if (forceRedraw || posDegX10 != drawnPosDegX10) {
+    if (forceRedraw || posDeg != drawnPosDeg) {
         tft.fillRect(x, 64, valueW, 16, ST77XX_BLACK);
         tft.setTextSize(2);
         tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-        tft.setCursor(x, 64); printDegX10(posDegX10);
-        tft.setTextSize(1); tft.print("deg");
-        drawnPosDegX10 = posDegX10;
+        tft.setCursor(x, 64); tft.print(posDeg);
+        tft.setTextSize(1); tft.print(" deg");
+        drawnPosDeg = posDeg;
     }
 
     // SWEEP config summary (updates live while editing on the Settings screen).
@@ -1973,29 +1973,42 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
 }
 
 // ============= SETTINGS SCREEN (sweep params) =============
-// Dropping the "< Back" row freed a line, so the rows are textSize 2 (larger) and show
-// the label only — each value is displayed live in the side status bar. The arm animation
-// still fits underneath, matching the main-menu layout.
+// Rows show "label : value" at textSize 1; the changeable value is drawn in yellow so it
+// stands out. The arm animation fits underneath, matching the main-menu layout. (Labels are
+// padded to 11 chars so the colons line up.)
 void drawSettingsRow(int i, int y, bool selected, bool editing) {
-    const char* labels[] = { "Time", "Wafer", "Sweep type", "Speed profile" };
+    const char* labels[] = { "Sweep time ", "Wafer diam.", "Sweep type ", "Speed prof." };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
-    tft.fillRect(0, y - 2, CONTENT_W, 16, bg);
+    tft.fillRect(0, y - 2, CONTENT_W, 12, bg);
+    tft.setTextSize(1);
     tft.setTextColor(ST77XX_WHITE, bg);
-    tft.setTextSize(2);
     tft.setCursor(6, y);
     tft.print(labels[i]);
+    tft.print(" : ");
+    tft.setTextColor(ST77XX_YELLOW, bg);   // highlight the changeable value
+    switch (i) {
+        case 0: tft.print(SWEEP_TIME_MS / 1000.0f, 1); tft.print(" s."); break;
+        case 1: tft.print(SAMPLE_TABLE[sampleIndex]);  tft.print(" mm"); break;
+        case 2: tft.print(sweepTypeLabel());    break;
+        case 3: tft.print(sweepProfileLabel()); break;
+    }
 }
 
 void drawSettings() {
-    static int  lastIdx  = -1;
-    static bool lastEdit = false;
+    static int  lastIdx     = -1;
+    static bool lastEdit    = false;
+    static int  lastVals[4] = {};
 
     if (settingsNeedsRedraw) { settingsNeedsRedraw = false; lastIdx = -1; }
 
     int  si = settingsIndex;
     bool ed = editingSettings;
-    if (lastIdx != -1 && si == lastIdx && ed == lastEdit) return;
+    int  vals[4] = { (int)(SWEEP_TIME_MS / 100), sampleIndex, sweepType, sweepProfile };
+
+    bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit);
+    for (int i = 0; i < 4 && !changed; i++) changed = (vals[i] != lastVals[i]);
+    if (!changed) return;
 
     if (lastIdx == -1) {
         tft.fillScreen(ST77XX_BLACK);
@@ -2007,9 +2020,10 @@ void drawSettings() {
     }
 
     for (int i = 0; i < SETTINGS_COUNT; i++)
-        drawSettingsRow(i, 22 + i * 15, i == si, i == si && ed);
+        drawSettingsRow(i, 24 + i * 15, i == si, i == si && ed);
 
     lastIdx = si; lastEdit = ed;
+    for (int i = 0; i < 4; i++) lastVals[i] = vals[i];
 }
 
 // ============= SETUP SCREEN (hardware params) =============
@@ -2139,7 +2153,7 @@ void drawAbout() {
 // ============= UPDATE DISPLAY (Core 1) =============
 void updateDisplay() {
     static SystemState lastState       = (SystemState)-1;
-    static int         lastPosDegX10   = -9999;
+    static int         lastPosDeg      = -9999;
     static int         lastMenu        = -1;
     static bool        lastRunning     = false;
     static bool        lastSpray       = false;
@@ -2152,7 +2166,8 @@ void updateDisplay() {
     SystemState state = currentState;
     int         pos   = motorPosition;
     int         posDegX10 = stepsToDegX10(pos);
-    bool statusChanged = (state != lastState || posDegX10 != lastPosDegX10 ||
+    int         posDeg    = (posDegX10 + (posDegX10 >= 0 ? 5 : -5)) / 10;  // whole degrees for status bar
+    bool statusChanged = (state != lastState || posDeg != lastPosDeg ||
                           sprayActive != lastSpray || flowDetected != lastFlow ||
                           driverParkHoldMode != lastHold);
 
@@ -2165,16 +2180,16 @@ void updateDisplay() {
             // self-gates per field, so this does not flicker).
             drawSettings();
             drawArmAnim(modeChanged, posDegX10);
-            drawStatusColumn(state, posDegX10, modeChanged);
+            drawStatusColumn(state, posDeg, modeChanged);
         } else if (dm == DISP_SETUP) {
             drawSetup();
-            drawStatusColumn(state, posDegX10, modeChanged);
+            drawStatusColumn(state, posDeg, modeChanged);
         } else {
             drawAbout();
         }
         mutex_exit(&spi_mutex);
         if (modeChanged || statusChanged) {
-            lastState = state; lastPosDegX10 = posDegX10;
+            lastState = state; lastPosDeg = posDeg;
             lastSpray = sprayActive; lastFlow = flowDetected; lastHold = driverParkHoldMode;
         }
         lastDisplayMode = dm;
@@ -2183,7 +2198,7 @@ void updateDisplay() {
 
     if (lastDisplayMode != DISP_MENU) {
         lastState   = (SystemState)-1;
-        lastPosDegX10 = -9999;
+        lastPosDeg  = -9999;
         lastMenu    = -1;
         lastRunning = false;
         lastSpray   = false;
@@ -2222,9 +2237,9 @@ void updateDisplay() {
     }
 
     if (statusChanged || forceStatusRedraw) {
-        drawStatusColumn(state, posDegX10, forceStatusRedraw);
+        drawStatusColumn(state, posDeg, forceStatusRedraw);
 
-        lastState = state; lastPosDegX10 = posDegX10;
+        lastState = state; lastPosDeg = posDeg;
         lastSpray = sprayActive; lastFlow = flowDetected; lastHold = driverParkHoldMode;
 
         Serial.print("State:");

@@ -171,30 +171,37 @@ function statusColumn(){
   // live state + arm angle
   text(x,24,"STATE",1,C.white); text(x,34,S.state,2,C.yellow);
   text(x,54,"ANGLE",1,C.white);
-  const ang=degStr(S.angleX10);
-  text(x,64,ang,2,C.yellow); text(x+ang.length*12,64,"deg",1,C.yellow);
+  const ang=String(Math.round(S.angleX10/10));   // whole degrees
+  text(x,64,ang,2,C.yellow); text(x+ang.length*12,64," deg",1,C.yellow);
   // sweep config summary
   text(x,86,"SWEEP",1,C.cyan);
   text(x,96,degStr(travelSweepX10())+"deg",1,C.yellow);
   text(x,106,(S.sweepTimeMs/1000).toFixed(1)+"s",1,C.white);
   text(x,116,waferMm()+"mm",1,C.white);
   text(x,126,(S.sweepType===0?"Edge↔(•)":"Edge↔Edge"),1,C.white);
-  text(x,136,(S.profile===0?"Linear":S.profile===1?"Harm":"InvDist"),1,C.white);
+  text(x,136,(S.profile===0?"Sine":S.profile===1?"Sawtooth":"Cosecant"),1,C.white);
   // sensors
   text(x,148,"SPRAY",1,C.white); text(x+38,148,SENSORS?"OFF":"DIS",1,SENSORS?C.red:C.magenta);
   text(x,158,"FLOW",1,C.white);  text(x+38,158,SENSORS?"NO":"DIS",1,SENSORS?C.red:C.magenta);
 }
 function settingsRow(i,y,sel,edit){
-  const labels=["Time","Wafer","Sweep type","Speed profile"];   // value shown in status bar
+  const labels=["Sweep time ","Wafer diam.","Sweep type ","Speed prof."];
   const bg=edit?C.editgreen:(sel?C.blue:C.black);
-  rect(0,y-2,CONTENT_W,16,bg);
-  text(6,y,labels[i],2,C.white);
+  rect(0,y-2,CONTENT_W,12,bg);
+  const lab=labels[i]+" : ";
+  text(6,y,lab,1,C.white);
+  let val;
+  if(i===0) val=(S.sweepTimeMs/1000).toFixed(1)+" s.";
+  else if(i===1) val=waferMm()+" mm";
+  else if(i===2) val=(S.sweepType===0?"Edge↔(•)":"Edge↔Edge");
+  else val=(S.profile===0?"Sine":S.profile===1?"Sawtooth":"Cosecant");
+  text(6+lab.length*6,y,val,1,C.yellow);   // highlight the changeable value
 }
 function drawSettings(){
   rect(0,0,W,H,C.black);
   text(6,3,"SWEEP SETTINGS",2,C.cyan);
   for(let i=0;i<4;i++)
-    settingsRow(i,22+i*15, i===S.settingsIndex, S.editing && i===S.settingsIndex);
+    settingsRow(i,24+i*15, i===S.settingsIndex, S.editing && i===S.settingsIndex);
   armAnim();
   statusColumn();
 }
@@ -244,7 +251,11 @@ function curFeature(){ return tour[fIdx]; }
 function enterFeature(){
   vIdx=0; oscCount=0; parkClock=0;
   const f=curFeature();
-  if(f.sweeps){ armPhase=0; f.apply(f.values[0]); }
+  if(f.sweeps){
+    armPhase=0;
+    if(f.key!=='time') S.sweepTimeMs=4000;   // fixed 4 s cycle for wafer/type/profile demos
+    f.apply(f.values[0]);
+  }
 }
 function nextFeature(){ fIdx=(fIdx+1)%tour.length; enterFeature(); }
 function buildTour(){

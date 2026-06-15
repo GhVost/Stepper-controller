@@ -68,8 +68,8 @@ menu from the Sweep Settings / Setup screens (there is no "< Back" row).
 - **Advanced menu**: a short-click immediately followed by a long-press toggles the
   advanced items (`Setup` and `About`) on/off.
 - **Sweep Settings**: sweep time, wafer diameter, **sweep type**, and **speed profile** —
-  large label rows with the same arm animation underneath as the main menu. The calculated
-  sweep angle and the live parameter values are shown in the side status bar.
+  each row shows `label : value` with the value highlighted, and the same arm animation sits
+  underneath as on the main menu. The calculated sweep angle is shown in the side status bar.
 - **Setup** (hardware): park angle, centre angle (live jog while editing), arm length,
   cycles, driver current, microsteps, direction invert, and the **Debug** toggle
   (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active).
@@ -192,8 +192,8 @@ sweep = 2 · asin( (wafer_diameter / 2) / arm_length )
 
 - **Sweep type** `Edge↔(•)`: arm travels edge → centre (half the sweep).
 - **Sweep type** `Edge↔Edge`: arm travels edge → edge (full sweep).
-- **Speed profile**: `Linear` (constant speed), `Harmonic` (sinusoidal ease in/out), or
-  `Inverse-Distance` (varies speed with distance from the wafer centre).
+- **Speed profile**: `Sine`, `Sawtooth`, or `Cosecant` — three velocity-shaping modes
+  applied across each sweep.
 
 The ultrasonic generator is energised **only while the arm tip is over the wafer disk**.
 
