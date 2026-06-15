@@ -184,18 +184,38 @@ int           sweepTimingStartSteps = 0;
 int           sweepTimingTargetSteps = 0;
 unsigned long sweepTimingStartMicros = 0;
 double        sweepTimingCompletedFactorSum = 0.0;
-double        sweepTimingLegFactorSum = 1.0;
 double        sweepTimingBaseUs = 1.0;
 unsigned long lastEncoderRead = 0;
-volatile int     encoderDetentDelta = 0;
-volatile int     encoderTransitionAccum = 0;
-volatile uint8_t encoderIsrState = 0;
 volatile bool    encoderButtonEdgePending = false;
 volatile bool    encoderButtonRawState = HIGH;
 volatile unsigned long encoderButtonEdgeMillis = 0;
+
+// Buxton quadrature state table: rows are states, columns are pinState = (B<<1 | A).
+const uint8_t ENC_R_START   = 0x0;
+const uint8_t ENC_R_CW_FIN  = 0x1;
+const uint8_t ENC_R_CW_BEG  = 0x2;
+const uint8_t ENC_R_CW_NEXT = 0x3;
+const uint8_t ENC_R_CCW_BEG = 0x4;
+const uint8_t ENC_R_CCW_FIN = 0x5;
+const uint8_t ENC_R_CCW_NEXT = 0x6;
+const uint8_t ENC_DIR_CW    = 0x10;
+const uint8_t ENC_DIR_CCW   = 0x20;
+const uint8_t ENC_TTABLE[7][4] = {
+    {ENC_R_START,      ENC_R_CW_BEG,  ENC_R_CCW_BEG, ENC_R_START},
+    {ENC_R_CW_NEXT,    ENC_R_START,   ENC_R_CW_FIN,  ENC_R_START | ENC_DIR_CW},
+    {ENC_R_CW_NEXT,    ENC_R_CW_BEG,  ENC_R_START,   ENC_R_START},
+    {ENC_R_CW_NEXT,    ENC_R_CW_BEG,  ENC_R_CW_FIN,  ENC_R_START},
+    {ENC_R_CCW_NEXT,   ENC_R_START,   ENC_R_CCW_BEG, ENC_R_START},
+    {ENC_R_CCW_NEXT,   ENC_R_CCW_FIN, ENC_R_START,   ENC_R_START | ENC_DIR_CCW},
+    {ENC_R_CCW_NEXT,   ENC_R_CCW_FIN, ENC_R_CCW_BEG, ENC_R_START},
+};
+uint8_t encoderRotState = ENC_R_START;
+bool encoderDiagEnabled = false;
+// Tunable from the serial debug console ('[' / ']') while diagnosing encoder issues;
+// normally 1ms is plenty since mechanical detents are far slower than that.
+unsigned long encoderReadIntervalMs = 1;
 const unsigned long MOTOR_UPDATE_INTERVAL_US = 500;
 const unsigned long MIN_SWEEP_STEP_INTERVAL_US = 100;
-const unsigned long ENCODER_READ_INTERVAL = 1;
 const unsigned long ENCODER_STEP_MIN_INTERVAL = 5;
 const unsigned long ENCODER_BUTTON_DEBOUNCE = 120;
 const uint8_t ENCODER_STABLE_SAMPLES = 1;
@@ -221,7 +241,7 @@ const int ANIM_Y = 172 - ANIM_H;   // 115 — flush to the bottom edge
 const char* menuItems[] = { "START/STOP", "Settings", "Setup", "About" };
 const int   MENU_COUNT  = 4;
 const int   BASIC_MENU_COUNT = 2;
-const unsigned long LONG_PRESS_MS = 700;   // hold time that counts as a "long" click
+const unsigned long LONG_PRESS_MS = 1000;  // hold time that counts as a "long" click
 const unsigned long COMBO_GAP_MS  = 400;   // max gap from short-click release to the long press
 volatile int menuIndex  = 0;
 volatile bool advancedMenuUnlocked = false;
@@ -260,7 +280,7 @@ mutex_t spi_mutex;
 void initHardware();
 void initSPI();
 void initEncoder();
-void encoderIsr();
+int8_t pollEncoderRotation();
 void encoderButtonIsr();
 void initTMC2130();
 void initDisplay();
@@ -362,7 +382,7 @@ void loop() {
 
     handleSerialDebug();
 
-    if (now - lastEncoderRead >= ENCODER_READ_INTERVAL) {
+    if (now - lastEncoderRead >= encoderReadIntervalMs) {
         readEncoder();
         lastEncoderRead = now;
     }
@@ -384,7 +404,10 @@ void loop() {
 
     // Debounced auto-save: commit pending Setup/Settings changes once the encoder has
     // been quiet for SETTINGS_SAVE_DELAY (coalesces a burst of steps into one write).
-    if (settingsDirty && now - lastSettingsChange >= SETTINGS_SAVE_DELAY) {
+    // Re-read millis() here rather than reusing `now`: markSettingsDirty() above (via
+    // readEncoder) can set lastSettingsChange to a value >= now within this same
+    // iteration, and now - lastSettingsChange would then underflow and fire every step.
+    if (settingsDirty && millis() - lastSettingsChange >= SETTINGS_SAVE_DELAY) {
         saveSettings();
     }
 }
@@ -436,15 +459,11 @@ void initEncoder() {
     pinMode(ENC_A,  INPUT_PULLUP);
     pinMode(ENC_B,  INPUT_PULLUP);
     pinMode(ENC_SW, INPUT_PULLUP);
-    encoderIsrState = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
-    encoderTransitionAccum = 0;
-    encoderDetentDelta = 0;
+    encoderRotState = ENC_R_START;
     encoderButtonRawState = digitalRead(ENC_SW);
     encoderButtonEdgePending = false;
-    attachInterrupt(digitalPinToInterrupt(ENC_A), encoderIsr, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(ENC_B), encoderIsr, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC_SW), encoderButtonIsr, CHANGE);
-    Serial.printf("Encoder initialized: CLK=%d DT=%d SW=%d (interrupt mode)\n", ENC_A, ENC_B, ENC_SW);
+    Serial.printf("Encoder initialized: CLK=%d DT=%d SW=%d (polled rotation, interrupt button)\n", ENC_A, ENC_B, ENC_SW);
 }
 
 void initTMC2130() {
@@ -594,9 +613,9 @@ const char* sweepTypeLabel() {
     return sweepType == SWEEP_PATH_BACK_CENTER ? "Edge\x1D(\x07)" : "Edge\x1D" "Edge";
 }
 const char* sweepProfileLabel() {
-    if (sweepProfile == SWEEP_PROFILE_LINEAR)   return "Sine";
-    if (sweepProfile == SWEEP_PROFILE_HARMONIC) return "Sawtooth";
-    return "Cosecant";
+    if (sweepProfile == SWEEP_PROFILE_LINEAR)   return "Sawtooth";
+    if (sweepProfile == SWEEP_PROFILE_HARMONIC) return "Sine";
+    return "Reciprocal";
 }
 
 int sweepLeftSteps() {
@@ -637,25 +656,36 @@ double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
     if (sweepSteps <= 0) return 1.0f;
 
     if (sweepProfile == SWEEP_PROFILE_HARMONIC) {
-        double progress = (double)abs(currentSteps - startSteps) / (double)sweepSteps;
-        if (progress < 0.0) progress = 0.0;
-        if (progress > 1.0) progress = 1.0;
-        double velocity = sin(PI * progress);
-        if (velocity < 0.20) velocity = 0.20;
-        return 1.0 / velocity;
+        // Sine: speed is highest at the wafer centre and falls off toward the edge,
+        // following a sine curve (gentler than Reciprocal's 1/distance falloff).
+        // Keyed off |position - centre|, so it behaves the same for either sweep type.
+        int centerSteps = degX10ToSteps(CENTER_DEG_X10);
+        int maxDistance = max(abs(sweepBackSteps() - centerSteps), abs(sweepForwardSteps() - centerSteps));
+        if (maxDistance > 0) {
+            double distance = (double)abs(currentSteps - centerSteps) / (double)maxDistance;  // 0 centre … 1 edge
+            if (distance > 1.0) distance = 1.0;
+            double velocity = cos(PI / 2.0 * distance);  // 1 at centre … 0 at edge
+            if (velocity < 0.20) velocity = 0.20;
+            return (1.0 / velocity) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
+        }
     }
 
     if (sweepProfile == SWEEP_PROFILE_INVDIST) {
-        // Cosecant: speed is lowest at the wafer centre and rises with distance from it,
-        // so the step interval is inversely proportional to that distance (≈ 1/sin → csc).
+        // Reciprocal: speed is highest at the wafer centre and falls off toward the edge,
+        // proportional to distance from the centre, so the step interval (dwell time)
+        // is the reciprocal of the remaining distance to the edge, growing toward it.
+        // This keeps dwell-time/area roughly constant as the wafer spins underneath:
+        // a point at radius r sweeps past the arm at a rate ∝ r, so the arm must
+        // linger longer at larger r to deposit the same dose per unit area.
         // Keyed off |position − centre|, so it behaves the same for either sweep type.
         int centerSteps = degX10ToSteps(CENTER_DEG_X10);
         int maxDistance = max(abs(sweepBackSteps() - centerSteps), abs(sweepForwardSteps() - centerSteps));
         if (maxDistance > 0) {
             double distance = (double)abs(currentSteps - centerSteps) / (double)maxDistance;  // 0 centre … 1 edge
-            if (distance < 0.10) distance = 0.10;   // clamp so the arm still creeps through the centre
             if (distance > 1.0) distance = 1.0;
-            return (1.0 / distance) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
+            double edgeDistance = 1.0 - distance;     // 1 centre … 0 edge
+            if (edgeDistance < 0.10) edgeDistance = 0.10;   // clamp so the arm still moves at the edge
+            return (1.0 / edgeDistance) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps);
         }
     }
 
@@ -720,7 +750,6 @@ static void beginSweepLegTiming(unsigned long nowUs, int startSteps, int targetS
     sweepTimingTargetSteps = targetSteps;
     sweepTimingStartMicros = nowUs;
     sweepTimingCompletedFactorSum = 0.0;
-    sweepTimingLegFactorSum = sweepLegFactorSum(startSteps, targetSteps);
     sweepTimingBaseUs = ((double)SWEEP_TIME_MS * 1000.0) / fullCycleFactorSum;
 }
 
@@ -729,13 +758,12 @@ bool sweepStepDue(unsigned long nowUs, int currentSteps, int targetSteps) {
 
     bool targetChanged = !sweepTimingActive || targetSteps != sweepTimingTargetSteps;
     if (targetChanged) {
-        unsigned long startUs = nowUs;
-        if (sweepTimingActive && currentSteps == sweepTimingTargetSteps) {
-            unsigned long previousLegDuration =
-                (unsigned long)(sweepTimingBaseUs * sweepTimingLegFactorSum + 0.5);
-            startUs = sweepTimingStartMicros + previousLegDuration;
-        }
-        beginSweepLegTiming(startUs, currentSteps, targetSteps);
+        // Start each leg's timing fresh from "now" rather than chaining off the
+        // previous leg's scheduled end time: any rounding slack between the
+        // scheduled and actual duration of the previous leg would otherwise carry
+        // over as a time "debt", making the new leg's early steps already overdue
+        // and firing in a rapid burst right after the direction reversal.
+        beginSweepLegTiming(nowUs, currentSteps, targetSteps);
     }
 
     int legDirection = sweepTimingTargetSteps > sweepTimingStartSteps ? 1 : -1;
@@ -794,30 +822,28 @@ void readSensors() {
 }
 
 // ============= ENCODER =============
-const int8_t ENCODER_TRANSITION_TABLE[16] = {
-    0, -1,  1,  0,
-    1,  0,  0, -1,
-   -1,  0,  0,  1,
-    0,  1, -1,  0
-};
+// Polled full quadrature decode (Buxton state table): readEncoder() is called every
+// encoderReadIntervalMs from the main loop and samples both A/B pins directly, so there
+// is no reliance on GPIO interrupts (which the RP2040 can coalesce on simultaneous edges)
+// and no fixed debounce window. Invalid/bouncy pin sequences simply route back to
+// ENC_R_START without emitting a step, while a full valid 4-phase rotation in either
+// direction emits exactly one detent.
+int8_t pollEncoderRotation() {
+    uint8_t pinState = (digitalRead(ENC_B) << 1) | digitalRead(ENC_A);
+    uint8_t prevState = encoderRotState & 0x0F;
+    encoderRotState = ENC_TTABLE[prevState][pinState];
+    uint8_t dir = encoderRotState & 0x30;
+    int8_t result = 0;
+    // Inverted vs. the table's nominal CW/CCW so increasing values correspond to the
+    // knob's expected turn direction on this hardware.
+    if (dir == ENC_DIR_CW)  result = -1;
+    if (dir == ENC_DIR_CCW) result =  1;
 
-void encoderIsr() {
-    uint8_t encoded = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
-    uint8_t transition = (encoderIsrState << 2) | encoded;
-    int8_t movement = ENCODER_TRANSITION_TABLE[transition];
-    encoderIsrState = encoded;
-
-    if (movement == 0) return;
-
-    int accum = encoderTransitionAccum + movement;
-    if (accum >= 4) {
-        encoderDetentDelta++;
-        accum -= 4;
-    } else if (accum <= -4) {
-        encoderDetentDelta--;
-        accum += 4;
+    if (encoderDiagEnabled && (encoderRotState & 0x0F) != prevState) {
+        Serial.printf("ENC: A=%d B=%d state %u->%u result=%d\n",
+                      pinState & 1, (pinState >> 1) & 1, prevState, encoderRotState & 0x0F, result);
     }
-    encoderTransitionAccum = accum;
+    return result;
 }
 
 void encoderButtonIsr() {
@@ -830,12 +856,7 @@ void readEncoder() {
     static unsigned long lastStepTime     = 0;
     static int           pendingDetents   = 0;
 
-    int detents = 0;
-    noInterrupts();
-    detents = encoderDetentDelta;
-    encoderDetentDelta = 0;
-    interrupts();
-    pendingDetents += detents;
+    pendingDetents += pollEncoderRotation();
 
     if (pendingDetents != 0) {
         unsigned long now = millis();
@@ -843,7 +864,12 @@ void readEncoder() {
             unsigned long stepInterval = now - lastStepTime;
             int d = pendingDetents > 0 ? 1 : -1;
             int steps = abs(pendingDetents);
-            int editDelta = d * steps * encoderAcceleration(stepInterval);
+            int accel = encoderAcceleration(stepInterval);
+            int editDelta = d * steps * accel;
+            if (encoderDiagEnabled) {
+                Serial.printf("ENC step: pending=%d interval=%lums accel=%d editDelta=%d\n",
+                              pendingDetents, stepInterval, accel, editDelta);
+            }
             switch (displayMode) {
                 case DISP_MENU:
                     {
@@ -853,11 +879,11 @@ void readEncoder() {
                     break;
                 case DISP_SETTINGS:
                     if (editingSettings) adjustSettingsValue(editDelta);
-                    else settingsIndex = constrain(settingsIndex + d * steps, 0, SETTINGS_COUNT - 1);
+                    else settingsIndex = (settingsIndex + d * steps + SETTINGS_COUNT * steps) % SETTINGS_COUNT;
                     break;
                 case DISP_SETUP:
                     if (editingSetup) adjustSetupValue(editDelta);
-                    else setupIndex = constrain(setupIndex + d * steps, 0, SETUP_COUNT - 1);
+                    else setupIndex = (setupIndex + d * steps + SETUP_COUNT * steps) % SETUP_COUNT;
                     break;
                 case DISP_ABOUT:
                     break;
@@ -1148,7 +1174,6 @@ void handleState() {
                 if (motorPosition == target) {
                     if (oscillationDir < 0) {
                         oscillationCount++;
-                        Serial.printf("Sweep %lu/%lu\n", oscillationCount, OSCILLATION_CYCLES);
                     }
                     oscillationDir = -oscillationDir;
                 }
@@ -1268,7 +1293,7 @@ void adjustSettingsValue(int delta) {
     int singleStep = delta > 0 ? 1 : -1;
     switch (settingsIndex) {
         case 0:
-            SWEEP_TIME_MS = (unsigned long)constrain((long)SWEEP_TIME_MS + delta * 500L, 500L, 60000L);
+            SWEEP_TIME_MS = (unsigned long)constrain((long)SWEEP_TIME_MS + delta * 1000L, 500L, 60000L);
             break;
         case 1:
             sampleIndex = (sampleIndex + singleStep + SAMPLE_COUNT) % SAMPLE_COUNT;
@@ -1410,8 +1435,22 @@ void handleSerialDebug() {
                 debugStepBurst(1, revSteps, 150);
                 break;
             }
+            case 'k':
+            case 'K':
+                encoderDiagEnabled = !encoderDiagEnabled;
+                Serial.printf("DBG: encoder diagnostics %s (read interval %lums)\n",
+                              encoderDiagEnabled ? "ON" : "OFF", encoderReadIntervalMs);
+                break;
+            case '[':
+                if (encoderReadIntervalMs > 1) encoderReadIntervalMs--;
+                Serial.printf("DBG: encoder read interval = %lums\n", encoderReadIntervalMs);
+                break;
+            case ']':
+                if (encoderReadIntervalMs < 20) encoderReadIntervalMs++;
+                Serial.printf("DBG: encoder read interval = %lums\n", encoderReadIntervalMs);
+                break;
             case '?':
-                Serial.println("DBG commands: d=dump TMC, e=enable, x=disable, +=one forward, -=one back, f=400 forward, b=400 back, r=one shaft rev");
+                Serial.println("DBG commands: d=dump TMC, e=enable, x=disable, +=one forward, -=one back, f=400 forward, b=400 back, r=one shaft rev, k=toggle encoder diag, [/]=encoder read interval -/+");
                 break;
         }
     }
@@ -1579,9 +1618,12 @@ void printDegX10(int degX10) {
 }
 
 int encoderAcceleration(unsigned long intervalMs) {
-    if (intervalMs <= 20) return 25;
-    if (intervalMs <= 40) return 10;
-    if (intervalMs <= 80) return 5;
+    // A gentle, wide gradient: even a "quick" turn in the 150-400ms/detent range (about
+    // as fast as this encoder's detents register in practice) gets a small boost, while
+    // a slow, deliberate single click stays at 1x for 0.1 precision. The top end is
+    // intentionally modest (4x, not 10x+) so fast spins feel controllable.
+    if (intervalMs <= 15)  return 8;
+    if (intervalMs <= 50)  return 4;
     if (intervalMs <= 150) return 2;
     return 1;
 }
@@ -1646,9 +1688,12 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     static bool drawnSpray = false;
     static bool drawnFlow  = false;
     static int  drawnSweepAng = -1, drawnTime = -1, drawnWafer = -1, drawnType = -1, drawnProfile = -1;
+    static bool drawnSensorEnabled = true;
 
     int x = STATUS_X + 6;          // 238
     int valueW = STATUS_W - 8;     // 80
+
+    bool sensorChanged = (SENSOR_INPUTS_ENABLED != drawnSensorEnabled);
 
     if (forceRedraw) {
         tft.fillRect(STATUS_X, 0, STATUS_W, tft.height(), ST77XX_BLACK);
@@ -1658,10 +1703,6 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
         tft.setTextSize(1);
         tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
         tft.setCursor(x, 4);  tft.print("STATUS");
-        if (!SENSOR_INPUTS_ENABLED) {
-            tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
-            tft.setCursor(x, 14); tft.print("DEBUG ON");
-        }
         tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
         tft.setCursor(x, 24); tft.print("STATE");
         tft.setCursor(x, 54); tft.print("ANGLE");
@@ -1676,6 +1717,17 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
         drawnSpray = !sprayActive;
         drawnFlow  = !flowDetected;
         drawnSweepAng = drawnTime = drawnWafer = drawnType = drawnProfile = -1;
+    }
+
+    // DEBUG ON indicator: re-drawn whenever the sensor-bypass toggle changes,
+    // not just on a full redraw, so flipping it in Setup updates live.
+    if (forceRedraw || sensorChanged) {
+        tft.fillRect(x, 14, valueW, 8, ST77XX_BLACK);
+        if (!SENSOR_INPUTS_ENABLED) {
+            tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+            tft.setCursor(x, 14); tft.print("DEBUG ON");
+        }
+        drawnSensorEnabled = SENSOR_INPUTS_ENABLED;
     }
 
     if (forceRedraw || state != drawnState) {
@@ -1706,7 +1758,7 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     if (forceRedraw || (int)SWEEP_TIME_MS != drawnTime) {
         tft.fillRect(x, 106, valueW, 8, ST77XX_BLACK);
         tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-        tft.setCursor(x, 106); tft.print(SWEEP_TIME_MS / 1000.0f, 1); tft.print("s");
+        tft.setCursor(x, 106); tft.print((SWEEP_TIME_MS + 500) / 1000); tft.print("s");
         drawnTime = (int)SWEEP_TIME_MS;
     }
     if (forceRedraw || sampleIndex != drawnWafer) {
@@ -1728,7 +1780,7 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
         drawnProfile = sweepProfile;
     }
 
-    if (forceRedraw || sprayActive != drawnSpray) {
+    if (forceRedraw || sprayActive != drawnSpray || sensorChanged) {
         tft.fillRect(x + 38, 148, valueW - 38, 8, ST77XX_BLACK);
         tft.setTextSize(1);
         if (SENSOR_INPUTS_ENABLED) {
@@ -1741,7 +1793,7 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
         drawnSpray = sprayActive;
     }
 
-    if (forceRedraw || flowDetected != drawnFlow) {
+    if (forceRedraw || flowDetected != drawnFlow || sensorChanged) {
         tft.fillRect(x + 38, 158, valueW - 38, 8, ST77XX_BLACK);
         tft.setTextSize(1);
         if (SENSOR_INPUTS_ENABLED) {
@@ -1979,7 +2031,7 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
 // value drawn in yellow so it stands out. The space after each title is dropped so the
 // longest line ("Sweep type:Edge↔Edge") just fits the content width left of the status bar.
 void drawSettingsRow(int i, int y, bool selected, bool editing) {
-    const char* labels[] = { "Sweep time", "Wafer diam.", "Sweep type", "Speed prof." };
+    const char* labels[] = { "Sweep time", "Wafer diam.", "Sweep type", "Profile" };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
     tft.fillRect(0, y - 2, CONTENT_W, 16, bg);
@@ -1990,7 +2042,7 @@ void drawSettingsRow(int i, int y, bool selected, bool editing) {
     tft.print(":");
     tft.setTextColor(ST77XX_YELLOW, bg);   // highlight the changeable value
     switch (i) {
-        case 0: tft.print(SWEEP_TIME_MS / 1000.0f, 1); tft.print(" s."); break;
+        case 0: tft.print((SWEEP_TIME_MS + 500) / 1000); tft.print(" s."); break;
         case 1: tft.print(SAMPLE_TABLE[sampleIndex]);  tft.print(" mm"); break;
         case 2: tft.print(sweepTypeLabel());    break;
         case 3: tft.print(sweepProfileLabel()); break;
@@ -2111,7 +2163,7 @@ void drawAbout() {
         tft.setTextWrap(false);
         tft.setTextColor(ST77XX_CYAN,  ST77XX_BLACK);
         tft.setTextSize(2);
-        tft.setCursor(8, 3);   tft.print("MEGASONIC v1.1");
+        tft.setCursor(8, 3);   tft.print("MEGASONIC v1.2");
         tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
         tft.setCursor(8, 22);  tft.print("RP2040 earlephilhower");
         tft.setCursor(8, 40);  tft.print("GMT147SPI 172x320");
@@ -2241,21 +2293,28 @@ void updateDisplay() {
     if (statusChanged || forceStatusRedraw) {
         drawStatusColumn(state, posDeg, forceStatusRedraw);
 
+        // Only echo to serial on a real state/sensor change, not on every
+        // arm-motion step (position alone changes constantly while sweeping).
+        bool eventChanged = (state != lastState || sprayActive != lastSpray ||
+                              flowDetected != lastFlow || driverParkHoldMode != lastHold);
+
         lastState = state; lastPosDeg = posDeg;
         lastSpray = sprayActive; lastFlow = flowDetected; lastHold = driverParkHoldMode;
 
-        Serial.print("State:");
-        switch (state) {
-            case STATE_IDLE:          Serial.print("IDLE");         break;
-            case STATE_HOMING:        Serial.print("HOMING");       break;
-            case STATE_PARKED:        Serial.print("PARKED");       break;
-            case STATE_WAITING_SPRAY: Serial.print("WAITING");      break;
-            case STATE_SPRAY_ACTIVE:  Serial.print("SPRAY_ACTIVE"); break;
-            case STATE_OSCILLATING:   Serial.print("OSCILLATING");  break;
-            case STATE_ERROR:         Serial.print("ERROR");        break;
+        if (eventChanged) {
+            Serial.print("State:");
+            switch (state) {
+                case STATE_IDLE:          Serial.print("IDLE");         break;
+                case STATE_HOMING:        Serial.print("HOMING");       break;
+                case STATE_PARKED:        Serial.print("PARKED");       break;
+                case STATE_WAITING_SPRAY: Serial.print("WAITING");      break;
+                case STATE_SPRAY_ACTIVE:  Serial.print("SPRAY_ACTIVE"); break;
+                case STATE_OSCILLATING:   Serial.print("OSCILLATING");  break;
+                case STATE_ERROR:         Serial.print("ERROR");        break;
+            }
+            Serial.printf(" | Pos:%d steps (%.1f deg) | Spray:%s | Flow:%s\n",
+                pos, posDegX10 * 0.1f, sprayActive ? "ON" : "OFF", flowDetected ? "YES" : "NO");
         }
-        Serial.printf(" | Pos:%d steps (%.1f deg) | Spray:%s | Flow:%s\n",
-            pos, posDegX10 * 0.1f, sprayActive ? "ON" : "OFF", flowDetected ? "YES" : "NO");
     }
 
     mutex_exit(&spi_mutex);

@@ -46,7 +46,7 @@ Hardware initialized
 SPI0 LCD initialized: SCK=18 MOSI=19
 SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
 TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
-Encoder initialized: CLK=26 DT=27 SW=22 (interrupt mode)
+Encoder initialized: CLK=26 DT=27 SW=22 (polled rotation, interrupt button)
 Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
 ```
@@ -60,7 +60,9 @@ State:IDLE | Pos:0 steps (0.0 deg) | Spray:OFF | Flow:NO
 
 The encoder drives the whole interface: **rotate** to move the selection or change a
 value, **click** to select / enter-edit / confirm, and **long-press** to go back to the
-menu from the Sweep Settings / Setup screens (there is no "< Back" row).
+menu from the Sweep Settings / Setup screens (there is no "< Back" row). Item lists
+(main menu, Sweep Settings, Setup) wrap around — rotating past the last row selects
+the first, and vice versa.
 
 - **Basic menu** (default): `START/STOP` and `Settings`. An arm-position animation under
   the rows shows the wafer (circle), the park tick, the live arm position (red arrow), and
@@ -193,8 +195,12 @@ sweep = 2 · asin( (wafer_diameter / 2) / arm_length )
 
 - **Sweep type** `Edge↔(•)`: arm travels edge → centre (half the sweep).
 - **Sweep type** `Edge↔Edge`: arm travels edge → edge (full sweep).
-- **Speed profile**: `Sine`, `Sawtooth`, or `Cosecant` — velocity-shaping across each sweep
-  (`Cosecant` is slowest at the wafer centre and fastest at the edges, for either sweep type).
+- **Speed profile**: `Sawtooth`, `Sine`, or `Reciprocal` — velocity-shaping across each sweep.
+  `Sawtooth` is constant speed throughout. `Sine` and `Reciprocal` are both fastest at the
+  wafer centre and slow toward the edges (independent of sweep type) — `Sine` follows a
+  cosine taper, `Reciprocal` an exponential decay — keeping dwell-time/area roughly
+  constant as the wafer spins beneath the arm. All profiles ease in/out at each direction
+  reversal.
 
 The ultrasonic generator is energised **only while the arm tip is over the wafer disk**.
 
@@ -216,7 +222,8 @@ The ultrasonic generator is energised **only while the arm tip is over the wafer
 - [x] Sensor reading (limit, spray, flow) with debounce + sensor-bypass DEBUG mode
 - [x] LED indicators, fan PWM, ultrasonic relay (energised only over the wafer)
 - [x] LCD UI — hardware SPI 20 MHz, partial redraw, ~20 fps on Core 1, arm-position animation
-- [x] Rotary encoder — interrupt-based quadrature/button input, acceleration, basic/advanced menu unlock
+- [x] Rotary encoder — polled quadrature (RC-filtered inputs) with interrupt button,
+      acceleration, cyclic menu navigation, basic/advanced menu unlock
 - [x] On-device Settings/Setup editors
 - [x] Persistent settings in flash (versioned, checksummed, compatible record loading)
 - [x] Recoverable ERROR state (START re-homes and clears the fault latch)

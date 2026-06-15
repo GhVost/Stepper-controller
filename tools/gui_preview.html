@@ -179,7 +179,7 @@ function statusColumn(){
   text(x,106,(S.sweepTimeMs/1000).toFixed(1)+"s",1,C.white);
   text(x,116,waferMm()+"mm",1,C.white);
   text(x,126,(S.sweepType===0?"Edge↔(•)":"Edge↔Edge"),1,C.white);
-  text(x,136,(S.profile===0?"Sine":S.profile===1?"Sawtooth":"Cosecant"),1,C.white);
+  text(x,136,(S.profile===0?"Sawtooth":S.profile===1?"Sine":"Reciprocal"),1,C.white);
   // sensors
   text(x,148,"SPRAY",1,C.white); text(x+38,148,SENSORS?"OFF":"DIS",1,SENSORS?C.red:C.magenta);
   text(x,158,"FLOW",1,C.white);  text(x+38,158,SENSORS?"NO":"DIS",1,SENSORS?C.red:C.magenta);
@@ -194,7 +194,7 @@ function settingsRow(i,y,sel,edit){
   if(i===0) val=(S.sweepTimeMs/1000).toFixed(1)+" s.";
   else if(i===1) val=waferMm()+" mm";
   else if(i===2) val=(S.sweepType===0?"Edge↔(•)":"Edge↔Edge");
-  else val=(S.profile===0?"Sine":S.profile===1?"Sawtooth":"Cosecant");
+  else val=(S.profile===0?"Sawtooth":S.profile===1?"Sine":"Reciprocal");
   text(2+lab.length*12,y,val,2,C.yellow);   // highlight the changeable value
 }
 function drawSettings(){
@@ -218,7 +218,7 @@ function sweepBounds(){
 // Position fraction (0..1) along one sweep leg for the selected speed profile.
 function profileEase(u){
   if(S.profile===1) return 0.5-0.5*Math.cos(Math.PI*u);            // sine: ease in/out at the turns
-  if(S.profile===2){ const t=2*u-1; return 0.5+0.5*Math.sign(t)*t*t; } // cosecant: slowest at the centre
+  if(S.profile===2){ return u<0.5 ? 2*u*u : 1-2*(1-u)*(1-u); }        // reciprocal: fastest at the centre, eases to a stop at the edges
   return u;                                                        // sawtooth: constant speed
 }
 // Arm angle from the continuous cycle phase (0..1): forward leg, then return leg. The full
@@ -254,7 +254,7 @@ function enterFeature(){
   if(f.sweeps){
     armPhase=0;
     if(f.key!=='time') S.sweepTimeMs=4000;   // fixed 4 s cycle for wafer/type/profile demos
-    if(f.key==='profile') S.sweepType=1;     // Back-Front so the cosecant centre is mid-sweep
+    if(f.key==='profile') S.sweepType=1;     // Back-Front so the reciprocal centre is mid-sweep
     f.apply(f.values[0]);
   }
 }

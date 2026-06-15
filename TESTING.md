@@ -39,7 +39,7 @@ SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
 TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
 === TMC2130 DEBUG ===
 ...register dump...
-Encoder initialized: CLK=26 DT=27 SW=22 (interrupt mode)
+Encoder initialized: CLK=26 DT=27 SW=22 (polled rotation, interrupt button)
 Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
 ```
@@ -128,7 +128,7 @@ on GPIO 10/11/12/13, VCC_IO, and `R_SENSE`.
 | 1 | Menu START (from IDLE) | `Menu: START → HOMING` |
 | 2 | Limit reached | `→ PARKED (moving to park position)`, pos → park |
 | 3 | (auto, bypass armed) | `→ SPRAY_ACTIVE (sensor bypass)` |
-| 4 | After ~2 s at sweep start | `→ OSCILLATING`, then `Sweep 1/4` … |
+| 4 | After ~2 s at sweep start | `→ OSCILLATING`, arm sweeps back and forth |
 | 5 | Cycles complete | `→ PARKED (cleaning cycle complete)` → `→ IDLE` |
 | — | Menu STOP at any time | `Menu: STOP → PARK then disable` → IDLE |
 

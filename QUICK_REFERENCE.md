@@ -66,7 +66,7 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 - **Advanced menu** (Setup, About): short-click then long-press to toggle.
 - **Sweep Settings**: Sweep time, Wafer diam., Sweep type, Speed prof. — each row shows
   `label:value` (large font, value highlighted) with the arm animation (~1/3 screen)
-  underneath. Speed profiles are Sine / Sawtooth / Cosecant; the sweep angle is in the status bar.
+  underneath. Speed profiles are Sawtooth / Sine / Reciprocal; the sweep angle is in the status bar.
 - **Setup** (hardware): Park, Centre (live jog), Arm, Cycles, Current, Mstep, Invert,
   Debug (ON = ignore spray/flow, OFF = use safety inputs).
 - Edits persist to RP2040 flash EEPROM emulation and are reloaded at boot.
@@ -126,7 +126,7 @@ degX10ToSteps(int degX10);    // angle (0.1°) → microsteps
 
 // Sensors / input
 readSensors();                // limit always; spray/flow only when Debug = OFF
-readEncoder();                // consume interrupt encoder/button events
+readEncoder();                // poll quadrature rotation + consume interrupt button events
 
 // Outputs
 setLED(pin, state);
@@ -170,6 +170,8 @@ Type a key in the serial monitor (115200):
 | `+` / `-` | One step forward / back |
 | `f` / `b` | 400 steps forward / back |
 | `r` | One full shaft revolution |
+| `k` | Toggle encoder diagnostics (per-transition + per-step serial log) |
+| `[` / `]` | Decrease / increase the encoder poll interval (1-20 ms) |
 | `?` | List commands |
 
 **Startup:**
@@ -180,7 +182,7 @@ Hardware initialized
 SPI0 LCD initialized: SCK=18 MOSI=19
 SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
 TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
-Encoder initialized: CLK=26 DT=27 SW=22 (interrupt mode)
+Encoder initialized: CLK=26 DT=27 SW=22 (polled rotation, interrupt button)
 Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!
 ```
@@ -192,7 +194,6 @@ Menu: START → HOMING
 State:PARKED | Pos:78 steps (7.0 deg) | Spray:OFF | Flow:NO
 → SPRAY_ACTIVE (sensor bypass)
 → OSCILLATING
-Sweep 1/4
 → PARKED (cleaning cycle complete)
 → IDLE (parked, motor disabled)
 ```
@@ -219,7 +220,7 @@ int           driverMicrosteps   = 128;   // resolution (no recalibration needed
 |------|--------|-------|
 | TMC2130 SPI config | ✅ Done | SPI1; run/park hold modes; fault polling |
 | Driver fault handling | ✅ Done | OT / S2G / charge-pump UV → park + ERROR |
-| Encoder + menu UI | ✅ Done | Interrupt input, navigation, edit, basic/advanced unlock |
+| Encoder + menu UI | ✅ Done | Polled quadrature + interrupt button, navigation, edit, cyclic menus, basic/advanced unlock |
 | Persistent settings | ✅ Done | Versioned, checksummed, compatible flash records |
 | Error recovery | ✅ Done | START clears the latch and re-homes |
 | LCD display | ✅ Done | GMT147SPI 172×320, 20 MHz HW SPI, ~20 fps, arm animation |

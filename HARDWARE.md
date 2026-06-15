@@ -122,8 +122,15 @@ SW  (Button)  ───── GPIO 22  (INPUT_PULLUP — LOW when pressed)
 GND           ───── GND
 ```
 
+**Recommended: RC debounce.** Add a 100nF (0.1µF) ceramic capacitor from CLK (GPIO 26)
+to GND and another from DT (GPIO 27) to GND, as close to the Pico's pins as practical.
+Combined with the ~50-80kΩ internal pull-ups this gives a ~5-8ms time constant that
+filters mechanical contact bounce, making rotation noticeably more reliable. The
+firmware's polled quadrature decoder works without the capacitors, but is much
+"snappier" with them.
+
 **UI gestures:** rotate to navigate / edit, click to select. On the main menu a short
-click immediately followed by a long press (≥ 700 ms, within 400 ms of the release)
+click immediately followed by a long press (≥ 1000 ms, within 400 ms of the release)
 toggles the advanced menu (Setup / About).
 
 ---
