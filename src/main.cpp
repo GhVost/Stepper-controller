@@ -122,10 +122,10 @@ double motionAccelDegS2 = 100.0;   // deg/s^2, endpoint deceleration
 double motionJerkDegS3  = 4000.0;  // deg/s^3, endpoint ramp shape
 const double JERK_BLEND_LOW_DEG_S3  = 1000.0;   // at/below: fully quintic (smoothest)
 const double JERK_BLEND_HIGH_DEG_S3 = 8000.0;   // at/above: fully cubic (sharpest)
-const double MOTION_ACCEL_MIN_DEG_S2  = 10.0;
+const double MOTION_ACCEL_MIN_DEG_S2  = 1.0;
 const double MOTION_ACCEL_MAX_DEG_S2  = 2000.0;
 const double MOTION_ACCEL_STEP_DEG_S2 = 10.0;
-const double MOTION_JERK_MIN_DEG_S3  = 200.0;
+const double MOTION_JERK_MIN_DEG_S3  = 20.0;
 const double MOTION_JERK_MAX_DEG_S3  = 20000.0;
 const double MOTION_JERK_STEP_DEG_S3 = 200.0;
 

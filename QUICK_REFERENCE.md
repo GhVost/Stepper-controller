@@ -172,8 +172,8 @@ Type a key in the serial monitor (115200):
 | `r` | One full shaft revolution |
 | `k` | Toggle encoder diagnostics (per-transition + per-step serial log) |
 | `[` / `]` | Decrease / increase the encoder poll interval (1-20 ms) |
-| `a` / `A` | Decrease / increase endpoint accel (10-2000 deg/s², persisted) |
-| `j` / `J` | Decrease / increase endpoint jerk (200-20000 deg/s³, persisted) |
+| `a` / `A` | Decrease / increase endpoint accel (1-2000 deg/s², persisted) |
+| `j` / `J` | Decrease / increase endpoint jerk (20-20000 deg/s³, persisted) |
 | `?` | List commands |
 
 **Startup:**
