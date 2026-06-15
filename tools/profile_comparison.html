@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MEGASONIC — Sine vs Reciprocal speed profile comparison</title>
+<style>
+  :root { --bg:#15171c; --panel:#1d2028; --accent:#00c8ff; --accent2:#ffb000; }
+  html,body { margin:0; min-height:100%; background:var(--bg); color:#cdd3df;
+              font-family:"Segoe UI",system-ui,sans-serif; }
+  .wrap { display:flex; flex-direction:column; align-items:center; gap:16px; padding:24px; }
+  h1 { font-size:18px; font-weight:600; margin:0; letter-spacing:.5px; text-align:center; }
+  h1 span { color:var(--accent); }
+  .panel { background:var(--panel); border-radius:10px; padding:14px 18px;
+           box-shadow:0 8px 24px rgba(0,0,0,.4); }
+  canvas { display:block; border-radius:4px; background:#0a0b0e; }
+  .controls { display:flex; flex-wrap:wrap; gap:18px; justify-content:center; align-items:center;
+              max-width:880px; }
+  .row { display:flex; align-items:center; gap:10px; }
+  input[type=range] { width:200px; }
+  select { background:#0a0b0e; color:#cdd3df; border:1px solid #333a47; border-radius:6px;
+           padding:4px 8px; font-size:13px; }
+  label.feat { display:inline-flex; gap:6px; align-items:center; font-size:13px; color:#cdd3df; }
+  .lbl { font-size:12.5px; color:#8b93a3; min-width:80px; }
+  .val { font-size:12.5px; width:60px; display:inline-block; }
+  .stats { font-size:13px; line-height:1.6; max-width:880px; }
+  .stats b { color:#fff; }
+  .legend { display:flex; gap:18px; justify-content:center; font-size:13px; }
+  .swatch { display:inline-block; width:14px; height:3px; vertical-align:middle; margin-right:6px; }
+  .hint { font-size:12.5px; color:#8b93a3; max-width:880px; text-align:center; line-height:1.5; }
+  code { background:#23262e; padding:1px 6px; border-radius:4px; color:#d8dee9; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span>MEGASONIC</span> — Sine vs Reciprocal speed profile comparison</h1>
+
+  <div class="controls">
+    <div class="row">
+      <span class="lbl">Sweep type</span>
+      <select id="sweepType">
+        <option value="edge-edge">Edge&#8596;Edge</option>
+        <option value="edge-center">Edge&#8596;(&bull;)</option>
+      </select>
+    </div>
+    <div class="row">
+      <span class="lbl">Sweep angle</span>
+      <input id="angle" type="range" min="2" max="120" step="1" value="40">
+      <span id="angleLbl" class="val">40&deg;</span>
+    </div>
+    <div class="row">
+      <span class="lbl">Sweep time</span>
+      <input id="time" type="range" min="1000" max="10000" step="250" value="4000">
+      <span id="timeLbl" class="val">4000 ms</span>
+    </div>
+    <label class="feat"><input type="checkbox" id="ramp" checked> Endpoint accel/decel ramp (1&deg; / 3&times;)</label>
+  </div>
+
+  <div class="panel">
+    <canvas id="speedChart" width="860" height="320"></canvas>
+  </div>
+  <div class="legend">
+    <span><span class="swatch" style="background:#ffb000"></span>Sine</span>
+    <span><span class="swatch" style="background:#00c8ff"></span>Reciprocal</span>
+    <span style="color:#8b93a3">grey dashed = direction reversal &nbsp;|&nbsp; green dotted = wafer centre crossing</span>
+  </div>
+
+  <div class="panel">
+    <canvas id="posChart" width="860" height="200"></canvas>
+  </div>
+  <div class="legend">
+    <span><span class="swatch" style="background:#ffb000"></span>Sine position</span>
+    <span><span class="swatch" style="background:#00c8ff"></span>Reciprocal position</span>
+  </div>
+
+  <div class="panel">
+    <canvas id="accelChart" width="860" height="240"></canvas>
+  </div>
+  <div class="legend">
+    <span><span class="swatch" style="background:#ffb000"></span>Sine acceleration</span>
+    <span><span class="swatch" style="background:#00c8ff"></span>Reciprocal acceleration</span>
+    <span style="color:#8b93a3">= d(speed)/dt</span>
+  </div>
+
+  <div class="panel stats" id="stats"></div>
+
+  <div class="hint">
+    Both curves are normalised so their <b>mean speed over one full cycle equals 1</b> — since
+    both profiles run the same total sweep distance in the same <b>Sweep time</b>, this makes
+    them directly comparable. <b>Speed</b> is signed: positive while sweeping back&rarr;forward,
+    negative on the return leg. <b>Sine</b> follows a cosine taper (speed never drops below 20% of
+    centre speed); <b>Reciprocal</b> follows an exponential-decay taper (down to 10%) — so
+    Reciprocal slows more aggressively near the wafer edge and runs faster through the centre to
+    compensate. The endpoint ramp (1&deg; smoothstep, up to 3&times; slower) applies to <i>both</i>
+    profiles at every direction reversal, independent of the speed-profile shape — for
+    <b>Edge&#8596;(&bull;)</b> this means the arm decelerates sharply right as it reaches the wafer
+    centre, even though the profile shape alone would have it at its fastest there.<br><br>
+    <b>Why the flat plateau near each edge?</b> The cosine/reciprocal tapers are <i>clamped</i> at
+    their 20%/10% floors once the distance from centre exceeds ~87%/90% of the half-sweep — so
+    speed is genuinely constant (flat) across that outer band of the sweep, independent of the
+    ramp. The much narrower 1&deg; endpoint ramp then adds one extra small dip right at the very
+    reversal point, inside that flat band.<br><br>
+    <b>Acceleration</b> (bottom chart) is the numerical derivative of the signed speed curve. The
+    big spikes at each reversal come from the endpoint ramp's rapid slow-down/speed-up <i>and</i>
+    from the model's instantaneous direction flip — this dwell-time model doesn't simulate
+    decelerating through zero, so speed jumps directly from a small positive value to a small
+    negative one (or vice versa) at each reversal.
+  </div>
+</div>
+
+<script>
+// ===================== firmware constants (src/main.cpp) =====================
+const RAMP_DEG = 1.0;            // SWEEP_ENDPOINT_RAMP_DEG_X10 = 10 -> 1.0 deg
+const SLOW_FACTOR_ON = 3.0;      // SWEEP_ENDPOINT_SLOW_FACTOR
+
+// ===================== profile math (mirrors sweepProfileFactor()) =====================
+function rampFactor(x, sweepDeg, slowFactor) {
+  const rampDeg = Math.min(RAMP_DEG, sweepDeg / 2);
+  if (rampDeg <= 0) return 1.0;
+  const progressDeg = x * sweepDeg;
+  const edgeDeg = Math.min(progressDeg, sweepDeg - progressDeg);
+  if (edgeDeg >= rampDeg) return 1.0;
+  const t = edgeDeg / rampDeg;
+  const smooth = t * t * (3 - 2 * t);
+  return 1.0 + (slowFactor - 1.0) * (1.0 - smooth);
+}
+function velocityShape(profile, distance) {
+  if (profile === 'sine') return Math.max(Math.cos(Math.PI / 2 * distance), 0.20);
+  return Math.max(1 - distance, 0.10);   // reciprocal
+}
+function distanceForLeg(sweepType, leg, x) {
+  if (sweepType === 'edge-edge') return Math.abs(2 * x - 1);   // centre at mid-leg
+  return leg === 'fwd' ? (1 - x) : x;                          // edge-center: centre at the leg's far end
+}
+
+// Build one full back-forward-back cycle for a given profile.
+// Returns {t[], v[], pos[], centreT[], revT[]} where t is ms, v is mean-normalised speed,
+// pos is 0..1 along the back(0)->forward(1) axis.
+const N = 400; // samples per leg
+function buildCycle(profile, sweepType, sweepDeg, sweepTimeMs, slowFactor) {
+  const legs = [
+    { name: 'fwd', from: 0, to: 1 },   // back -> forward/target
+    { name: 'ret', from: 1, to: 0 },   // forward/target -> back
+  ];
+  const factor = [], pos = [], legOf = [], xOf = [];
+  for (const leg of legs) {
+    const start = factor.length === 0 ? 0 : 1; // skip duplicate junction point
+    for (let i = start; i <= N; i++) {
+      const x = i / N;
+      const dist = distanceForLeg(sweepType, leg.name, x);
+      const f = rampFactor(x, sweepDeg, slowFactor) / velocityShape(profile, dist);
+      factor.push(f);
+      pos.push(leg.from + (leg.to - leg.from) * x);
+      legOf.push(leg.name);
+      xOf.push(x);
+    }
+  }
+  // cumulative trapezoidal integral of factor over the (continuous, 2-leg-long) cycle
+  const dx = 1 / N;
+  const cum = [0];
+  for (let i = 1; i < factor.length; i++) {
+    cum.push(cum[i - 1] + 0.5 * (factor[i - 1] + factor[i]) * dx);
+  }
+  const total = cum[cum.length - 1];
+  const meanFactor = total / 2; // cycle length = 2 (two legs of length 1)
+
+  const t = cum.map(c => sweepTimeMs * c / total);
+  const v = factor.map(f => meanFactor / f);
+  // signed speed: + while moving back->forward, - while returning forward->back
+  const vSigned = v.map((s, i) => legOf[i] === 'fwd' ? s : -s);
+
+  // acceleration = d(vSigned)/dt, in (relative speed) per second
+  const accel = vSigned.map((_, i) => {
+    const lo = Math.max(0, i - 1), hi = Math.min(vSigned.length - 1, i + 1);
+    return (vSigned[hi] - vSigned[lo]) / (t[hi] - t[lo]) * 1000;
+  });
+
+  // direction-reversal times: start, leg junction, end
+  const revT = [t[0], t[N], t[t.length - 1]];
+
+  // wafer-centre crossing times (distance == 0 within a leg)
+  const centreT = [];
+  for (let i = 1; i < factor.length; i++) {
+    const d0 = distanceForLeg(sweepType, legOf[i - 1], xOf[i - 1]);
+    const d1 = distanceForLeg(sweepType, legOf[i], xOf[i]);
+    if ((d0 > 0 && d1 <= 0) || (d0 === 0)) centreT.push(t[i - 1] + (t[i] - t[i - 1]) * (d0 / (d0 - d1 || 1)));
+  }
+
+  return { t, v, vSigned, accel, pos, revT, centreT };
+}
+
+// ===================== drawing helpers =====================
+function clear(ctx, w, h) { ctx.clearRect(0, 0, w, h); }
+function drawAxes(ctx, m, w, h, xMax, yMin, yMax, xLabel, yLabel, yTickFmt) {
+  ctx.strokeStyle = '#333a47'; ctx.fillStyle = '#8b93a3';
+  ctx.font = '11px "Segoe UI",sans-serif'; ctx.lineWidth = 1;
+  const plotW = w - m.l - m.r, plotH = h - m.t - m.b;
+  // gridlines + y ticks
+  const yTicks = 5;
+  for (let i = 0; i <= yTicks; i++) {
+    const yv = yMin + (yMax - yMin) * i / yTicks;
+    const py = m.t + plotH * (1 - i / yTicks);
+    ctx.beginPath(); ctx.moveTo(m.l, py); ctx.lineTo(w - m.r, py); ctx.stroke();
+    ctx.fillText(yTickFmt(yv), 4, py + 4);
+  }
+  // x ticks
+  const xTicks = 8;
+  for (let i = 0; i <= xTicks; i++) {
+    const xv = xMax * i / xTicks;
+    const px = m.l + plotW * i / xTicks;
+    ctx.fillText(Math.round(xv).toString(), px - 10, h - m.b + 16);
+  }
+  ctx.fillText(xLabel, w / 2 - 30, h - 4);
+  ctx.save(); ctx.translate(12, h / 2 + 30); ctx.rotate(-Math.PI / 2); ctx.fillText(yLabel, 0, 0); ctx.restore();
+}
+function toPx(m, w, h, xMax, yMin, yMax, x, y) {
+  const plotW = w - m.l - m.r, plotH = h - m.t - m.b;
+  return [m.l + plotW * (x / xMax), m.t + plotH * (1 - (y - yMin) / (yMax - yMin))];
+}
+function plotLine(ctx, m, w, h, xMax, yMin, yMax, xs, ys, color) {
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+  for (let i = 0; i < xs.length; i++) {
+    const [px, py] = toPx(m, w, h, xMax, yMin, yMax, xs[i], ys[i]);
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+}
+function vline(ctx, m, w, h, xMax, yMin, yMax, x, color, dash) {
+  const [px0, py0] = toPx(m, w, h, xMax, yMin, yMax, x, yMin);
+  const [px1, py1] = toPx(m, w, h, xMax, yMin, yMax, x, yMax);
+  ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.setLineDash(dash || []);
+  ctx.beginPath(); ctx.moveTo(px0, py0); ctx.lineTo(px1, py1); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// ===================== main render =====================
+const speedCv = document.getElementById('speedChart');
+const posCv = document.getElementById('posChart');
+const accelCv = document.getElementById('accelChart');
+const statsEl = document.getElementById('stats');
+const m1 = { l: 44, r: 14, t: 14, b: 30 };
+const m2 = { l: 44, r: 14, t: 14, b: 30 };
+const m3 = { l: 50, r: 14, t: 14, b: 30 };
+
+function interp(t, ts, vs) {
+  if (t <= ts[0]) return vs[0];
+  if (t >= ts[ts.length - 1]) return vs[vs.length - 1];
+  let lo = 0, hi = ts.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (ts[mid] <= t) lo = mid; else hi = mid; }
+  const f = (t - ts[lo]) / (ts[hi] - ts[lo]);
+  return vs[lo] + (vs[hi] - vs[lo]) * f;
+}
+
+function render() {
+  const sweepType = document.getElementById('sweepType').value;
+  const sweepDeg = +document.getElementById('angle').value;
+  const sweepTimeMs = +document.getElementById('time').value;
+  const slowFactor = document.getElementById('ramp').checked ? SLOW_FACTOR_ON : 1.0;
+
+  const sine = buildCycle('sine', sweepType, sweepDeg, sweepTimeMs, slowFactor);
+  const recip = buildCycle('reciprocal', sweepType, sweepDeg, sweepTimeMs, slowFactor);
+
+  // ---- speed chart (signed: + = forward leg, - = return leg) ----
+  let ctx = speedCv.getContext('2d');
+  const w1 = speedCv.width, h1 = speedCv.height;
+  clear(ctx, w1, h1);
+  const yMax = Math.max(...sine.v, ...recip.v) * 1.05;
+  const yMin = -yMax;
+  drawAxes(ctx, m1, w1, h1, sweepTimeMs, yMin, yMax, 'time (ms)', 'relative speed', v => v.toFixed(1));
+  for (const rt of sine.revT) vline(ctx, m1, w1, h1, sweepTimeMs, yMin, yMax, rt, '#555f73', [5, 4]);
+  for (const ct of [...sine.centreT, ...recip.centreT]) vline(ctx, m1, w1, h1, sweepTimeMs, yMin, yMax, ct, '#3ddc84', [2, 3]);
+  vline(ctx, m1, w1, h1, sweepTimeMs, yMin, yMax, 0, '#555f73', []);
+  plotLine(ctx, m1, w1, h1, sweepTimeMs, yMin, yMax, [0, sweepTimeMs], [0, 0], '#333a47');
+  plotLine(ctx, m1, w1, h1, sweepTimeMs, yMin, yMax, sine.t, sine.vSigned, '#ffb000');
+  plotLine(ctx, m1, w1, h1, sweepTimeMs, yMin, yMax, recip.t, recip.vSigned, '#00c8ff');
+
+  // ---- position chart ----
+  ctx = posCv.getContext('2d');
+  const w2 = posCv.width, h2 = posCv.height;
+  clear(ctx, w2, h2);
+  drawAxes(ctx, m2, w2, h2, sweepTimeMs, 0, 1, 'time (ms)', 'position', v => v.toFixed(1));
+  for (const rt of sine.revT) vline(ctx, m2, w2, h2, sweepTimeMs, 0, 1, rt, '#555f73', [5, 4]);
+  plotLine(ctx, m2, w2, h2, sweepTimeMs, 0, 1, sine.t, sine.pos, '#ffb000');
+  plotLine(ctx, m2, w2, h2, sweepTimeMs, 0, 1, recip.t, recip.pos, '#00c8ff');
+
+  // ---- acceleration chart (d(speed)/dt) ----
+  ctx = accelCv.getContext('2d');
+  const w3 = accelCv.width, h3 = accelCv.height;
+  clear(ctx, w3, h3);
+  const aMax = Math.max(...sine.accel.map(Math.abs), ...recip.accel.map(Math.abs)) * 1.05;
+  const aMin = -aMax;
+  drawAxes(ctx, m3, w3, h3, sweepTimeMs, aMin, aMax, 'time (ms)', 'accel (1/s)', v => v.toFixed(0));
+  for (const rt of sine.revT) vline(ctx, m3, w3, h3, sweepTimeMs, aMin, aMax, rt, '#555f73', [5, 4]);
+  for (const ct of [...sine.centreT, ...recip.centreT]) vline(ctx, m3, w3, h3, sweepTimeMs, aMin, aMax, ct, '#3ddc84', [2, 3]);
+  plotLine(ctx, m3, w3, h3, sweepTimeMs, aMin, aMax, [0, sweepTimeMs], [0, 0], '#333a47');
+  plotLine(ctx, m3, w3, h3, sweepTimeMs, aMin, aMax, sine.t, sine.accel, '#ffb000');
+  plotLine(ctx, m3, w3, h3, sweepTimeMs, aMin, aMax, recip.t, recip.accel, '#00c8ff');
+
+  // ---- closeness stats ----
+  const M = 400;
+  let sumSq = 0, maxDiff = 0, maxDiffT = 0;
+  for (let i = 0; i <= M; i++) {
+    const t = sweepTimeMs * i / M;
+    const vs = interp(t, sine.t, sine.vSigned);
+    const vr = interp(t, recip.t, recip.vSigned);
+    const d = Math.abs(vs - vr);
+    sumSq += d * d;
+    if (d > maxDiff) { maxDiff = d; maxDiffT = t; }
+  }
+  const rms = Math.sqrt(sumSq / (M + 1));
+  const centreLabel = sweepType === 'edge-edge'
+    ? 'mid-sweep'
+    : 'the centre-side reversal';
+  statsEl.innerHTML =
+    `<b>RMS difference:</b> ${(rms * 100).toFixed(1)}% of mean speed &nbsp;|&nbsp; ` +
+    `<b>Largest difference:</b> ${(maxDiff * 100).toFixed(1)}% at t&approx;${Math.round(maxDiffT)} ms ` +
+    `(${maxDiffT < sweepTimeMs * 0.1 || maxDiffT > sweepTimeMs * 0.9 ? 'near a direction reversal' :
+        Math.abs(maxDiffT - sweepTimeMs / 2) < sweepTimeMs * 0.1 ? `near ${centreLabel}` : 'mid-leg'})<br>` +
+    `Reciprocal's speed range is wider (10%&ndash;100% of centre speed, vs Sine's 20%&ndash;100%), so it runs ` +
+    `noticeably faster through the centre and slower at the edges than Sine for the same cycle time &mdash; ` +
+    `the two shapes are similar but not close; Reciprocal is the more aggressive taper.`;
+}
+
+['sweepType', 'angle', 'time', 'ramp'].forEach(id => {
+  document.getElementById(id).addEventListener('input', () => {
+    document.getElementById('angleLbl').textContent = document.getElementById('angle').value + '°';
+    document.getElementById('timeLbl').textContent = document.getElementById('time').value + ' ms';
+    render();
+  });
+});
+render();
+</script>
+</body>
+</html>
