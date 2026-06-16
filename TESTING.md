@@ -5,7 +5,7 @@
 ### Step 1: Build Verification
 
 ```bash
-cd Megasonic
+cd Stepper-controller
 pio run
 ```
 

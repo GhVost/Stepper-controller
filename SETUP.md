@@ -62,7 +62,7 @@ pio run --target clean           # Clean build artefacts
 ## Project Structure
 
 ```
-Megasonic/
+Stepper-controller/
 ├── platformio.ini          # PlatformIO project config & library deps
 ├── src/
 │   └── main.cpp            # All firmware (~2050 lines)

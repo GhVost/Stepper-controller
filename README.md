@@ -216,6 +216,9 @@ The ultrasonic generator is energised **only while the arm tip is over the wafer
 - **Adafruit GFX Library** – graphics primitives
 - **Adafruit ST7735/ST7789** – LCD driver (`Adafruit_ST7789`)
 
+These libraries are declared in [`platformio.ini`](platformio.ini) so PlatformIO can
+resolve them automatically during `pio pkg install` / `pio run`.
+
 ## Development Status
 
 ### ✅ Implemented

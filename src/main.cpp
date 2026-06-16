@@ -195,6 +195,8 @@ int           oscillationDir      = -1;
 int           oscillationStepCount = 0;
 
 unsigned long lastMotorStepMicros = 0;
+volatile int   setupCenterTargetSteps = 0;
+volatile unsigned long setupCenterLastChangeMillis = 0;
 bool          sweepTimingActive = false;
 int           sweepTimingStartSteps = 0;
 int           sweepTimingTargetSteps = 0;
@@ -232,6 +234,8 @@ bool encoderDiagEnabled = false;
 // normally 1ms is plenty since mechanical detents are far slower than that.
 unsigned long encoderReadIntervalMs = 1;
 const unsigned long MOTOR_UPDATE_INTERVAL_US = 500;
+const unsigned long SETUP_CENTER_UPDATE_INTERVAL_US = 50;
+const unsigned long SETUP_CENTER_FOLLOW_DELAY_MS = 150;
 const unsigned long MIN_SWEEP_STEP_INTERVAL_US = 100;
 const unsigned long ENCODER_STEP_MIN_INTERVAL = 5;
 const unsigned long ENCODER_BUTTON_DEBOUNCE = 120;
@@ -327,6 +331,7 @@ int degX10ToSteps(int degX10);
 int stepsToDegX10(int steps);
 void printDegX10(int degX10);
 int encoderAcceleration(unsigned long intervalMs);
+int setupCenterAcceleration(unsigned long intervalMs);
 void readSensors();
 void readEncoder();
 void updateStateMachine();
@@ -922,6 +927,9 @@ void readEncoder() {
             int d = pendingDetents > 0 ? 1 : -1;
             int steps = abs(pendingDetents);
             int accel = encoderAcceleration(stepInterval);
+            if (displayMode == DISP_SETUP && editingSetup && setupIndex == 1) {
+                accel = setupCenterAcceleration(stepInterval);
+            }
             int editDelta = d * steps * accel;
             if (encoderDiagEnabled) {
                 Serial.printf("ENC step: pending=%d interval=%lums accel=%d editDelta=%d\n",
@@ -1165,6 +1173,17 @@ void handleState() {
         motorSetEnable(true);
         setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
         setFan(FAN_OFF); setUltrasonic(false);
+        if (millis() - setupCenterLastChangeMillis < SETUP_CENTER_FOLLOW_DELAY_MS) {
+            return;
+        }
+        for (int i = 0;
+             i < 4 &&
+             stepNow - lastMotorStepMicros >= SETUP_CENTER_UPDATE_INTERVAL_US &&
+             motorPosition != setupCenterTargetSteps;
+             i++) {
+            motorMoveTo(setupCenterTargetSteps);
+            lastMotorStepMicros += SETUP_CENTER_UPDATE_INTERVAL_US;
+        }
         return;
     }
 
@@ -1268,6 +1287,8 @@ void handleMenuSelect() {
         else {
             if (setupIndex == 1) {
                 CENTER_DEG_X10 = constrain(stepsToDegX10(motorPosition), 10, 1800);
+                setupCenterTargetSteps = motorPosition;
+                setupCenterLastChangeMillis = millis();
                 setupNeedsRedraw = true;
                 Serial.printf("Setup: Centre live jog starts at %.1f deg\n", CENTER_DEG_X10 * 0.1f);
             }
@@ -1372,7 +1393,8 @@ void adjustSetupValue(int delta) {
         case 0: PARK_DEG_X10 = constrain(PARK_DEG_X10 + delta, 10, 1800); break;
         case 1:
             CENTER_DEG_X10 = constrain(CENTER_DEG_X10 + delta, 10, 1800);
-            motorMoveToBlocking(degX10ToSteps(CENTER_DEG_X10), MOTOR_UPDATE_INTERVAL_US);
+            setupCenterTargetSteps = degX10ToSteps(CENTER_DEG_X10);
+            setupCenterLastChangeMillis = millis();
             break;
         case 2: ARM_LENGTH_MM = constrain(ARM_LENGTH_MM + delta * 5, 50, 1000); break;
         case 3: OSCILLATION_CYCLES = (unsigned long)constrain(
@@ -1703,13 +1725,23 @@ void printDegX10(int degX10) {
 }
 
 int encoderAcceleration(unsigned long intervalMs) {
-    // A gentle, wide gradient: even a "quick" turn in the 150-400ms/detent range (about
-    // as fast as this encoder's detents register in practice) gets a small boost, while
-    // a slow, deliberate single click stays at 1x for 0.1 precision. The top end is
-    // intentionally modest (4x, not 10x+) so fast spins feel controllable.
-    if (intervalMs <= 15)  return 8;
-    if (intervalMs <= 50)  return 4;
-    if (intervalMs <= 150) return 2;
+    // More responsive scaling for setup edits: fast turns should jump noticeably,
+    // while slow clicks still keep 1x precision.
+    if (intervalMs <= 12)  return 16;
+    if (intervalMs <= 30)  return 8;
+    if (intervalMs <= 75)  return 4;
+    if (intervalMs <= 180) return 2;
+    return 1;
+}
+
+int setupCenterAcceleration(unsigned long intervalMs) {
+    // Even more aggressive scaling just for the live centre adjustment so a fast
+    // twist produces visibly larger position jumps.
+    if (intervalMs <= 10)  return 32;
+    if (intervalMs <= 20)  return 16;
+    if (intervalMs <= 45)  return 8;
+    if (intervalMs <= 90)  return 4;
+    if (intervalMs <= 180) return 2;
     return 1;
 }
 
