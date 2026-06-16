@@ -443,8 +443,8 @@ void initHardware() {
     digitalWrite(TMC_CS, HIGH);
 
     pinMode(LIMIT_SWITCH, INPUT_PULLUP);
-    pinMode(SPRAY_VALVE,  INPUT_PULLDOWN);
-    pinMode(FLOW_SENSOR,  INPUT_PULLDOWN);
+    pinMode(SPRAY_VALVE,  INPUT_PULLUP);
+    pinMode(FLOW_SENSOR,  INPUT_PULLUP);
 
     pinMode(LED_GREEN,  OUTPUT);
     pinMode(LED_YELLOW, OUTPUT);
@@ -846,8 +846,8 @@ void readSensors() {
     static unsigned long lastFlowChange  = 0;
     unsigned long now = millis();
 
-    bool sprayRaw = (digitalRead(SPRAY_VALVE) == HIGH);
-    bool flowRaw  = (digitalRead(FLOW_SENSOR) == HIGH);
+    bool sprayRaw = (digitalRead(SPRAY_VALVE) == LOW);   // open-collector opto: active = LOW
+    bool flowRaw  = (digitalRead(FLOW_SENSOR) == LOW);
 
     if (sprayRaw != lastSprayRaw) {
         lastSprayRaw = sprayRaw;
