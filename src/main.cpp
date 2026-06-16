@@ -75,10 +75,8 @@ unsigned long lastStateChange = 0;
 
 // When true: after reaching limit switch go IDLE instead of PARKED (abort path)
 volatile bool homingToStop = false;
-
-// Home search safety: abort if the endstop is not found within this much arm travel.
-const int HOMING_MAX_DEG_X10 = 700;     // 70.0 degrees of real arm motion
-volatile int homingStartPos  = 0;       // motorPosition captured when homing begins
+unsigned long homingStartMillis = 0;
+volatile bool homingTimeoutLatched = false;
 
 // Position is unknown (motor was disabled / never homed): re-home before a run.
 // Set whenever the motor is de-energised; cleared once homing reaches the limit.
@@ -90,12 +88,13 @@ volatile bool faultLatched  = false;
 
 // ============= MOTION PARAMETERS =============
 const int FULL_STEPS_PER_REV = 200;  // typical 1.8 degree NEMA17 motor
-int PARK_DEG_X10       = 70;
-int CENTER_DEG_X10     = 260;
+int PARK_DEG_X10       = 50;
+int CENTER_DEG_X10     = 700;
 int ARM_LENGTH_MM      = 250;
 unsigned long SWEEP_TIME_MS = 4000;
 unsigned long OSCILLATION_CYCLES = 4;
 const unsigned long SPRAY_ACTIVE_WAIT = 2000;
+const unsigned long HOMING_TIMEOUT_MS = 10000;
 bool SENSOR_INPUTS_ENABLED = false;  // false = bypass/debug safety inputs (toggle in Setup)
 
 // ============= SETTINGS (sweep params) =============
@@ -130,7 +129,7 @@ const double MOTION_JERK_MAX_DEG_S3  = 20000.0;
 const double MOTION_JERK_STEP_DEG_S3 = 200.0;
 
 // ============= SETUP (hardware/driver params) =============
-int driverCurrent    = 600;
+int driverCurrent    = 800;
 int driverMicrosteps = 256;
 bool motorDirectionInverted = false;
 const float DRIVER_RUN_HOLD_MULTIPLIER = 0.25f;
@@ -141,7 +140,7 @@ const int MICROSTEP_TABLE[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 const int MICROSTEP_COUNT   = 9;
 
 const uint32_t SETTINGS_MAGIC = 0x4D534743UL;  // "MSGC"
-const uint16_t SETTINGS_VERSION = 7;
+const uint16_t SETTINGS_VERSION = 10;
 const size_t EEPROM_BYTES = 4096;
 
 // Auto-save: every Setup/Settings change is persisted, but writes are debounced so a
@@ -233,7 +232,7 @@ bool encoderDiagEnabled = false;
 // Tunable from the serial debug console ('[' / ']') while diagnosing encoder issues;
 // normally 1ms is plenty since mechanical detents are far slower than that.
 unsigned long encoderReadIntervalMs = 1;
-const unsigned long MOTOR_UPDATE_INTERVAL_US = 500;
+const unsigned long MOTOR_UPDATE_INTERVAL_US = 450;
 const unsigned long SETUP_CENTER_UPDATE_INTERVAL_US = 50;
 const unsigned long SETUP_CENTER_FOLLOW_DELAY_MS = 150;
 const unsigned long MIN_SWEEP_STEP_INTERVAL_US = 100;
@@ -543,7 +542,7 @@ void loadSettings() {
     EEPROM.get(0, stored);
 
     bool validMagic = stored.magic == SETTINGS_MAGIC;
-    bool validVersion = stored.version > 0 && stored.version <= SETTINGS_VERSION;
+    bool validVersion = stored.version == SETTINGS_VERSION;
     bool validSize = stored.size == sizeof(StoredSettings);
     bool validChecksum = stored.checksum == settingsChecksum(stored);
     bool validMicrosteps = isValidMicrostep(stored.driverMicrosteps);
@@ -1050,25 +1049,26 @@ void updateStateMachine() {
                 currentState = STATE_ERROR; lastStateChange = now;
                 Serial.println("→ ERROR (driver fault)");
             } else if (SENSOR_INPUTS_ENABLED && sprayActive) {
-                homingStartPos = motorPosition;
+                homingStartMillis = now;
+                homingTimeoutLatched = false;
                 currentState = STATE_HOMING; lastStateChange = now;
                 Serial.println("→ HOMING");
             }
             break;
 
         case STATE_HOMING:
-            // Safety: endstop must be found within HOMING_MAX_DEG_X10 of real travel.
-            if (!limitSwitchPressed &&
-                (homingStartPos - motorPosition) >= degX10ToSteps(HOMING_MAX_DEG_X10)) {
+            if (millis() - homingStartMillis > HOMING_TIMEOUT_MS) {
                 motorSetEnable(false);
                 needsHoming = true;
+                homingTimeoutLatched = true;
                 currentState = STATE_ERROR; lastStateChange = now;
-                Serial.println("→ ERROR (home endstop not found within 70°)");
+                Serial.println("→ ERROR (homing timeout)");
                 break;
             }
             if (limitSwitchPressed) {
                 motorPosition = 0;
                 needsHoming = false;                    // position re-established
+                homingTimeoutLatched = false;
                 if (faultLatched) {
                     needsHoming = true;
                     motorSetEnable(false);
@@ -1286,8 +1286,7 @@ void handleMenuSelect() {
         if (editingSetup) { editingSetup = false; saveSettings(); }
         else {
             if (setupIndex == 1) {
-                CENTER_DEG_X10 = constrain(stepsToDegX10(motorPosition), 10, 1800);
-                setupCenterTargetSteps = motorPosition;
+                setupCenterTargetSteps = degX10ToSteps(CENTER_DEG_X10);
                 setupCenterLastChangeMillis = millis();
                 setupNeedsRedraw = true;
                 Serial.printf("Setup: Centre live jog starts at %.1f deg\n", CENTER_DEG_X10 * 0.1f);
@@ -1307,7 +1306,8 @@ void handleMenuSelect() {
                 // START: always home first to re-establish position, then park + run.
                 faultLatched = false; stopRequested = false; homingToStop = false;
                 sensorBypassCycleArmed = !SENSOR_INPUTS_ENABLED;
-                homingStartPos = motorPosition;
+                homingTimeoutLatched = false;
+                homingStartMillis = millis();
                 currentState = STATE_HOMING; lastStateChange = millis();
                 Serial.println("Menu: START → HOMING");
             } else if (currentState == STATE_PARKED && !needsHoming) {
