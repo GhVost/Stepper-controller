@@ -697,14 +697,14 @@ double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
         int maxDist = max(abs(sweepBackSteps() - cSteps), abs(sweepForwardSteps() - cSteps));
         if (maxDist > 0) {
             double dist = constrain((double)abs(currentSteps - cSteps) / (double)maxDist, 0.0, 1.0);
-            vShape = max(cos(PI / 2.0 * dist), 0.20);
+            vShape = max(cos(PI / 2.0 * dist), 0.02);
         }
     } else if (sweepProfile == SWEEP_PROFILE_INVDIST) {
         int cSteps  = degX10ToSteps(CENTER_DEG_X10);
         int maxDist = max(abs(sweepBackSteps() - cSteps), abs(sweepForwardSteps() - cSteps));
         if (maxDist > 0) {
             double dist = constrain((double)abs(currentSteps - cSteps) / (double)maxDist, 0.0, 1.0);
-            vShape = max(1.0 - dist, 0.10);
+            vShape = max(1.0 - dist, 0.02);
         }
     }
 

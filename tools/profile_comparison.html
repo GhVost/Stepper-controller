@@ -125,8 +125,8 @@ function sCurveV(distDeg, a, j) {
 }
 
 function velocityShape(profile, distance) {
-  if (profile === 'sine') return Math.max(Math.cos(Math.PI / 2 * distance), 0.20);
-  return Math.max(1 - distance, 0.10);   // reciprocal
+  if (profile === 'sine') return Math.max(Math.cos(Math.PI / 2 * distance), 0.02);
+  return Math.max(1 - distance, 0.02);   // reciprocal
 }
 function distanceForLeg(sweepType, leg, x) {
   if (sweepType === 'edge-edge') return Math.abs(2 * x - 1);   // centre at mid-leg
