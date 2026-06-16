@@ -710,10 +710,8 @@ double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
 
     // S-curve ramp: velocity is limited by what is physically achievable from/to a stop
     double vRamp = min(sCurveVelocity(fromStartDeg), sCurveVelocity(fromEndDeg));
-    // Smooth minimum (quadratic blend, w=0.05) — keeps velocity differentiable at the
-    // S-curve / profile-shape crossover so acceleration ramps linearly rather than spiking.
-    double a = vShape, b = vRamp / sweepVelocityPeakDegS, dv = a - b;
-    double vNorm = 0.5 * (a + b - sqrt(dv * dv + 0.0025));
+    // Normalised velocity (fraction of peak cruise speed)
+    double vNorm = min(vShape, vRamp / sweepVelocityPeakDegS);
     return 1.0 / max(vNorm, 1e-9);
 }
 

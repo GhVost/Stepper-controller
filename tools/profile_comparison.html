@@ -133,15 +133,8 @@ function distanceForLeg(sweepType, leg, x) {
   return leg === 'fwd' ? (1 - x) : x;                          // edge-center: centre at the leg's far end
 }
 
-// Smooth minimum: quadratic blend within ±w of the crossover — makes velocity
-// differentiable at the S-curve / profile-shape handover so acceleration ramps
-// linearly instead of jumping.
-function smoothMin(a, b, w) {
-  const d = a - b;
-  return 0.5 * (a + b - Math.sqrt(d * d + w * w));
-}
-
 // Sample one full back-forward-back cycle at a given vPeak.
+// factor[i] = 1 / min(vShape, sCurveV(fromStart)/vPeak, sCurveV(fromEnd)/vPeak)
 const N = 400;
 function sampleCycle(profile, sweepType, sweepDeg, accelDegS2, jerkDegS3, vPeak) {
   const legs = [
@@ -161,7 +154,7 @@ function sampleCycle(profile, sweepType, sweepDeg, accelDegS2, jerkDegS3, vPeak)
       const vShape = velocityShape(profile, dist);
       const vRamp  = Math.min(sCurveV(fromStartDeg, accelDegS2, jerkDegS3),
                                sCurveV(fromEndDeg,   accelDegS2, jerkDegS3));
-      const vNorm  = smoothMin(vShape, vRamp / vPeak, 0.05);
+      const vNorm  = Math.min(vShape, vRamp / vPeak);
       factor.push(1 / Math.max(vNorm, 1e-9));
       pos.push(leg.from + (leg.to - leg.from) * x);
       legOf.push(leg.name);
