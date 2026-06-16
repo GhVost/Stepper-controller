@@ -113,16 +113,13 @@ const int SWEEP_PATH_BACK_FRONT  = 1;
 const int SWEEP_PROFILE_LINEAR   = 0;
 const int SWEEP_PROFILE_HARMONIC = 1;
 const int SWEEP_PROFILE_INVDIST  = 2;
-const double SWEEP_ENDPOINT_SLOW_FACTOR = 3.0;
-
-// Endpoint ramp: the width (in degrees) over which the arm decelerates to a stop at
-// each reversal is derived from motionAccelDegS2 and the sweep's actual peak speed
-// (see beginSweepLegTiming). motionJerkDegS3 blends the ramp's smoothstep shape
-// between a sharper cubic (high jerk) and a smoother quintic "smootherstep" (low jerk).
-double motionAccelDegS2 = 100.0;   // deg/s^2, endpoint deceleration
-double motionJerkDegS3  = 4000.0;  // deg/s^3, endpoint ramp shape
-const double JERK_BLEND_LOW_DEG_S3  = 1000.0;   // at/below: fully quintic (smoothest)
-const double JERK_BLEND_HIGH_DEG_S3 = 8000.0;   // at/above: fully cubic (sharpest)
+// Endpoint ramp: at each direction reversal the arm decelerates to a stop and
+// re-accelerates using a 7-phase S-curve profile (see sCurveVelocity).
+// motionAccelDegS2 caps the acceleration / deceleration (deg/s^2).
+// motionJerkDegS3  limits the rate of change of acceleration (deg/s^3);
+// lower jerk → gentler onset/exit, higher jerk → snappier transitions.
+double motionAccelDegS2 = 100.0;   // deg/s^2
+double motionJerkDegS3  = 4000.0;  // deg/s^3
 const double MOTION_ACCEL_MIN_DEG_S2  = 1.0;
 const double MOTION_ACCEL_MAX_DEG_S2  = 2000.0;
 const double MOTION_ACCEL_STEP_DEG_S2 = 10.0;
@@ -204,7 +201,7 @@ int           sweepTimingTargetSteps = 0;
 unsigned long sweepTimingStartMicros = 0;
 double        sweepTimingCompletedFactorSum = 0.0;
 double        sweepTimingBaseUs = 1.0;
-int           activeRampSteps = 0;  // endpoint ramp width for the current leg, set by beginSweepLegTiming
+double        sweepVelocityPeakDegS = 1.0; // cruise peak speed for the active leg (deg/s), set by beginSweepLegTiming
 unsigned long lastEncoderRead = 0;
 volatile bool    encoderButtonEdgePending = false;
 volatile bool    encoderButtonRawState = HIGH;
@@ -320,10 +317,9 @@ int sweepLeftSteps();
 int sweepRightSteps();
 int sweepBackSteps();
 int sweepForwardSteps();
-double sweepEndpointRampFactor(int currentSteps, int startSteps, int targetSteps, int rampSteps);
-double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps, int rampSteps);
-double sweepLegFactorSum(int startSteps, int targetSteps, int rampSteps);
-int computeRampSteps(double baseUsNoRamp);
+double sCurveVelocity(double distDeg);
+double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps);
+double sweepLegFactorSum(int startSteps, int targetSteps);
 unsigned long minimumSweepTimeMs();
 bool enforceMinimumSweepTime(bool persist);
 void resetSweepTiming();
@@ -665,125 +661,104 @@ int sweepForwardSteps() {
     return sweepType == SWEEP_PATH_BACK_CENTER ? degX10ToSteps(CENTER_DEG_X10) : sweepRightSteps();
 }
 
-double sweepEndpointRampFactor(int currentSteps, int startSteps, int targetSteps, int rampSteps) {
-    int sweepSteps = abs(targetSteps - startSteps);
-    if (sweepSteps <= 0 || rampSteps <= 0) return 1.0;
+// Maximum velocity achievable from rest in distDeg, or decelerating to rest over distDeg,
+// using the 7-phase S-curve defined by motionAccelDegS2 (peak accel) and motionJerkDegS3
+// (rate of change of acceleration):
+//   Phase 1/7 (jerk): acceleration ramps linearly 0 → a_max (or a_max → 0)
+//   Phase 2/6 (accel): constant acceleration at a_max
+double sCurveVelocity(double distDeg) {
+    if (distDeg <= 0.0) return 0.0;
+    double a = motionAccelDegS2, j = motionJerkDegS3;
+    // Phase-1 endpoint: d1 = distance covered while accel ramps 0→a_max; v1 = velocity there
+    double d1 = (a * a * a) / (6.0 * j * j);
+    double v1 = (a * a) / (2.0 * j);
+    if (distDeg <= d1) {
+        // Jerk-limited (still in phase 1): v^3 = 4.5 * j * d^2
+        return cbrt(4.5 * j * distDeg * distDeg);
+    }
+    // Accel-limited (phase 2 onward, constant a from v1):
+    return sqrt(v1 * v1 + 2.0 * a * (distDeg - d1));
+}
 
-    rampSteps = min(rampSteps, max(1, sweepSteps / 2));
+double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
+    int sweepSteps = abs(targetSteps - startSteps);
+    if (sweepSteps <= 0) return 1.0;
+
+    double dps = 360.0 / (double)(FULL_STEPS_PER_REV * driverMicrosteps);
     int progressSteps = abs(currentSteps - startSteps);
-    int edgeDistance = min(progressSteps, max(0, sweepSteps - progressSteps));
-    if (edgeDistance >= rampSteps) return 1.0;
+    // Evaluate at the midpoint of this step so the endpoint distance is never zero
+    double fromStartDeg = (progressSteps + 0.5) * dps;
+    double fromEndDeg   = (sweepSteps - progressSteps - 0.5) * dps;
 
-    double x = (double)edgeDistance / (double)rampSteps;
-    double smoothCubic = x * x * (3.0 - 2.0 * x);                          // C1, sharper
-    double smoothQuintic = x * x * x * (x * (x * 6.0 - 15.0) + 10.0);      // C2, smoother
-    double jerkBlend = constrain(
-        (motionJerkDegS3 - JERK_BLEND_LOW_DEG_S3) / (JERK_BLEND_HIGH_DEG_S3 - JERK_BLEND_LOW_DEG_S3),
-        0.0, 1.0);
-    double smooth = jerkBlend * smoothCubic + (1.0 - jerkBlend) * smoothQuintic;
-    return 1.0 + (SWEEP_ENDPOINT_SLOW_FACTOR - 1.0) * (1.0 - smooth);
-}
-
-double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps, int rampSteps) {
-    int sweepSteps = abs(targetSteps - startSteps);
-    if (sweepSteps <= 0) return 1.0f;
-
+    // Velocity profile shape: 1.0 = full cruise speed, lower = slower
+    double vShape = 1.0;
     if (sweepProfile == SWEEP_PROFILE_HARMONIC) {
-        // Sine: speed is highest at the wafer centre and falls off toward the edge,
-        // following a sine curve (gentler than Reciprocal's 1/distance falloff).
-        // Keyed off |position - centre|, so it behaves the same for either sweep type.
-        int centerSteps = degX10ToSteps(CENTER_DEG_X10);
-        int maxDistance = max(abs(sweepBackSteps() - centerSteps), abs(sweepForwardSteps() - centerSteps));
-        if (maxDistance > 0) {
-            double distance = (double)abs(currentSteps - centerSteps) / (double)maxDistance;  // 0 centre … 1 edge
-            if (distance > 1.0) distance = 1.0;
-            double velocity = cos(PI / 2.0 * distance);  // 1 at centre … 0 at edge
-            if (velocity < 0.20) velocity = 0.20;
-            return (1.0 / velocity) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps, rampSteps);
+        int cSteps  = degX10ToSteps(CENTER_DEG_X10);
+        int maxDist = max(abs(sweepBackSteps() - cSteps), abs(sweepForwardSteps() - cSteps));
+        if (maxDist > 0) {
+            double dist = constrain((double)abs(currentSteps - cSteps) / (double)maxDist, 0.0, 1.0);
+            vShape = max(cos(PI / 2.0 * dist), 0.20);
+        }
+    } else if (sweepProfile == SWEEP_PROFILE_INVDIST) {
+        int cSteps  = degX10ToSteps(CENTER_DEG_X10);
+        int maxDist = max(abs(sweepBackSteps() - cSteps), abs(sweepForwardSteps() - cSteps));
+        if (maxDist > 0) {
+            double dist = constrain((double)abs(currentSteps - cSteps) / (double)maxDist, 0.0, 1.0);
+            vShape = max(1.0 - dist, 0.10);
         }
     }
 
-    if (sweepProfile == SWEEP_PROFILE_INVDIST) {
-        // Reciprocal: speed is highest at the wafer centre and falls off toward the edge,
-        // proportional to distance from the centre, so the step interval (dwell time)
-        // is the reciprocal of the remaining distance to the edge, growing toward it.
-        // This keeps dwell-time/area roughly constant as the wafer spins underneath:
-        // a point at radius r sweeps past the arm at a rate ∝ r, so the arm must
-        // linger longer at larger r to deposit the same dose per unit area.
-        // Keyed off |position − centre|, so it behaves the same for either sweep type.
-        int centerSteps = degX10ToSteps(CENTER_DEG_X10);
-        int maxDistance = max(abs(sweepBackSteps() - centerSteps), abs(sweepForwardSteps() - centerSteps));
-        if (maxDistance > 0) {
-            double distance = (double)abs(currentSteps - centerSteps) / (double)maxDistance;  // 0 centre … 1 edge
-            if (distance > 1.0) distance = 1.0;
-            double edgeDistance = 1.0 - distance;     // 1 centre … 0 edge
-            if (edgeDistance < 0.10) edgeDistance = 0.10;   // clamp so the arm still moves at the edge
-            return (1.0 / edgeDistance) * sweepEndpointRampFactor(currentSteps, startSteps, targetSteps, rampSteps);
-        }
-    }
-
-    return sweepEndpointRampFactor(currentSteps, startSteps, targetSteps, rampSteps);
+    // S-curve ramp: velocity is limited by what is physically achievable from/to a stop
+    double vRamp = min(sCurveVelocity(fromStartDeg), sCurveVelocity(fromEndDeg));
+    // Normalised velocity (fraction of peak cruise speed)
+    double vNorm = min(vShape, vRamp / sweepVelocityPeakDegS);
+    return 1.0 / max(vNorm, 1e-9);
 }
 
-double sweepLegFactorSum(int startSteps, int targetSteps, int rampSteps) {
+// Sum of per-step factors over a leg, using a fixed sample grid for efficiency.
+// The result is scaled back to represent the full step count so that
+//   sweepTimingBaseUs * sweepLegFactorSum ≈ leg travel time in µs.
+double sweepLegFactorSum(int startSteps, int targetSteps) {
     int sweepSteps = abs(targetSteps - startSteps);
-    if (sweepSteps <= 0) return 1.0f;
-
-    int direction = targetSteps > startSteps ? 1 : -1;
+    if (sweepSteps <= 0) return 1.0;
+    int dir = (targetSteps > startSteps) ? 1 : -1;
+    const int N = min(sweepSteps, 200);
     double sum = 0.0;
-    for (int i = 0; i < sweepSteps; i++) {
-        sum += sweepProfileFactor(startSteps + i * direction, startSteps, targetSteps, rampSteps);
+    for (int i = 0; i < N; i++) {
+        // Sample at the midpoint of each sub-interval
+        int pos = startSteps + (int)(((double)i + 0.5) * sweepSteps / N + 0.5) * dir;
+        pos = constrain(pos, min(startSteps, targetSteps), max(startSteps, targetSteps));
+        sum += sweepProfileFactor(pos, startSteps, targetSteps);
     }
-    return sum > 1.0 ? sum : 1.0;
-}
-
-// Steps over which the arm decelerates from the leg's peak speed to a stop, given the
-// no-ramp baseline dwell time at the peak-speed point (the centre, where factor == 1).
-int computeRampSteps(double baseUsNoRamp) {
-    if (baseUsNoRamp <= 0.0 || motionAccelDegS2 <= 0.0) return 0;
-
-    double stepsPerDeg = (double)(FULL_STEPS_PER_REV * driverMicrosteps) / 360.0;
-    if (stepsPerDeg <= 0.0) return 0;
-
-    double degreesPerStep = 1.0 / stepsPerDeg;
-    double peakSpeedDegS = degreesPerStep * 1.0e6 / baseUsNoRamp;
-    double rampDeg = (peakSpeedDegS * peakSpeedDegS) / (2.0 * motionAccelDegS2);
-    return max(0, (int)(rampDeg * stepsPerDeg + 0.5));
+    return max(sum * (double)sweepSteps / N, 1.0);
 }
 
 unsigned long minimumSweepTimeMs() {
     int backSteps = sweepBackSteps();
-    int forwardSteps = sweepForwardSteps();
-    if (backSteps == forwardSteps) return 500UL;
+    int fwdSteps  = sweepForwardSteps();
+    if (backSteps == fwdSteps) return 500UL;
 
-    // Use rampSteps=0 here: the real ramp width depends on SWEEP_TIME_MS (via the peak
-    // speed), which this function exists to bound, so a no-ramp estimate avoids the
-    // circularity. The ramp only shortens the fastest-step factor sum slightly, so this
-    // remains a safe (slightly conservative) minimum.
-    double forwardSum = sweepLegFactorSum(backSteps, forwardSteps, 0);
-    double returnSum = sweepLegFactorSum(forwardSteps, backSteps, 0);
-    double fullCycleFactorSum = forwardSum + returnSum;
-    double minFactor = 1.0;   // smallest profile factor (fastest step) is ~1.0 for every profile
+    // Minimum time = cycle time when running at the maximum step rate, fully S-curve constrained.
+    double dps  = 360.0 / (double)(FULL_STEPS_PER_REV * driverMicrosteps);
+    double vMax = dps * 1.0e6 / (double)MIN_SWEEP_STEP_INTERVAL_US;
 
-    double minTimeMs =
-        (fullCycleFactorSum * (double)MIN_SWEEP_STEP_INTERVAL_US / minFactor) / 1000.0;
-    unsigned long roundedMs = (unsigned long)(minTimeMs + 0.999);
-    return constrain(roundedMs, 500UL, 60000UL);
+    double savedPeak = sweepVelocityPeakDegS;
+    sweepVelocityPeakDegS = vMax;
+    double fSum = sweepLegFactorSum(backSteps, fwdSteps) + sweepLegFactorSum(fwdSteps, backSteps);
+    sweepVelocityPeakDegS = savedPeak;
+
+    double minUs = (dps * 1.0e6 / vMax) * fSum;
+    return constrain((unsigned long)(minUs / 1000.0 + 0.999), 500UL, 60000UL);
 }
 
 bool enforceMinimumSweepTime(bool persist) {
     unsigned long minimumMs = minimumSweepTimeMs();
     if (SWEEP_TIME_MS >= minimumMs) return false;
-
     SWEEP_TIME_MS = minimumMs;
     Serial.printf("Settings: Time raised to %.3fs minimum for this sweep/profile\n",
                   SWEEP_TIME_MS / 1000.0f);
     resetSweepTiming();
-    if (persist) {
-        saveSettings();
-    } else {
-        markSettingsDirty();
-    }
+    if (persist) saveSettings(); else markSettingsDirty();
     return true;
 }
 
@@ -793,27 +768,30 @@ void resetSweepTiming() {
 
 static void beginSweepLegTiming(unsigned long nowUs, int startSteps, int targetSteps) {
     int backSteps = sweepBackSteps();
-    int forwardSteps = sweepForwardSteps();
+    int fwdSteps  = sweepForwardSteps();
+    double dps    = 360.0 / (double)(FULL_STEPS_PER_REV * driverMicrosteps);
 
-    // Pass 1: no-ramp baseline, to estimate the leg's peak speed (at the centre, where
-    // the profile factor is at its minimum of 1.0).
-    double fullCycleFactorSumNoRamp = sweepLegFactorSum(backSteps, forwardSteps, 0) +
-                                       sweepLegFactorSum(forwardSteps, backSteps, 0);
-    if (fullCycleFactorSumNoRamp < 1.0) fullCycleFactorSumNoRamp = 1.0;
-    double baseUsNoRamp = ((double)SWEEP_TIME_MS * 1000.0) / fullCycleFactorSumNoRamp;
-    activeRampSteps = computeRampSteps(baseUsNoRamp);
+    // Binary search for sweepVelocityPeakDegS such that the total cycle time = SWEEP_TIME_MS.
+    // Invariant: T(vLo) > target, T(vHi) <= target.
+    double vMax = dps * 1.0e6 / (double)MIN_SWEEP_STEP_INTERVAL_US;
+    double vLo = 1e-3, vHi = vMax;
+    const double targetUs = (double)SWEEP_TIME_MS * 1000.0;
 
-    // Pass 2: real timing with the accel-derived ramp applied.
-    double fullCycleFactorSum = sweepLegFactorSum(backSteps, forwardSteps, activeRampSteps) +
-                                sweepLegFactorSum(forwardSteps, backSteps, activeRampSteps);
-    if (fullCycleFactorSum < 1.0) fullCycleFactorSum = 1.0;
+    for (int iter = 0; iter < 16; iter++) {
+        double vMid = (vLo + vHi) * 0.5;
+        sweepVelocityPeakDegS = vMid;
+        double fSum = sweepLegFactorSum(backSteps, fwdSteps) + sweepLegFactorSum(fwdSteps, backSteps);
+        double tUs  = (dps * 1.0e6 / vMid) * fSum;
+        if (tUs > targetUs) vLo = vMid; else vHi = vMid;
+    }
+    sweepVelocityPeakDegS  = (vLo + vHi) * 0.5;
+    sweepTimingBaseUs       = dps * 1.0e6 / sweepVelocityPeakDegS;
 
-    sweepTimingActive = true;
-    sweepTimingStartSteps = startSteps;
-    sweepTimingTargetSteps = targetSteps;
-    sweepTimingStartMicros = nowUs;
-    sweepTimingCompletedFactorSum = 0.0;
-    sweepTimingBaseUs = ((double)SWEEP_TIME_MS * 1000.0) / fullCycleFactorSum;
+    sweepTimingActive             = true;
+    sweepTimingStartSteps         = startSteps;
+    sweepTimingTargetSteps        = targetSteps;
+    sweepTimingStartMicros        = nowUs;
+    sweepTimingCompletedFactorSum  = 0.0;
 }
 
 bool sweepStepDue(unsigned long nowUs, int currentSteps, int targetSteps) {
@@ -837,7 +815,7 @@ bool sweepStepDue(unsigned long nowUs, int currentSteps, int targetSteps) {
         beginSweepLegTiming(nowUs, currentSteps, targetSteps);
     }
 
-    double nextFactor = sweepProfileFactor(currentSteps, sweepTimingStartSteps, sweepTimingTargetSteps, activeRampSteps);
+    double nextFactor = sweepProfileFactor(currentSteps, sweepTimingStartSteps, sweepTimingTargetSteps);
     unsigned long dueUs =
         sweepTimingStartMicros +
         (unsigned long)(sweepTimingBaseUs * (sweepTimingCompletedFactorSum + nextFactor) + 0.5);

@@ -62,7 +62,15 @@
       <input id="jerk" type="range" min="20" max="20000" step="200" value="4000">
       <span id="jerkLbl" class="val">4000 &deg;/s&sup3;</span>
     </div>
-    <label class="feat"><input type="checkbox" id="ramp" checked> Endpoint accel/decel ramp (3&times; max slowdown)</label>
+  </div>
+
+  <div class="panel">
+    <canvas id="accelChart" width="860" height="240"></canvas>
+  </div>
+  <div class="legend">
+    <span><span class="swatch" style="background:#ffb000"></span>Sine acceleration</span>
+    <span><span class="swatch" style="background:#00c8ff"></span>Reciprocal acceleration</span>
+    <span style="color:#8b93a3">= d(speed)/dt &nbsp;|&nbsp; grey dashed = direction reversal &nbsp;|&nbsp; green dotted = wafer centre crossing</span>
   </div>
 
   <div class="panel">
@@ -82,15 +90,6 @@
     <span><span class="swatch" style="background:#00c8ff"></span>Reciprocal position</span>
   </div>
 
-  <div class="panel">
-    <canvas id="accelChart" width="860" height="240"></canvas>
-  </div>
-  <div class="legend">
-    <span><span class="swatch" style="background:#ffb000"></span>Sine acceleration</span>
-    <span><span class="swatch" style="background:#00c8ff"></span>Reciprocal acceleration</span>
-    <span style="color:#8b93a3">= d(speed)/dt</span>
-  </div>
-
   <div class="panel stats" id="stats"></div>
 
   <div class="hint">
@@ -101,47 +100,30 @@
     centre speed); <b>Reciprocal</b> follows an exponential-decay taper (down to 10%) — so
     Reciprocal slows more aggressively near the wafer edge and runs faster through the centre to
     compensate.<br><br>
-    <b>Endpoint ramp (Accel/Jerk):</b> the firmware no longer uses a fixed-angle ramp. Instead it
-    estimates each leg's peak speed (a no-ramp pass), then sizes the ramp so the arm can decelerate
-    to a stop at <b>Accel</b> (&deg;/s&sup2;) before the reversal — <code>rampDeg = vPeak&sup2; /
-    (2&times;accel)</code>, up to 3&times; slower at the very edge. <b>Jerk</b> (&deg;/s&sup3;)
-    controls the ramp's shape: low jerk blends toward a smoother quintic "smootherstep" (gentler
-    onset/exit), high jerk toward a sharper cubic smoothstep. Because Reciprocal's peak speed is
-    higher than Sine's for the same settings, it gets a <i>wider</i> ramp for the same Accel — see
-    the computed ramp widths below the charts. This applies to <i>both</i> profiles at every
-    direction reversal, independent of the speed-profile shape — for <b>Edge&#8596;(&bull;)</b>
-    this means the arm decelerates as it reaches the wafer centre, even though the profile shape
-    alone would have it at its fastest there.<br><br>
-    <b>Why the flat plateau near each edge?</b> The cosine/reciprocal tapers are <i>clamped</i> at
-    their 20%/10% floors once the distance from centre exceeds ~87%/90% of the half-sweep — so
-    speed is genuinely constant (flat) across that outer band of the sweep, independent of the
-    ramp. The endpoint ramp then adds one extra dip right at the very reversal point, inside that
-    flat band.<br><br>
-    <b>Acceleration</b> (bottom chart) is the numerical derivative of the signed speed curve. The
-    big spikes at each reversal come from the endpoint ramp's slow-down/speed-up <i>and</i> from
-    the model's instantaneous direction flip — this dwell-time model doesn't simulate
-    decelerating through zero, so speed jumps directly from a small positive value to a small
-    negative one (or vice versa) at each reversal.
+    <b>S-curve endpoint ramp (Accel/Jerk):</b> at every direction reversal the arm decelerates to a
+    complete stop and then re-accelerates using a 7-phase S-curve profile — so velocity passes
+    smoothly through zero at each edge. <b>Accel</b> (&deg;/s&sup2;) caps the peak
+    acceleration/deceleration. <b>Jerk</b> (&deg;/s&sup3;) limits how fast acceleration can change:
+    lower jerk gives a gentler onset/exit, higher jerk gives snappier transitions. The peak cruise
+    speed <code>vPeak</code> is found by binary search so the total cycle time stays exactly equal
+    to <b>Sweep time</b> — a wider ramp requires a higher vPeak through the centre to compensate.
+    The <b>ramp distance</b> shown in the stats is how many degrees the arm needs to accelerate
+    from rest to vPeak under the S-curve constraints.<br><br>
+    <b>Acceleration</b> (top chart) shows d(speed)/dt. Because velocity now passes smoothly through
+    zero at each reversal, the acceleration chart shows smooth S-curve ramps instead of sharp spikes.
   </div>
 </div>
 
 <script>
-// ===================== firmware constants (src/main.cpp) =====================
-const SLOW_FACTOR_ON = 3.0;          // SWEEP_ENDPOINT_SLOW_FACTOR
-const JERK_BLEND_LOW = 1000.0;       // JERK_BLEND_LOW_DEG_S3 -> fully quintic (smoothest)
-const JERK_BLEND_HIGH = 8000.0;      // JERK_BLEND_HIGH_DEG_S3 -> fully cubic (sharpest)
-
-// ===================== profile math (mirrors sweepEndpointRampFactor()) =====================
-// edgeDeg/rampDeg are both in degrees, measured from the nearer end of the leg.
-function rampFactor(edgeDeg, rampDeg, slowFactor, jerkDegS3) {
-  if (rampDeg <= 0 || edgeDeg >= rampDeg) return 1.0;
-  const t = edgeDeg / rampDeg;
-  const smoothCubic = t * t * (3 - 2 * t);                      // C1, sharper
-  const smoothQuintic = t * t * t * (t * (t * 6 - 15) + 10);    // C2, smoother
-  const jerkBlend = Math.min(Math.max((jerkDegS3 - JERK_BLEND_LOW) / (JERK_BLEND_HIGH - JERK_BLEND_LOW), 0), 1);
-  const smooth = jerkBlend * smoothCubic + (1 - jerkBlend) * smoothQuintic;
-  return 1.0 + (slowFactor - 1.0) * (1.0 - smooth);
+// ===================== S-curve motion math (mirrors sCurveVelocity() in firmware) =====================
+function sCurveV(distDeg, a, j) {
+  if (distDeg <= 0) return 0;
+  const d1 = (a * a * a) / (6 * j * j);
+  const v1 = (a * a) / (2 * j);
+  if (distDeg <= d1) return Math.cbrt(4.5 * j * distDeg * distDeg);
+  return Math.sqrt(v1 * v1 + 2 * a * (distDeg - d1));
 }
+
 function velocityShape(profile, distance) {
   if (profile === 'sine') return Math.max(Math.cos(Math.PI / 2 * distance), 0.20);
   return Math.max(1 - distance, 0.10);   // reciprocal
@@ -151,78 +133,90 @@ function distanceForLeg(sweepType, leg, x) {
   return leg === 'fwd' ? (1 - x) : x;                          // edge-center: centre at the leg's far end
 }
 
-// One pass: sample factor/pos over a full back-forward-back cycle for a given (fixed)
-// ramp width in degrees. Mirrors sweepLegFactorSum() across both legs.
-const N = 400; // samples per leg
-function sampleCycle(profile, sweepType, sweepDeg, slowFactor, jerkDegS3, rampDeg) {
+// Sample one full back-forward-back cycle at a given vPeak.
+// factor[i] = 1 / min(vShape, sCurveV(fromStart)/vPeak, sCurveV(fromEnd)/vPeak)
+const N = 400;
+function sampleCycle(profile, sweepType, sweepDeg, accelDegS2, jerkDegS3, vPeak) {
   const legs = [
-    { name: 'fwd', from: 0, to: 1 },   // back -> forward/target
-    { name: 'ret', from: 1, to: 0 },   // forward/target -> back
+    { name: 'fwd', from: 0, to: 1 },
+    { name: 'ret', from: 1, to: 0 },
   ];
   const factor = [], pos = [], legOf = [], xOf = [];
+  const halfStep = 0.5 * sweepDeg / N;
   for (const leg of legs) {
-    const start = factor.length === 0 ? 0 : 1; // skip duplicate junction point
+    const start = factor.length === 0 ? 0 : 1;
     for (let i = start; i <= N; i++) {
       const x = i / N;
-      const dist = distanceForLeg(sweepType, leg.name, x);
       const progressDeg = x * sweepDeg;
-      const edgeDeg = Math.min(progressDeg, sweepDeg - progressDeg);
-      const f = rampFactor(edgeDeg, rampDeg, slowFactor, jerkDegS3) / velocityShape(profile, dist);
-      factor.push(f);
+      const fromStartDeg = Math.max(progressDeg, halfStep);
+      const fromEndDeg   = Math.max(sweepDeg - progressDeg, halfStep);
+      const dist   = distanceForLeg(sweepType, leg.name, x);
+      const vShape = velocityShape(profile, dist);
+      const vRamp  = Math.min(sCurveV(fromStartDeg, accelDegS2, jerkDegS3),
+                               sCurveV(fromEndDeg,   accelDegS2, jerkDegS3));
+      const vNorm  = Math.min(vShape, vRamp / vPeak);
+      factor.push(1 / Math.max(vNorm, 1e-9));
       pos.push(leg.from + (leg.to - leg.from) * x);
       legOf.push(leg.name);
       xOf.push(x);
     }
   }
-  // cumulative trapezoidal integral of factor over the (continuous, 2-leg-long) cycle
   const dx = 1 / N;
   const cum = [0];
   for (let i = 1; i < factor.length; i++) {
     cum.push(cum[i - 1] + 0.5 * (factor[i - 1] + factor[i]) * dx);
   }
   const total = cum[cum.length - 1];
-  const meanFactor = total / 2; // cycle length = 2 (two legs of length 1)
+  const meanFactor = total / 2;
   return { factor, pos, legOf, xOf, cum, total, meanFactor };
 }
 
-// Build one full back-forward-back cycle for a given profile, deriving the endpoint
-// ramp width from motionAccelDegS2 (mirrors the two-pass beginSweepLegTiming()):
-// pass 1 estimates the leg's peak speed with no ramp, pass 2 applies the accel-derived
-// ramp width. Returns {t[], v[], pos[], centreT[], revT[], rampDeg} where t is ms,
-// v is mean-normalised speed, pos is 0..1 along the back(0)->forward(1) axis.
-function buildCycle(profile, sweepType, sweepDeg, sweepTimeMs, slowFactor, accelDegS2, jerkDegS3) {
-  // Pass 1: no-ramp baseline -> peak speed at factor==1 (the centre).
-  const noRamp = sampleCycle(profile, sweepType, sweepDeg, slowFactor, jerkDegS3, 0);
-  const peakSpeedDegS = noRamp.meanFactor * 2 * sweepDeg * 1000 / sweepTimeMs;
-  let rampDeg = accelDegS2 > 0 ? (peakSpeedDegS * peakSpeedDegS) / (2 * accelDegS2) : 0;
-  rampDeg = Math.min(rampDeg, sweepDeg / 2);
-
-  // Pass 2: real timing with the accel-derived ramp applied.
-  const { factor, pos, legOf, xOf, cum, total, meanFactor } = sampleCycle(profile, sweepType, sweepDeg, slowFactor, jerkDegS3, rampDeg);
+// Find vPeak via binary search so that T_ms = sweepDeg*1000*total(vPeak)/vPeak = sweepTimeMs.
+// T_ms decreases monotonically with vPeak.
+function buildCycle(profile, sweepType, sweepDeg, sweepTimeMs, accelDegS2, jerkDegS3) {
+  let vHi = Math.max(2 * sweepDeg * 1000 / sweepTimeMs, 1);
+  for (let i = 0; i < 20; i++) {
+    const s = sampleCycle(profile, sweepType, sweepDeg, accelDegS2, jerkDegS3, vHi);
+    if (sweepDeg * 1000 * s.total / vHi < sweepTimeMs) break;
+    vHi *= 4;
+  }
+  let vLo = 1e-3;
+  for (let iter = 0; iter < 40; iter++) {
+    const vMid = (vLo + vHi) * 0.5;
+    const s = sampleCycle(profile, sweepType, sweepDeg, accelDegS2, jerkDegS3, vMid);
+    if (sweepDeg * 1000 * s.total / vMid > sweepTimeMs) vLo = vMid; else vHi = vMid;
+  }
+  const vPeak = (vLo + vHi) * 0.5;
+  const { factor, pos, legOf, xOf, cum, total, meanFactor } =
+    sampleCycle(profile, sweepType, sweepDeg, accelDegS2, jerkDegS3, vPeak);
 
   const t = cum.map(c => sweepTimeMs * c / total);
   const v = factor.map(f => meanFactor / f);
-  // signed speed: + while moving back->forward, - while returning forward->back
   const vSigned = v.map((s, i) => legOf[i] === 'fwd' ? s : -s);
 
-  // acceleration = d(vSigned)/dt, in (relative speed) per second
   const accel = vSigned.map((_, i) => {
     const lo = Math.max(0, i - 1), hi = Math.min(vSigned.length - 1, i + 1);
     return (vSigned[hi] - vSigned[lo]) / (t[hi] - t[lo]) * 1000;
   });
 
-  // direction-reversal times: start, leg junction, end
   const revT = [t[0], t[N], t[t.length - 1]];
 
-  // wafer-centre crossing times (distance == 0 within a leg)
   const centreT = [];
   for (let i = 1; i < factor.length; i++) {
     const d0 = distanceForLeg(sweepType, legOf[i - 1], xOf[i - 1]);
-    const d1 = distanceForLeg(sweepType, legOf[i], xOf[i]);
-    if ((d0 > 0 && d1 <= 0) || (d0 === 0)) centreT.push(t[i - 1] + (t[i] - t[i - 1]) * (d0 / (d0 - d1 || 1)));
+    const d1c = distanceForLeg(sweepType, legOf[i], xOf[i]);
+    if ((d0 > 0 && d1c <= 0) || (d0 === 0)) centreT.push(t[i - 1] + (t[i] - t[i - 1]) * (d0 / (d0 - d1c || 1)));
   }
 
-  return { t, v, vSigned, accel, pos, revT, centreT, rampDeg };
+  // rampDeg: distance to accelerate from rest to vPeak under S-curve constraints
+  const a = accelDegS2, j = jerkDegS3;
+  const sd1 = (a * a * a) / (6 * j * j);
+  const sv1 = (a * a) / (2 * j);
+  const rampDeg = vPeak <= sv1
+    ? Math.sqrt(vPeak * vPeak * vPeak / (4.5 * j))
+    : sd1 + (vPeak * vPeak - sv1 * sv1) / (2 * a);
+
+  return { t, v, vSigned, accel, pos, revT, centreT, rampDeg, vPeak };
 }
 
 // ===================== drawing helpers =====================
@@ -231,7 +225,6 @@ function drawAxes(ctx, m, w, h, xMax, yMin, yMax, xLabel, yLabel, yTickFmt) {
   ctx.strokeStyle = '#333a47'; ctx.fillStyle = '#8b93a3';
   ctx.font = '11px "Segoe UI",sans-serif'; ctx.lineWidth = 1;
   const plotW = w - m.l - m.r, plotH = h - m.t - m.b;
-  // gridlines + y ticks
   const yTicks = 5;
   for (let i = 0; i <= yTicks; i++) {
     const yv = yMin + (yMax - yMin) * i / yTicks;
@@ -239,7 +232,6 @@ function drawAxes(ctx, m, w, h, xMax, yMin, yMax, xLabel, yLabel, yTickFmt) {
     ctx.beginPath(); ctx.moveTo(m.l, py); ctx.lineTo(w - m.r, py); ctx.stroke();
     ctx.fillText(yTickFmt(yv), 4, py + 4);
   }
-  // x ticks
   const xTicks = 8;
   for (let i = 0; i <= xTicks; i++) {
     const xv = xMax * i / xTicks;
@@ -288,16 +280,14 @@ function interp(t, ts, vs) {
 }
 
 function render() {
-  const sweepType = document.getElementById('sweepType').value;
-  const sweepDeg = +document.getElementById('angle').value;
+  const sweepType  = document.getElementById('sweepType').value;
+  const sweepDeg   = +document.getElementById('angle').value;
   const sweepTimeMs = +document.getElementById('time').value;
-  const rampOn = document.getElementById('ramp').checked;
-  const slowFactor = rampOn ? SLOW_FACTOR_ON : 1.0;
-  const accelDegS2 = rampOn ? +document.getElementById('accel').value : 0;
-  const jerkDegS3 = +document.getElementById('jerk').value;
+  const accelDegS2 = +document.getElementById('accel').value;
+  const jerkDegS3  = +document.getElementById('jerk').value;
 
-  const sine = buildCycle('sine', sweepType, sweepDeg, sweepTimeMs, slowFactor, accelDegS2, jerkDegS3);
-  const recip = buildCycle('reciprocal', sweepType, sweepDeg, sweepTimeMs, slowFactor, accelDegS2, jerkDegS3);
+  const sine  = buildCycle('sine',       sweepType, sweepDeg, sweepTimeMs, accelDegS2, jerkDegS3);
+  const recip = buildCycle('reciprocal', sweepType, sweepDeg, sweepTimeMs, accelDegS2, jerkDegS3);
 
   // ---- speed chart (signed: + = forward leg, - = return leg) ----
   let ctx = speedCv.getContext('2d');
@@ -335,7 +325,7 @@ function render() {
   plotLine(ctx, m3, w3, h3, sweepTimeMs, aMin, aMax, sine.t, sine.accel, '#ffb000');
   plotLine(ctx, m3, w3, h3, sweepTimeMs, aMin, aMax, recip.t, recip.accel, '#00c8ff');
 
-  // ---- closeness stats ----
+  // ---- stats ----
   const M = 400;
   let sumSq = 0, maxDiff = 0, maxDiffT = 0;
   for (let i = 0; i <= M; i++) {
@@ -347,9 +337,7 @@ function render() {
     if (d > maxDiff) { maxDiff = d; maxDiffT = t; }
   }
   const rms = Math.sqrt(sumSq / (M + 1));
-  const centreLabel = sweepType === 'edge-edge'
-    ? 'mid-sweep'
-    : 'the centre-side reversal';
+  const centreLabel = sweepType === 'edge-edge' ? 'mid-sweep' : 'the centre-side reversal';
   statsEl.innerHTML =
     `<b>RMS difference:</b> ${(rms * 100).toFixed(1)}% of mean speed &nbsp;|&nbsp; ` +
     `<b>Largest difference:</b> ${(maxDiff * 100).toFixed(1)}% at t&approx;${Math.round(maxDiffT)} ms ` +
@@ -358,14 +346,14 @@ function render() {
     `Reciprocal's speed range is wider (10%&ndash;100% of centre speed, vs Sine's 20%&ndash;100%), so it runs ` +
     `noticeably faster through the centre and slower at the edges than Sine for the same cycle time &mdash; ` +
     `the two shapes are similar but not close; Reciprocal is the more aggressive taper.<br>` +
-    (rampOn
-      ? `<b>Endpoint ramp width</b> (accel-derived): Sine &approx;${sine.rampDeg.toFixed(2)}&deg;, ` +
-        `Reciprocal &approx;${recip.rampDeg.toFixed(2)}&deg; &mdash; computed from each profile's own peak speed, ` +
-        `so the faster (Reciprocal) profile gets a wider ramp for the same accel limit.`
-      : `<b>Endpoint ramp:</b> off (instant reversal).`);
+    `<b>Peak cruise speed:</b> Sine <b>${sine.vPeak.toFixed(1)}&deg;/s</b>, ` +
+    `Reciprocal <b>${recip.vPeak.toFixed(1)}&deg;/s</b> &mdash; ` +
+    `<b>S-curve ramp distance</b> (0&rarr;vPeak&rarr;0): ` +
+    `Sine &approx;${sine.rampDeg.toFixed(2)}&deg;, Reciprocal &approx;${recip.rampDeg.toFixed(2)}&deg; &mdash; ` +
+    `Reciprocal's faster cruise requires a wider ramp for the same Accel/Jerk settings.`;
 }
 
-['sweepType', 'angle', 'time', 'accel', 'jerk', 'ramp'].forEach(id => {
+['sweepType', 'angle', 'time', 'accel', 'jerk'].forEach(id => {
   document.getElementById(id).addEventListener('input', () => {
     document.getElementById('angleLbl').textContent = document.getElementById('angle').value + '°';
     document.getElementById('timeLbl').textContent = document.getElementById('time').value + ' ms';
