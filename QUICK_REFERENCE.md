@@ -88,7 +88,7 @@ START always re-homes first (position is unknown whenever the motor was disabled
 | State | Duration |
 |-------|----------|
 | IDLE | Indefinite |
-| HOMING | Until limit switch (timeout 70° → ERROR) |
+| HOMING | Until limit switch (travel > 120° or timeout 10s → ERROR) |
 | PARKED | Until at park angle, then branch |
 | WAITING_SPRAY | Until flow detected or spray lost (sensor mode) |
 | SPRAY_ACTIVE | ≥ 2 s + time to reach the sweep start |

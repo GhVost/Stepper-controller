@@ -76,6 +76,7 @@ unsigned long lastStateChange = 0;
 // When true: after reaching limit switch go IDLE instead of PARKED (abort path)
 volatile bool homingToStop = false;
 unsigned long homingStartMillis = 0;
+int           homingStartPosition = 0;   // motorPosition at the moment homing began
 volatile bool homingTimeoutLatched = false;
 
 // Position is unknown (motor was disabled / never homed): re-home before a run.
@@ -95,6 +96,7 @@ unsigned long SWEEP_TIME_MS = 4000;
 unsigned long OSCILLATION_CYCLES = 4;
 const unsigned long SPRAY_ACTIVE_WAIT = 2000;
 const unsigned long HOMING_TIMEOUT_MS = 10000;
+const int HOMING_MAX_DEG_X10 = 1200;  // 120.0° max travel during a homing search
 bool SENSOR_INPUTS_ENABLED = false;  // false = bypass/debug safety inputs (toggle in Setup)
 
 // ============= SETTINGS (sweep params) =============
@@ -1050,19 +1052,25 @@ void updateStateMachine() {
                 Serial.println("→ ERROR (driver fault)");
             } else if (SENSOR_INPUTS_ENABLED && sprayActive) {
                 homingStartMillis = now;
+                homingStartPosition = motorPosition;
                 homingTimeoutLatched = false;
                 currentState = STATE_HOMING; lastStateChange = now;
                 Serial.println("→ HOMING");
             }
             break;
 
-        case STATE_HOMING:
-            if (millis() - homingStartMillis > HOMING_TIMEOUT_MS) {
+        case STATE_HOMING: {
+            bool homingTimedOut = millis() - homingStartMillis > HOMING_TIMEOUT_MS;
+            bool homingTravelExceeded = abs(motorPosition - homingStartPosition) >= degX10ToSteps(HOMING_MAX_DEG_X10);
+            if (homingTimedOut || homingTravelExceeded) {
                 motorSetEnable(false);
                 needsHoming = true;
                 homingTimeoutLatched = true;
                 currentState = STATE_ERROR; lastStateChange = now;
-                Serial.println("→ ERROR (homing timeout)");
+                if (homingTravelExceeded)
+                    Serial.printf("→ ERROR (homing exceeded %.0f deg)\n", HOMING_MAX_DEG_X10 * 0.1f);
+                else
+                    Serial.println("→ ERROR (homing timeout)");
                 break;
             }
             if (limitSwitchPressed) {
@@ -1086,6 +1094,7 @@ void updateStateMachine() {
                 }
             }
             break;
+        }
 
         case STATE_PARKED:
             // Park is reached at the park setpoint (≤ PARK_DEG_X10, a small angle).
@@ -1308,6 +1317,7 @@ void handleMenuSelect() {
                 sensorBypassCycleArmed = !SENSOR_INPUTS_ENABLED;
                 homingTimeoutLatched = false;
                 homingStartMillis = millis();
+                homingStartPosition = motorPosition;
                 currentState = STATE_HOMING; lastStateChange = millis();
                 Serial.println("Menu: START → HOMING");
             } else if (currentState == STATE_PARKED && !needsHoming) {
