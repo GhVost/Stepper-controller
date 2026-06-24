@@ -145,9 +145,11 @@ Fan 100 %, generator ON over the wafer, green LED on.
 
 ### STATE_ERROR
 **Entry**: a latched driver fault (overtemperature, short-to-ground, or charge-pump
-undervoltage) detected by `pollDriverStatus()`, or a home-search timeout.
+undervoltage), a **StallGuard collision** (blocked/stalled arm, when `Stall` is enabled in
+SpreadCycle) detected by `pollDriverStatus()`, or a home-search timeout. A collision parks
+the arm first (`faultLatched` path), then disables and shows a red **COLLISION** label.
 **Actions**: motor disabled, all outputs off, yellow LED blinks at 1 Hz.
-**Recovery**: press START — it clears `faultLatched` and re-homes. (No power-cycle needed.)
+**Recovery**: press START — it clears `faultLatched`/`collisionLatched` and re-homes.
 
 ---
 

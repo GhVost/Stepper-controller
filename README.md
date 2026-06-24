@@ -12,14 +12,14 @@ selected wafer diameter and the arm length.
 
 - **RP2040 microcontroller** – dual-core ARM, 133 MHz, 264 KB RAM
 - **Dual-core architecture** – Core 0 runs the state machine and I/O; Core 1 renders the LCD at ~20 fps
-- **TMC2130 stepper driver** – SPI-controlled, selectable StealthChop/SpreadCycle chopper, current limiting, adjustable run/park hold-current %, live fault detection (overtemperature, short-to-ground, charge-pump UV)
+- **TMC2130 stepper driver** – SPI-controlled, selectable StealthChop/SpreadCycle chopper, current limiting, adjustable run/park hold-current %, live fault detection (overtemperature, short-to-ground, charge-pump UV) and **StallGuard collision detection** (blocked arm → park + red COLLISION)
 - **Hardware SPI LCD** – GMT147SPI 1.47" 172×320 ST7789 at 20 MHz on its own SPI bus
 - **Rotary encoder UI** – KY-040 quadrature + push-button; full menu, in-place value editing, and a basic/advanced menu unlock
 - **Angle-based motion** – park and centre angles in degrees; sweep angle computed from wafer Ø and arm length
 - **Configurable sweep** – sweep time, wafer diameter, path (back-centre / back-front), and velocity profile (linear / harmonic / inverse-distance)
-- **Persistent settings** – all parameters stored in flash EEPROM emulation and reloaded at boot
+- **Persistent settings** – all parameters stored in flash EEPROM emulation and reloaded at boot; loading is **forward/backward compatible**, so a firmware update keeps your existing settings and only defaults newly-added ones
 - **Two operating modes** – sensor-driven (spray valve + flow sensor) or a menu-driven **Debug** bypass mode
-- **Safety** – re-home before every run, home-search timeout, ultrasonic energised only while the arm is over the wafer, park-then-disable stop, and a recoverable ERROR state
+- **Safety** – re-home before every run, home-search timeout, ultrasonic energised only while the arm is over the wafer, park-then-disable stop, StallGuard collision park, and a recoverable ERROR state
 
 ## Quick Start
 
@@ -75,15 +75,16 @@ the first, and vice versa.
   each row shows `label:value` in a large font with the value highlighted, and the arm
   animation (about a third of the screen height) sits underneath. The calculated sweep angle
   is shown in the side status bar.
-- **Setup** (hardware): an 18-row list that **scrolls vertically** — a 6-row window tracks
+- **Setup** (hardware): a 20-row list that **scrolls vertically** — a 6-row window tracks
   the selection, with a `row/total` counter and ▲/▼ markers showing more above/below.
   Rows: park angle, centre angle (live jog while editing), **Parking speed** (deg/s — arm
   speed for homing/park/staging moves), arm length, **gear ratio** (`Gear in` / `Gear out`
   teeth, default 15:108), cycles, **Accel** (deg/s²), **Jerk** (deg/s³), **Backlash**
   take-up (µsteps injected on reversal), driver current,
   **RunHold** / **PrkHold** current (% of run), **Chop** (StealthChop ↔ SpreadCycle),
-  microsteps (**Mstep**), **Interp** (microstep interpolation on/off), direction invert, and
-  the **Debug** toggle (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active).
+  microsteps (**Mstep**), **Interp** (microstep interpolation on/off), direction invert,
+  the **Debug** toggle (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active),
+  and **Stall** / **StallSG** (StallGuard collision detection on/off + sensitivity).
 - **About**: firmware version and live TMC2130 driver status.
 - **Status bar** (right side of every screen): live state, arm angle, the sweep summary
   (sweep angle, time, wafer, type, profile), and spray/flow.
@@ -229,6 +230,14 @@ sweep = 2 · asin( (wafer_diameter / 2) / arm_length )
 **Backlash compensation**: if the gear train has slack, set `Backlash` (in Setup) to the
 number of extra microsteps to inject on each direction reversal. These steps move the
 motor but not the load, taking up the slack so the arm reaches the commanded angle.
+
+**Collision / stall detection.** With `Stall` enabled, the TMC2130's StallGuard2 watches
+the motor load while sweeping. If the arm is blocked or stalls (e.g. you stop it by hand),
+the firmware moves to **park**, disables the motor, and latches **ERROR** with a red
+**COLLISION** message on screen. `StallSG` sets the sensitivity (SGT, −64 = most sensitive
+… +63 = least); tune it on the bench. StallGuard is only reliable in **SpreadCycle**, so set
+`Chop = Spread` for collision detection to work (it is ignored in StealthChop). Press START
+to recover (re-homes first).
 
 **Every move is acceleration-limited.** The sweep uses the jerk-limited 7-phase S-curve;
 all the other moves — homing, parking, pre-sweep staging and the live centre jog — use a

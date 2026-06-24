@@ -86,6 +86,8 @@ volatile bool needsHoming   = true;
 volatile bool stopRequested = false;
 // A driver fault was detected: park the arm, then disable the motor and latch ERROR.
 volatile bool faultLatched  = false;
+// The fault was a StallGuard collision (arm blocked / stalled) — shown as red "COLLISION".
+volatile bool collisionLatched = false;
 
 // ============= MOTION PARAMETERS =============
 const int FULL_STEPS_PER_REV = 200;  // typical 1.8 degree NEMA17 motor
@@ -152,6 +154,11 @@ bool driverStealthChop = true;
 // Microstep interpolation (intpol): TMC interpolates the configured microstep resolution
 // up to 256 internally. ON = smoother at low Mstep; turn OFF to feel the raw Mstep setting.
 bool driverInterpolation = true;
+// StallGuard2 stall detection → park-on-stall. Detects a jammed/overloaded motor (lost
+// steps) and parks then disables. Only reliable in SpreadCycle (Chop = Spread). stallThreshold
+// is the TMC SGT sensitivity (-64 = most sensitive … +63 = least). Default off.
+bool stallParkEnabled = false;
+int  stallThreshold   = 0;
 bool driverParkHoldMode = false;
 
 // Hold-current multipliers derived from the editable percentages above.
@@ -162,7 +169,7 @@ const int MICROSTEP_TABLE[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 const int MICROSTEP_COUNT   = 9;
 
 const uint32_t SETTINGS_MAGIC = 0x4D534743UL;  // "MSGC"
-const uint16_t SETTINGS_VERSION = 13;
+const uint16_t SETTINGS_VERSION = 14;
 const size_t EEPROM_BYTES = 4096;
 
 // Auto-save: every Setup/Settings change is persisted, but writes are debounced so a
@@ -198,6 +205,8 @@ struct StoredSettings {
     int16_t driverStealthChop;
     int16_t parkingSpeedDegS;
     int16_t driverInterpolation;
+    int16_t stallParkEnabled;
+    int16_t stallThreshold;
     uint32_t checksum;
 };
 
@@ -320,10 +329,10 @@ volatile bool editingSettings     = false;
 volatile bool settingsNeedsRedraw = false;
 
 // Setup rows: Park, Centre, Park spd, Arm, GearIn, GearOut, Cycles, Accel, Jerk,
-// Backlash, Current, RunHold, ParkHold, Chop, Mstep, Interp, Invert, Debug. More rows than
-// fit on screen, so the Setup list scrolls vertically (see drawSetup). No "< Back" row —
-// a long press returns to the menu.
-const int SETUP_COUNT = 18;
+// Backlash, Current, RunHold, ParkHold, Chop, Mstep, Interp, Invert, Debug, Stall, StallSG.
+// More rows than fit on screen, so the Setup list scrolls vertically (see drawSetup). No
+// "< Back" row — a long press returns to the menu.
+const int SETUP_COUNT = 20;
 volatile int  setupIndex       = 0;
 volatile bool editingSetup     = false;
 volatile bool setupNeedsRedraw = false;
@@ -541,6 +550,11 @@ void initTMC2130() {
     driver.intpol(driverInterpolation);
     driver.en_pwm_mode(driverStealthChop);   // StealthChop when true, SpreadCycle when false
     driver.pwm_autoscale(true);
+    // StallGuard2: sensitivity + always-on velocity gate + filter (used for collision/stall
+    // detection, see pollDriverStatus). Reliable in SpreadCycle.
+    driver.TCOOLTHRS(0xFFFFF);
+    driver.sgt(stallThreshold);
+    driver.sfilt(true);
     Serial.printf("TMC2130 configured: %d mA, run hold %d%%, park hold %d%%, %dx microsteps, intpol %s, %s\n",
                   driverCurrent, driverRunHoldPct, driverParkHoldPct, driverMicrosteps,
                   driverInterpolation ? "on" : "off",
@@ -559,15 +573,17 @@ void initDisplay() {
 }
 
 // ============= PERSISTENT SETTINGS =============
-uint32_t settingsChecksum(const StoredSettings& settings) {
-    const uint8_t* bytes = (const uint8_t*)&settings;
-    size_t len = sizeof(StoredSettings) - sizeof(settings.checksum);
+uint32_t fnv1aBytes(const uint8_t* bytes, size_t len) {
     uint32_t hash = 2166136261UL;
     for (size_t i = 0; i < len; i++) {
         hash ^= bytes[i];
         hash *= 16777619UL;
     }
     return hash;
+}
+
+uint32_t settingsChecksum(const StoredSettings& settings) {
+    return fnv1aBytes((const uint8_t*)&settings, sizeof(StoredSettings) - sizeof(settings.checksum));
 }
 
 bool isValidMicrostep(int value) {
@@ -577,59 +593,10 @@ bool isValidMicrostep(int value) {
     return false;
 }
 
-void loadSettings() {
-    EEPROM.begin(EEPROM_BYTES);
-
-    StoredSettings stored;
-    EEPROM.get(0, stored);
-
-    bool validMagic = stored.magic == SETTINGS_MAGIC;
-    bool validVersion = stored.version == SETTINGS_VERSION;
-    bool validSize = stored.size == sizeof(StoredSettings);
-    bool validChecksum = stored.checksum == settingsChecksum(stored);
-    bool validMicrosteps = isValidMicrostep(stored.driverMicrosteps);
-    bool valid = validMagic && validVersion && validSize && validChecksum && validMicrosteps;
-
-    if (!valid) {
-        Serial.printf("Settings: using defaults (magic=%d version=%u size=%u checksum=%d microsteps=%d)\n",
-                      validMagic ? 1 : 0,
-                      stored.version,
-                      stored.size,
-                      validChecksum ? 1 : 0,
-                      validMicrosteps ? 1 : 0);
-        saveSettings();
-        return;
-    }
-
-    PARK_DEG_X10 = constrain((int)stored.parkDegX10, 10, 1800);
-    CENTER_DEG_X10 = constrain((int)stored.centerDegX10, 10, 1800);
-    ARM_LENGTH_MM = constrain((int)stored.armLengthMm, 50, 1000);
-    SWEEP_TIME_MS = (unsigned long)constrain((long)stored.sweepTimeMs, 500L, 60000L);
-    OSCILLATION_CYCLES = (unsigned long)constrain((long)stored.oscillationCycles, 0L, 100L);
-    sampleIndex = constrain((int)stored.sampleIndex, 0, SAMPLE_COUNT - 1);
-    sweepType = constrain((int)stored.sweepType, 0, 1);
-    sweepProfile = constrain((int)stored.sweepProfile, 0, 2);
-    driverCurrent = constrain((int)stored.driverCurrent, 100, 1500);
-    driverMicrosteps = stored.driverMicrosteps;
-    motorDirectionInverted = stored.motorDirectionInverted != 0;
-    SENSOR_INPUTS_ENABLED = stored.sensorInputsEnabled != 0;
-    motionAccelDegS2 = constrain((double)stored.motionAccelDegS2, MOTION_ACCEL_MIN_DEG_S2, MOTION_ACCEL_MAX_DEG_S2);
-    motionJerkDegS3 = constrain((double)stored.motionJerkDegS3, MOTION_JERK_MIN_DEG_S3, MOTION_JERK_MAX_DEG_S3);
-    gearTeethMotor = constrain((int)stored.gearTeethMotor, 1, 500);
-    gearTeethOutput = constrain((int)stored.gearTeethOutput, 1, 500);
-    backlashMicrosteps = constrain((int)stored.backlashMicrosteps, 0, 2000);
-    driverRunHoldPct = constrain((int)stored.driverRunHoldPct, 1, 100);
-    driverParkHoldPct = constrain((int)stored.driverParkHoldPct, 0, 100);
-    driverStealthChop = stored.driverStealthChop != 0;
-    parkingSpeedDegS = constrain((int)stored.parkingSpeedDegS, 1, 120);
-    driverInterpolation = stored.driverInterpolation != 0;
-    enforceMinimumSweepTime(true);
-
-    Serial.printf("Settings: loaded from flash (v%u)\n", stored.version);
-}
-
-void saveSettings() {
-    StoredSettings stored = {};
+// Serialise the live globals into a StoredSettings record (header + payload, no checksum).
+// Used by saveSettings() and as the default base for migration in loadSettings().
+void fillStoredFromGlobals(StoredSettings& stored) {
+    stored = {};
     stored.magic = SETTINGS_MAGIC;
     stored.version = SETTINGS_VERSION;
     stored.size = sizeof(StoredSettings);
@@ -655,6 +622,84 @@ void saveSettings() {
     stored.driverStealthChop = driverStealthChop ? 1 : 0;
     stored.parkingSpeedDegS = parkingSpeedDegS;
     stored.driverInterpolation = driverInterpolation ? 1 : 0;
+    stored.stallParkEnabled = stallParkEnabled ? 1 : 0;
+    stored.stallThreshold = stallThreshold;
+}
+
+void loadSettings() {
+    EEPROM.begin(EEPROM_BYTES);
+
+    // Start from the current firmware defaults (the globals hold compile-time defaults at
+    // boot), then overlay whatever was saved. Fields added in a firmware *newer* than the
+    // saved record keep their default — so a firmware update never wipes existing settings.
+    StoredSettings stored;
+    fillStoredFromGlobals(stored);
+
+    uint32_t magic = 0;
+    uint16_t storedSize = 0;
+    EEPROM.get(0, magic);
+    EEPROM.get(offsetof(StoredSettings, size), storedSize);
+
+    bool ok = false;
+    if (magic == SETTINGS_MAGIC && storedSize >= 12 && storedSize <= sizeof(StoredSettings)) {
+        // Overlay the saved payload (everything but its trailing 4-byte checksum) onto the
+        // defaults. Because new fields are only ever *appended*, they sit exactly where the
+        // old checksum was, so a shorter (older) record leaves them at their defaults.
+        uint8_t* d = (uint8_t*)&stored;
+        for (uint16_t i = 0; i < storedSize - 4; i++) d[i] = EEPROM.read(i);
+        uint32_t storedSum = 0;
+        for (int b = 0; b < 4; b++) ((uint8_t*)&storedSum)[b] = EEPROM.read(storedSize - 4 + b);
+        uint32_t calcSum = fnv1aBytes(d, storedSize - 4);
+        ok = (storedSum == calcSum) && isValidMicrostep(stored.driverMicrosteps);
+    }
+
+    if (!ok) {
+        Serial.println("Settings: no valid record → using defaults");
+        saveSettings();
+        return;
+    }
+
+    uint16_t savedVersion = stored.version;
+    uint16_t savedSize    = stored.size;
+
+    PARK_DEG_X10 = constrain((int)stored.parkDegX10, 10, 1800);
+    CENTER_DEG_X10 = constrain((int)stored.centerDegX10, 10, 1800);
+    ARM_LENGTH_MM = constrain((int)stored.armLengthMm, 50, 1000);
+    SWEEP_TIME_MS = (unsigned long)constrain((long)stored.sweepTimeMs, 500L, 60000L);
+    OSCILLATION_CYCLES = (unsigned long)constrain((long)stored.oscillationCycles, 0L, 100L);
+    sampleIndex = constrain((int)stored.sampleIndex, 0, SAMPLE_COUNT - 1);
+    sweepType = constrain((int)stored.sweepType, 0, 1);
+    sweepProfile = constrain((int)stored.sweepProfile, 0, 2);
+    driverCurrent = constrain((int)stored.driverCurrent, 100, 1500);
+    driverMicrosteps = stored.driverMicrosteps;
+    motorDirectionInverted = stored.motorDirectionInverted != 0;
+    SENSOR_INPUTS_ENABLED = stored.sensorInputsEnabled != 0;
+    motionAccelDegS2 = constrain((double)stored.motionAccelDegS2, MOTION_ACCEL_MIN_DEG_S2, MOTION_ACCEL_MAX_DEG_S2);
+    motionJerkDegS3 = constrain((double)stored.motionJerkDegS3, MOTION_JERK_MIN_DEG_S3, MOTION_JERK_MAX_DEG_S3);
+    gearTeethMotor = constrain((int)stored.gearTeethMotor, 1, 500);
+    gearTeethOutput = constrain((int)stored.gearTeethOutput, 1, 500);
+    backlashMicrosteps = constrain((int)stored.backlashMicrosteps, 0, 2000);
+    driverRunHoldPct = constrain((int)stored.driverRunHoldPct, 1, 100);
+    driverParkHoldPct = constrain((int)stored.driverParkHoldPct, 0, 100);
+    driverStealthChop = stored.driverStealthChop != 0;
+    parkingSpeedDegS = constrain((int)stored.parkingSpeedDegS, 1, 120);
+    driverInterpolation = stored.driverInterpolation != 0;
+    stallParkEnabled = stored.stallParkEnabled != 0;
+    stallThreshold = constrain((int)stored.stallThreshold, -64, 63);
+    enforceMinimumSweepTime(true);
+
+    if (savedVersion != SETTINGS_VERSION || savedSize != sizeof(StoredSettings)) {
+        Serial.printf("Settings: migrated v%u (%u B) → v%u (%u B), keeping existing values\n",
+                      savedVersion, savedSize, SETTINGS_VERSION, (unsigned)sizeof(StoredSettings));
+        saveSettings();   // rewrite in the current layout so the next boot is an exact match
+    } else {
+        Serial.printf("Settings: loaded from flash (v%u)\n", savedVersion);
+    }
+}
+
+void saveSettings() {
+    StoredSettings stored;
+    fillStoredFromGlobals(stored);
     stored.checksum = settingsChecksum(stored);
 
     EEPROM.put(0, stored);
@@ -1353,7 +1398,7 @@ void handleMenuSelect() {
         case 0:  // START / STOP
             if (currentState == STATE_IDLE || currentState == STATE_ERROR) {
                 // START: always home first to re-establish position, then park + run.
-                faultLatched = false; stopRequested = false; homingToStop = false;
+                faultLatched = false; collisionLatched = false; stopRequested = false; homingToStop = false;
                 sensorBypassCycleArmed = !SENSOR_INPUTS_ENABLED;
                 homingTimeoutLatched = false;
                 homingStartMillis = millis();
@@ -1478,6 +1523,8 @@ void adjustSetupValue(int delta) {
         case 17:
             SENSOR_INPUTS_ENABLED = !SENSOR_INPUTS_ENABLED;
             break;
+        case 18: stallParkEnabled = !stallParkEnabled; break;
+        case 19: stallThreshold = constrain(stallThreshold + (delta > 0 ? 1 : -1), -64, 63); break;
     }
     enforceMinimumSweepTime(false);
     markSettingsDirty();
@@ -1489,6 +1536,7 @@ void applyDriverSettings() {
     driver.microsteps(driverMicrosteps);
     driver.intpol(driverInterpolation);
     driver.en_pwm_mode(driverStealthChop);   // StealthChop when true, SpreadCycle when false
+    driver.sgt(stallThreshold);              // StallGuard sensitivity (collision detection)
     mutex_exit(&spi_mutex);
     Serial.printf("Driver applied: %d mA, hold %d%%, %dx microsteps, intpol %s, %s\n",
                   driverCurrent,
@@ -1528,6 +1576,20 @@ void pollDriverStatus() {
         currentState != STATE_IDLE && currentState != STATE_ERROR) {
         faultLatched = true;
         Serial.printf("FAULT: OT=%d S2G=%d UVCP=%d → park + disable\n", ot, s2g, uvcp);
+    }
+
+    // Collision / stall detection (StallGuard2): if the arm is blocked or stalls while
+    // sweeping, park then disable and show COLLISION. Needs SpreadCycle to be reliable, so it
+    // only acts when StealthChop is off. A short streak avoids false trips at the reversals.
+    static int stallStreak = 0;
+    bool moving = (currentState == STATE_OSCILLATING || currentState == STATE_SPRAY_ACTIVE);
+    bool stallBit = (driverDrvStatus >> 24) & 1;            // StallGuard2 status (SG_RESULT == 0)
+    if (stallParkEnabled && !driverStealthChop && moving && stallBit) stallStreak++;
+    else stallStreak = 0;
+    if (stallStreak >= 2 && !faultLatched) {
+        faultLatched = true;
+        collisionLatched = true;
+        Serial.println("COLLISION: arm stalled → park + disable");
     }
 }
 
@@ -1966,6 +2028,7 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     static bool drawnFlow  = false;
     static int  drawnSweepAng = -1, drawnTime = -1, drawnWafer = -1, drawnType = -1, drawnProfile = -1;
     static bool drawnSensorEnabled = true;
+    static bool drawnCollision = false;
 
     int x = STATUS_X + 6;          // 238
     int valueW = STATUS_W - 8;     // 80
@@ -2007,12 +2070,26 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
         drawnSensorEnabled = SENSOR_INPUTS_ENABLED;
     }
 
-    if (forceRedraw || state != drawnState) {
+    if (forceRedraw || state != drawnState || collisionLatched != drawnCollision) {
         tft.fillRect(x, 34, valueW, 16, ST77XX_BLACK);
-        tft.setTextSize(2);
-        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-        tft.setCursor(x, 34); tft.print(stateLabel(state));
+        if (state == STATE_ERROR) {
+            // ERROR is red; a StallGuard trip is spelled out as "COLLISION".
+            tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+            if (collisionLatched) {
+                tft.setTextSize(1);
+                tft.setCursor(x, 34); tft.print("COLLISION");
+                tft.setCursor(x, 42); tft.print("arm stalled");
+            } else {
+                tft.setTextSize(2);
+                tft.setCursor(x, 34); tft.print("ERROR");
+            }
+        } else {
+            tft.setTextSize(2);
+            tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+            tft.setCursor(x, 34); tft.print(stateLabel(state));
+        }
         drawnState = state;
+        drawnCollision = collisionLatched;
     }
 
     if (forceRedraw || posDeg != drawnPosDeg) {
@@ -2362,7 +2439,7 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
     const char* labels[] = {
         "Park   ", "Centre ", "Parkspd", "Arm    ", "Gear in", "Gearout", "Cycles ",
         "Accel  ", "Jerk   ", "Backlsh", "Current", "RunHold", "PrkHold",
-        "Chop   ", "Mstep  ", "Interp ", "Invert ", "Debug  "
+        "Chop   ", "Mstep  ", "Interp ", "Invert ", "Debug  ", "Stall  ", "StallSG"
     };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
@@ -2394,6 +2471,8 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
         case 15: tft.print(driverInterpolation ? "ON" : "OFF"); break;
         case 16: tft.print(motorDirectionInverted ? "ON" : "OFF"); break;
         case 17: tft.print(SENSOR_INPUTS_ENABLED ? "OFF" : "ON");   break;
+        case 18: tft.print(stallParkEnabled ? "ON" : "OFF"); break;
+        case 19: tft.print(stallThreshold); break;
     }
 }
 
@@ -2426,7 +2505,8 @@ void drawSetup() {
         (int)(motionAccelDegS2 + 0.5), (int)(motionJerkDegS3 + 0.5),
         backlashMicrosteps, driverCurrent, driverRunHoldPct, driverParkHoldPct,
         driverStealthChop ? 1 : 0, driverMicrosteps, driverInterpolation ? 1 : 0,
-        motorDirectionInverted ? 1 : 0, SENSOR_INPUTS_ENABLED ? 1 : 0
+        motorDirectionInverted ? 1 : 0, SENSOR_INPUTS_ENABLED ? 1 : 0,
+        stallParkEnabled ? 1 : 0, stallThreshold
     };
 
     bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit) || (first != lastFirst);
