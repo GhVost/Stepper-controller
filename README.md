@@ -75,15 +75,15 @@ the first, and vice versa.
   each row shows `label:value` in a large font with the value highlighted, and the arm
   animation (about a third of the screen height) sits underneath. The calculated sweep angle
   is shown in the side status bar.
-- **Setup** (hardware): a 16-row list that **scrolls vertically** — a 6-row window tracks
+- **Setup** (hardware): an 18-row list that **scrolls vertically** — a 6-row window tracks
   the selection, with a `row/total` counter and ▲/▼ markers showing more above/below.
   Rows: park angle, centre angle (live jog while editing), **Parking speed** (deg/s — arm
   speed for homing/park/staging moves), arm length, **gear ratio** (`Gear in` / `Gear out`
   teeth, default 15:108), cycles, **Accel** (deg/s²), **Jerk** (deg/s³), **Backlash**
   take-up (µsteps injected on reversal), driver current,
   **RunHold** / **PrkHold** current (% of run), **Chop** (StealthChop ↔ SpreadCycle),
-  microsteps, direction invert, and the **Debug** toggle (`ON` = spray/flow ignored,
-  `OFF` = spray/flow safety inputs active).
+  microsteps (**Mstep**), **Interp** (microstep interpolation on/off), direction invert, and
+  the **Debug** toggle (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active).
 - **About**: firmware version and live TMC2130 driver status.
 - **Status bar** (right side of every screen): live state, arm angle, the sweep summary
   (sweep angle, time, wafer, type, profile), and spray/flow.
@@ -229,6 +229,15 @@ sweep = 2 · asin( (wafer_diameter / 2) / arm_length )
 **Backlash compensation**: if the gear train has slack, set `Backlash` (in Setup) to the
 number of extra microsteps to inject on each direction reversal. These steps move the
 motor but not the load, taking up the slack so the arm reaches the commanded angle.
+
+**Every move is acceleration-limited.** The sweep uses the jerk-limited 7-phase S-curve;
+all the other moves — homing, parking, pre-sweep staging and the live centre jog — use a
+**trapezoidal** profile (`profiledMove()`): velocity ramps up at `Accel`, cruises at
+`Parking speed`, then ramps down to stop exactly on target. Nothing starts or stops at a
+hard step, so the arm no longer jumps to a new value and loses steps (notably when setting
+the wafer centre). All limits are derived from a single `stepsPerArmDeg()` factor that folds
+in steps-per-rev, the microstep setting and the gear ratio, so speed, acceleration and
+position all stay consistent in the arm frame.
 
 The ultrasonic generator is energised **only while the arm tip is over the wafer disk**.
 

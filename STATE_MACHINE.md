@@ -103,9 +103,8 @@ wafer. The sweep half-width is derived from the wafer diameter and arm length.
 
 ### STATE_HOMING
 **Entry**: START or spray detected.
-**Actions**: motor enabled, steps toward the limit at the positioning step rate derived
-from `Parking speed` (deg/s, gear/microstep-aware via `positioningStepInterval()`),
-yellow LED on.
+**Actions**: motor enabled, `profiledMove()` accelerates the arm toward the limit and
+cruises at `Parking speed` (deg/s, gear/microstep-aware), yellow LED on.
 **Safety**: if the limit is not reached within `HOMING_MAX_DEG_X10` (120°) of travel, or
 within `homingTimeoutMs()` (scales with the positioning step rate), the motor is disabled
 and the state latches `ERROR`.

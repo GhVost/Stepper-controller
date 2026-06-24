@@ -67,11 +67,13 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 - **Sweep Settings**: Sweep time, Wafer diam., Sweep type, Speed prof. — each row shows
   `label:value` (large font, value highlighted) with the arm animation (~1/3 screen)
   underneath. Speed profiles are Sawtooth / Sine / Reciprocal; the sweep angle is in the status bar.
-- **Setup** (hardware): 17 rows, **scrolls vertically** (6-row window, `row/total` counter,
+- **Setup** (hardware): 18 rows, **scrolls vertically** (6-row window, `row/total` counter,
   ▲/▼ markers). Park, Centre (live jog), Parkspd (deg/s positioning speed), Arm,
   Gear in / Gear out (teeth, default 15:108), Cycles, Accel (deg/s²), Jerk (deg/s³),
   Backlsh (µsteps on reversal), Current, RunHold %, PrkHold %, Chop (Stealth/Spread),
-  Mstep, Invert, Debug (ON = ignore spray/flow, OFF = use safety inputs).
+  Mstep, Interp (interpolation on/off), Invert, Debug (ON = ignore spray/flow, OFF = use safety inputs).
+- **Motion**: sweep = jerk-limited S-curve; homing/park/staging/centre-jog = trapezoidal
+  (`profiledMove()`, accel-ramped) — no hard start/stop, no step loss on the live centre jog.
 - Edits persist to RP2040 flash EEPROM emulation and are reloaded at boot.
 
 ---

@@ -149,6 +149,9 @@ int driverRunHoldPct  = 25;
 int driverParkHoldPct = 10;
 // Chopper mode: true = StealthChop (quiet, PWM), false = SpreadCycle (more torque).
 bool driverStealthChop = true;
+// Microstep interpolation (intpol): TMC interpolates the configured microstep resolution
+// up to 256 internally. ON = smoother at low Mstep; turn OFF to feel the raw Mstep setting.
+bool driverInterpolation = true;
 bool driverParkHoldMode = false;
 
 // Hold-current multipliers derived from the editable percentages above.
@@ -159,7 +162,7 @@ const int MICROSTEP_TABLE[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 const int MICROSTEP_COUNT   = 9;
 
 const uint32_t SETTINGS_MAGIC = 0x4D534743UL;  // "MSGC"
-const uint16_t SETTINGS_VERSION = 12;
+const uint16_t SETTINGS_VERSION = 13;
 const size_t EEPROM_BYTES = 4096;
 
 // Auto-save: every Setup/Settings change is persisted, but writes are debounced so a
@@ -194,6 +197,7 @@ struct StoredSettings {
     int16_t driverParkHoldPct;
     int16_t driverStealthChop;
     int16_t parkingSpeedDegS;
+    int16_t driverInterpolation;
     uint32_t checksum;
 };
 
@@ -220,6 +224,11 @@ int           oscillationDir      = -1;
 int           oscillationStepCount = 0;
 
 unsigned long lastMotorStepMicros = 0;
+// Trapezoidal (acceleration-limited) positioning profile state — shared by homing, park,
+// pre-sweep staging and the live centre jog so none of them start/stop at a hard step.
+double        profileVelStepsS  = 0.0;   // current signed velocity (steps/s)
+double        profileAccumSteps = 0.0;   // fractional step accumulator
+unsigned long profileLastMicros = 0;     // last integration time (0 = profile reset)
 volatile int   setupCenterTargetSteps = 0;
 volatile unsigned long setupCenterLastChangeMillis = 0;
 bool          sweepTimingActive = false;
@@ -311,10 +320,10 @@ volatile bool editingSettings     = false;
 volatile bool settingsNeedsRedraw = false;
 
 // Setup rows: Park, Centre, Park spd, Arm, GearIn, GearOut, Cycles, Accel, Jerk,
-// Backlash, Current, RunHold, ParkHold, Chop, Mstep, Invert, Debug. More rows than fit
-// on screen, so the Setup list scrolls vertically (see drawSetup). No "< Back" row —
+// Backlash, Current, RunHold, ParkHold, Chop, Mstep, Interp, Invert, Debug. More rows than
+// fit on screen, so the Setup list scrolls vertically (see drawSetup). No "< Back" row —
 // a long press returns to the menu.
-const int SETUP_COUNT = 17;
+const int SETUP_COUNT = 18;
 volatile int  setupIndex       = 0;
 volatile bool editingSetup     = false;
 volatile bool setupNeedsRedraw = false;
@@ -365,8 +374,11 @@ void handleState();
 int motorShaftRevSteps();
 int degreesToSteps(int degrees);
 int stepsToDegrees(int steps);
+double stepsPerArmDeg();
 unsigned long positioningStepInterval();
 unsigned long homingTimeoutMs();
+void resetMotionProfile();
+bool profiledMove(unsigned long nowUs, int target, bool freeRun, int freeDir);
 void motorStep(int direction);
 void motorSetEnable(bool enable);
 void motorMoveTo(int target);
@@ -526,11 +538,12 @@ void initTMC2130() {
     driver.microsteps(driverMicrosteps);
     driver.iholddelay(15);
     driver.TPOWERDOWN(20);
-    driver.intpol(true);
+    driver.intpol(driverInterpolation);
     driver.en_pwm_mode(driverStealthChop);   // StealthChop when true, SpreadCycle when false
     driver.pwm_autoscale(true);
-    Serial.printf("TMC2130 configured: %d mA, run hold %d%%, park hold %d%%, %dx microsteps, interpolation, %s\n",
+    Serial.printf("TMC2130 configured: %d mA, run hold %d%%, park hold %d%%, %dx microsteps, intpol %s, %s\n",
                   driverCurrent, driverRunHoldPct, driverParkHoldPct, driverMicrosteps,
+                  driverInterpolation ? "on" : "off",
                   driverStealthChop ? "StealthChop" : "SpreadCycle");
     dumpDriverStatus();
 }
@@ -609,6 +622,7 @@ void loadSettings() {
     driverParkHoldPct = constrain((int)stored.driverParkHoldPct, 0, 100);
     driverStealthChop = stored.driverStealthChop != 0;
     parkingSpeedDegS = constrain((int)stored.parkingSpeedDegS, 1, 120);
+    driverInterpolation = stored.driverInterpolation != 0;
     enforceMinimumSweepTime(true);
 
     Serial.printf("Settings: loaded from flash (v%u)\n", stored.version);
@@ -640,6 +654,7 @@ void saveSettings() {
     stored.driverParkHoldPct = driverParkHoldPct;
     stored.driverStealthChop = driverStealthChop ? 1 : 0;
     stored.parkingSpeedDegS = parkingSpeedDegS;
+    stored.driverInterpolation = driverInterpolation ? 1 : 0;
     stored.checksum = settingsChecksum(stored);
 
     EEPROM.put(0, stored);
@@ -1203,22 +1218,25 @@ void handleState() {
     unsigned long now = millis();
     unsigned long stepNow = micros();
 
-    if (displayMode == DISP_SETUP && editingSetup && setupIndex == 1) {
+    // Reset the trapezoidal profile whenever the move context changes, so a new move
+    // always starts from a standstill (no leftover velocity carried between moves).
+    static SystemState profiledState = STATE_IDLE;
+    static bool        profiledJog   = false;
+    bool jogActive = (displayMode == DISP_SETUP && editingSetup && setupIndex == 1);
+    if (currentState != profiledState || jogActive != profiledJog) {
+        resetMotionProfile();
+        profiledState = currentState;
+        profiledJog   = jogActive;
+    }
+
+    if (jogActive) {
         setDriverParkHold(false);
         motorSetEnable(true);
         setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
         setFan(FAN_OFF); setUltrasonic(false);
-        if (millis() - setupCenterLastChangeMillis < SETUP_CENTER_FOLLOW_DELAY_MS) {
-            return;
-        }
-        for (int i = 0;
-             i < 4 &&
-             stepNow - lastMotorStepMicros >= SETUP_CENTER_UPDATE_INTERVAL_US &&
-             motorPosition != setupCenterTargetSteps;
-             i++) {
-            motorMoveTo(setupCenterTargetSteps);
-            lastMotorStepMicros += SETUP_CENTER_UPDATE_INTERVAL_US;
-        }
+        // Acceleration-limited follow of the live target: smoothly tracks the encoder
+        // instead of bursting to the new value and dropping steps.
+        profiledMove(stepNow, setupCenterTargetSteps, false, 0);
         return;
     }
 
@@ -1236,18 +1254,15 @@ void handleState() {
             setDriverParkHold(false);
             motorSetEnable(true);
             setLED(LED_GREEN, false); setLED(LED_YELLOW, true);
-            if (stepNow - lastMotorStepMicros >= positioningStepInterval()) {
-                motorStep(-1); lastMotorStepMicros = stepNow;
-            }
+            // Ramp up to cruise toward the limit (freeRun); the endstop ends the move.
+            profiledMove(stepNow, 0, true, -1);
             break;
 
         case STATE_PARKED:
             motorSetEnable(true);
             if (motorPosition != degX10ToSteps(PARK_DEG_X10)) {
                 setDriverParkHold(false);
-                if (stepNow - lastMotorStepMicros >= positioningStepInterval()) {
-                    motorMoveTo(degX10ToSteps(PARK_DEG_X10)); lastMotorStepMicros = stepNow;
-                }
+                profiledMove(stepNow, degX10ToSteps(PARK_DEG_X10), false, 0);
             } else {
                 setDriverParkHold(true);
             }
@@ -1267,9 +1282,8 @@ void handleState() {
             setFan(FAN_FULL); setUltrasonic(armOverWafer());   // generator only over the wafer
             setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
             motorSetEnable(true);
-            if (stepNow - lastMotorStepMicros >= positioningStepInterval()) {
-                motorMoveTo(sweepBackSteps()); lastMotorStepMicros = stepNow;
-            }
+            // Ramp to the sweep start position before oscillating (no hard start).
+            profiledMove(stepNow, sweepBackSteps(), false, 0);
             break;
 
         case STATE_OSCILLATING:
@@ -1457,10 +1471,11 @@ void adjustSetupValue(int delta) {
             driverMicrosteps = MICROSTEP_TABLE[idx];
             break;
         }
-        case 15:
+        case 15: driverInterpolation = !driverInterpolation; break;
+        case 16:
             motorDirectionInverted = !motorDirectionInverted;
             break;
-        case 16:
+        case 17:
             SENSOR_INPUTS_ENABLED = !SENSOR_INPUTS_ENABLED;
             break;
     }
@@ -1472,13 +1487,14 @@ void applyDriverSettings() {
     mutex_enter_blocking(&spi_mutex);
     driver.rms_current(driverCurrent, driverParkHoldMode ? driverParkHoldMult() : driverRunHoldMult());
     driver.microsteps(driverMicrosteps);
-    driver.intpol(true);
+    driver.intpol(driverInterpolation);
     driver.en_pwm_mode(driverStealthChop);   // StealthChop when true, SpreadCycle when false
     mutex_exit(&spi_mutex);
-    Serial.printf("Driver applied: %d mA, hold %d%%, %dx microsteps, %s\n",
+    Serial.printf("Driver applied: %d mA, hold %d%%, %dx microsteps, intpol %s, %s\n",
                   driverCurrent,
                   driverParkHoldMode ? driverParkHoldPct : driverRunHoldPct,
                   driverMicrosteps,
+                  driverInterpolation ? "on" : "off",
                   driverStealthChop ? "StealthChop" : "SpreadCycle");
 }
 
@@ -1773,14 +1789,18 @@ int stepsToDegX10(int steps) {
     return (int)((numerator - denom / 2) / denom);
 }
 
-// Motor step interval (µs) that moves the ARM at parkingSpeedDegS, accounting for
-// microstepping and the gear reduction, clamped to the motor's fastest safe rate.
-// Used for the constant-speed positioning moves (homing, park, pre-sweep staging).
+// Motor microsteps per ARM degree — the single source of truth for the geometry,
+// folding in steps-per-revolution, the microstep setting and the gear reduction.
+double stepsPerArmDeg() {
+    return (double)FULL_STEPS_PER_REV * driverMicrosteps * gearTeethOutput
+           / (360.0 * gearTeethMotor);
+}
+
+// Motor step interval (µs) for cruising the ARM at parkingSpeedDegS, clamped to the
+// motor's fastest safe rate. Used to size the homing timeout.
 unsigned long positioningStepInterval() {
-    double stepsPerArmDeg = (double)FULL_STEPS_PER_REV * driverMicrosteps * gearTeethOutput
-                            / (360.0 * gearTeethMotor);
     double speed = (double)max(parkingSpeedDegS, 1);
-    double us = 1.0e6 / (speed * stepsPerArmDeg);
+    double us = 1.0e6 / (speed * stepsPerArmDeg());
     unsigned long iv = (unsigned long)(us + 0.5);
     return iv < MIN_SWEEP_STEP_INTERVAL_US ? MIN_SWEEP_STEP_INTERVAL_US : iv;
 }
@@ -1852,6 +1872,55 @@ void motorSetEnable(bool enable) {
 void motorMoveTo(int target) {
     if      (motorPosition < target) motorStep( 1);
     else if (motorPosition > target) motorStep(-1);
+}
+
+void resetMotionProfile() {
+    profileVelStepsS  = 0.0;
+    profileAccumSteps = 0.0;
+    profileLastMicros = 0;
+}
+
+// Acceleration-limited (trapezoidal) move toward `target` (in steps). The velocity ramps
+// up at motionAccelDegS2, cruises at parkingSpeedDegS and ramps back down so the arm stops
+// exactly on target without a hard start/stop (which loses steps). When `freeRun` is set the
+// arm just accelerates to cruise in `freeDir` and keeps going (homing, which stops on the
+// endstop). All limits are converted from arm-frame to motor steps via stepsPerArmDeg(), so
+// they fold in microsteps, steps-per-rev and the gear ratio. Returns true once at rest on
+// the target. Call once per control tick; emits 0..N whole steps to honour the profile.
+bool profiledMove(unsigned long nowUs, int target, bool freeRun, int freeDir) {
+    if (profileLastMicros == 0) { profileLastMicros = nowUs; return false; }
+    double dt = (double)(nowUs - profileLastMicros) * 1.0e-6;
+    profileLastMicros = nowUs;
+    if (dt <= 0.0) return false;
+    if (dt > 0.02) dt = 0.02;   // after a stall, integrate at most one slice so we don't lurch
+
+    double spd  = stepsPerArmDeg();
+    double aMax = max(motionAccelDegS2, 1.0) * spd;                 // steps/s^2
+    double vCap = 1.0e6 / (double)MIN_SWEEP_STEP_INTERVAL_US;        // motor's fastest safe rate
+    double vMax = min((double)max(parkingSpeedDegS, 1) * spd, vCap);
+
+    double vTarget;
+    if (freeRun) {
+        vTarget = (double)freeDir * vMax;
+    } else {
+        double remaining = (double)(target - motorPosition) - profileAccumSteps;
+        double vStop = sqrt(2.0 * aMax * fabs(remaining));          // fastest v that can still stop in time
+        double v = min(vMax, vStop);
+        vTarget = (remaining > 0.5) ? v : (remaining < -0.5 ? -v : 0.0);
+    }
+
+    // Slope-limit the velocity change by the acceleration.
+    double dv = aMax * dt;
+    if      (profileVelStepsS < vTarget) profileVelStepsS = min(profileVelStepsS + dv, vTarget);
+    else if (profileVelStepsS > vTarget) profileVelStepsS = max(profileVelStepsS - dv, vTarget);
+
+    // Integrate velocity into the fractional accumulator and emit whole steps.
+    profileAccumSteps += profileVelStepsS * dt;
+    int guard = 0;
+    while (profileAccumSteps >=  1.0 && guard++ < 256) { motorStep( 1); profileAccumSteps -= 1.0; }
+    while (profileAccumSteps <= -1.0 && guard++ < 256) { motorStep(-1); profileAccumSteps += 1.0; }
+
+    return !freeRun && motorPosition == target && fabs(profileVelStepsS) < 1.0;
 }
 
 void motorMoveToBlocking(int target, unsigned int stepDelayUs) {
@@ -2293,7 +2362,7 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
     const char* labels[] = {
         "Park   ", "Centre ", "Parkspd", "Arm    ", "Gear in", "Gearout", "Cycles ",
         "Accel  ", "Jerk   ", "Backlsh", "Current", "RunHold", "PrkHold",
-        "Chop   ", "Mstep  ", "Invert ", "Debug  "
+        "Chop   ", "Mstep  ", "Interp ", "Invert ", "Debug  "
     };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
@@ -2322,8 +2391,9 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
         case 12: tft.print(driverParkHoldPct);  tft.print(" %");  break;
         case 13: tft.print(driverStealthChop ? "Stealth" : "Spread"); break;
         case 14: tft.print(driverMicrosteps); tft.print("x"); break;
-        case 15: tft.print(motorDirectionInverted ? "ON" : "OFF"); break;
-        case 16: tft.print(SENSOR_INPUTS_ENABLED ? "OFF" : "ON");   break;
+        case 15: tft.print(driverInterpolation ? "ON" : "OFF"); break;
+        case 16: tft.print(motorDirectionInverted ? "ON" : "OFF"); break;
+        case 17: tft.print(SENSOR_INPUTS_ENABLED ? "OFF" : "ON");   break;
     }
 }
 
@@ -2355,8 +2425,8 @@ void drawSetup() {
         gearTeethMotor, gearTeethOutput, (int)OSCILLATION_CYCLES,
         (int)(motionAccelDegS2 + 0.5), (int)(motionJerkDegS3 + 0.5),
         backlashMicrosteps, driverCurrent, driverRunHoldPct, driverParkHoldPct,
-        driverStealthChop ? 1 : 0, driverMicrosteps, motorDirectionInverted ? 1 : 0,
-        SENSOR_INPUTS_ENABLED ? 1 : 0
+        driverStealthChop ? 1 : 0, driverMicrosteps, driverInterpolation ? 1 : 0,
+        motorDirectionInverted ? 1 : 0, SENSOR_INPUTS_ENABLED ? 1 : 0
     };
 
     bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit) || (first != lastFirst);
