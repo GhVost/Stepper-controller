@@ -35,6 +35,14 @@
   <div class="screens">
     <div class="lcd"><div class="cap">SWEEP SETTINGS — change a value, watch the arm react</div>
       <div class="bezel"><canvas id="lcdS"></canvas></div></div>
+    <div class="lcd"><div class="cap">SETUP — hidden hardware menu, scrolls vertically (16 rows)</div>
+      <div class="bezel"><canvas id="lcdSetup"></canvas></div></div>
+  </div>
+
+  <div class="row">
+    <span style="font-size:12.5px;color:#8b93a3">Setup row</span>
+    <input id="setupSel" type="range" min="0" max="15" value="3">
+    <span id="setupSelLbl" style="font-size:12.5px;width:120px">4/16 — Gear in</span>
   </div>
 
   <div class="controls">
@@ -68,8 +76,12 @@
     <b>Tour shows</b> to pick the demonstrated features and <b>Play speed</b> to scale the tour;
     each value runs for a few full oscillations and only changes when the arm is at the wafer
     edge. To record a GIF, capture the panel
-    (Windows <code>Win+Alt+R</code> or ScreenToGif). The hidden hardware <i>Setup</i> and
-    <i>About</i> screens are omitted.
+    (Windows <code>Win+Alt+R</code> or ScreenToGif). The second panel shows the hidden hardware
+    <b>SETUP</b> menu — now 16 rows that scroll vertically with a sliding 6-row window, a
+    <code>row/total</code> counter and ▲/▼ markers. Drag <b>Setup row</b> to scroll: it includes
+    the new <b>gear ratio</b> (Gear in / Gear out, default 15:108), <b>Accel</b>/<b>Jerk</b>,
+    <b>Backlash</b> take-up (µsteps), and the driver <b>RunHold</b>/<b>PrkHold</b> % and
+    <b>Chop</b> (StealthChop/SpreadCycle) settings. The <i>About</i> screen is omitted.
   </div>
 </div>
 
@@ -78,6 +90,8 @@
 const W = 320, H = 172, SS = 2;
 const cS = document.getElementById('lcdS');
 cS.width = W*SS; cS.height = H*SS;
+const cSetup = document.getElementById('lcdSetup');
+cSetup.width = W*SS; cSetup.height = H*SS;
 let ctx = cS.getContext('2d');
 function use(c){ ctx = c.getContext('2d'); }
 
@@ -207,6 +221,52 @@ function drawSettings(){
 }
 function render(){ use(cS); drawSettings(); }
 
+// ---- SETUP screen (hidden hardware menu): 16 rows, vertical scroll window ----
+// Labels are padded to 7 chars and values are white (mirrors the firmware drawSetupRow).
+// Defaults match the firmware boot values, incl. the 15:108 gear ratio.
+const SETUP_ROWS = [
+  { label:"Park   ", val:"5.0 deg"   },
+  { label:"Centre ", val:"70.0 deg"  },
+  { label:"Arm    ", val:"250 mm"    },
+  { label:"Gear in", val:"15 t"      },
+  { label:"Gearout", val:"108 t"     },
+  { label:"Cycles ", val:"4"         },
+  { label:"Accel  ", val:"100"       },
+  { label:"Jerk   ", val:"4000"      },
+  { label:"Backlsh", val:"0 us"      },
+  { label:"Current", val:"800 mA"    },
+  { label:"RunHold", val:"25 %"      },
+  { label:"PrkHold", val:"10 %"      },
+  { label:"Chop   ", val:"Stealth"   },
+  { label:"Mstep  ", val:"256x"      },
+  { label:"Invert ", val:"OFF"       },
+  { label:"Debug  ", val:"ON"        },
+];
+let setupSel = 3;
+function setupRow(i,y,sel){
+  const bg = sel ? C.blue : C.black;
+  rect(0,y-2,CONTENT_W,20,bg);
+  const lab = SETUP_ROWS[i].label + ": ";
+  text(6,y,lab,2,C.white);
+  text(6+lab.length*12,y,SETUP_ROWS[i].val,2,C.white);
+}
+function drawSetupScreen(){
+  const VIS=6, Y0=26, DY=22, N=SETUP_ROWS.length;
+  rect(0,0,W,H,C.black);
+  let first=0, si=setupSel;
+  if(si<first) first=si;
+  if(si>=first+VIS) first=si-VIS+1;
+  first=Math.max(0,Math.min(first,N-VIS));
+  text(6,3,"SETUP",2,C.cyan);
+  const pos=(si+1)+'/'+N;
+  text(CONTENT_W-pos.length*12-6,3,pos,2,C.cyan);
+  for(let r=0;r<VIS;r++){ const i=first+r; if(i>=N) break; setupRow(i,Y0+r*DY,i===si); }
+  const xa=CONTENT_W-12, yTop=Y0, yBot=Y0+(VIS-1)*DY+4;
+  if(first>0)       fillTri(xa,yTop, xa-6,yTop+8, xa+6,yTop+8, C.yellow);
+  if(first+VIS<N)   fillTri(xa,yBot+8, xa-6,yBot, xa+6,yBot, C.yellow);
+}
+function renderSetup(){ use(cSetup); drawSetupScreen(); }
+
 // ===================== auto tour (checkbox-driven feature segments) =====================
 // `vt` is a virtual clock advanced by (real dt × speed); the tour and the lightning
 // blink both run off it, so the Play-speed slider scales the whole demonstration.
@@ -312,6 +372,13 @@ const slider=document.getElementById('angle'), slbl=document.getElementById('ang
 slider.oninput=()=>{ stopAuto(); S.angleX10=+slider.value; slbl.innerHTML=degStr(S.angleX10)+'&deg;'; };
 function syncSlider(){ slider.value=S.angleX10; slbl.innerHTML=degStr(S.angleX10)+'&deg;'; }
 
+const setupSlider=document.getElementById('setupSel'), setupSelLbl=document.getElementById('setupSelLbl');
+setupSlider.oninput=()=>{
+  setupSel=+setupSlider.value;
+  setupSelLbl.textContent=(setupSel+1)+'/'+SETUP_ROWS.length+' — '+SETUP_ROWS[setupSel].label.trim();
+  renderSetup();
+};
+
 const fbox=document.getElementById('features');
 FEATURES.forEach(f=>{
   const lbl=document.createElement('label'); lbl.className='feat';
@@ -321,6 +388,7 @@ FEATURES.forEach(f=>{
 });
 
 buildTour();
+renderSetup();
 requestAnimationFrame(tick);
 </script>
 </body>

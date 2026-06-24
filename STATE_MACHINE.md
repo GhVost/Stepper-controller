@@ -185,7 +185,7 @@ const unsigned long MOTOR_UPDATE_INTERVAL_US = 500; // µs per step (homing/park
 const int           HOMING_MAX_DEG_X10     = 700;  // 70° home-search limit
 ```
 
-Steps are derived from angle: `steps = degX10 × FULL_STEPS_PER_REV × microsteps / 3600`.
+Steps are derived from angle: `steps = degX10 × FULL_STEPS_PER_REV × microsteps × (gearOut/gearIn) / 3600` (gear default 15:108).
 The sweep half-width = `asin((waferØ/2) / armLength)`, so the sweep extremes reach the
 wafer edges; sweep type `Edge↔(•)` travels half of this (edge→centre), `Edge↔Edge` the
 full width (edge→edge).

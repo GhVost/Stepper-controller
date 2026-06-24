@@ -67,8 +67,11 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 - **Sweep Settings**: Sweep time, Wafer diam., Sweep type, Speed prof. — each row shows
   `label:value` (large font, value highlighted) with the arm animation (~1/3 screen)
   underneath. Speed profiles are Sawtooth / Sine / Reciprocal; the sweep angle is in the status bar.
-- **Setup** (hardware): Park, Centre (live jog), Arm, Cycles, Current, Mstep, Invert,
-  Debug (ON = ignore spray/flow, OFF = use safety inputs).
+- **Setup** (hardware): 16 rows, **scrolls vertically** (6-row window, `row/total` counter,
+  ▲/▼ markers). Park, Centre (live jog), Arm, Gear in / Gear out (teeth, default 15:108),
+  Cycles, Accel (deg/s²), Jerk (deg/s³), Backlsh (µsteps on reversal), Current, RunHold %,
+  PrkHold %, Chop (Stealth/Spread), Mstep, Invert, Debug (ON = ignore spray/flow, OFF = use
+  safety inputs).
 - Edits persist to RP2040 flash EEPROM emulation and are reloaded at boot.
 
 ---
@@ -122,7 +125,7 @@ START always re-homes first (position is unknown whenever the motor was disabled
 motorStep(int dir);           // ±1 step; updates motorPosition
 motorSetEnable(bool en);      // LOW = energised
 motorMoveTo(int target);      // call repeatedly — one step toward target
-degX10ToSteps(int degX10);    // angle (0.1°) → microsteps
+degX10ToSteps(int degX10);    // arm angle (0.1°) → motor microsteps (incl. gear ratio)
 
 // Sensors / input
 readSensors();                // limit always; spray/flow only when Debug = OFF
@@ -146,9 +149,12 @@ saveSettings() / loadSettings();  // flash persistence (versioned + checksummed)
 ## Motion Parameters
 
 ```cpp
-PARK_DEG_X10      = 70      // 7.0° park angle near the limit
-CENTER_DEG_X10    = 260     // 26.0° sweep centre over the wafer
+gearTeethMotor    = 15      // motor pinion teeth   } 15:108 = 7.2:1 reduction
+gearTeethOutput   = 108     // arm output gear teeth }
+PARK_DEG_X10      = 50      // 5.0° park angle near the limit
+CENTER_DEG_X10    = 700     // 70.0° sweep centre over the wafer
 ARM_LENGTH_MM     = 250     // arm length (transducer radius)
+backlashMicrosteps = 0      // extra µsteps injected on each direction reversal
 SWEEP_TIME_MS     = 4000    // ms per full back-forward-back cycle
 OSCILLATION_CYCLES = 4      // full cycles to run (0 = forever)
 SPRAY_ACTIVE_WAIT = 2000    // ms settle before oscillation
@@ -183,7 +189,7 @@ Settings: loaded from flash
 Hardware initialized
 SPI0 LCD initialized: SCK=18 MOSI=19
 SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
-TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
+TMC2130 configured: 800 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
 Encoder initialized: CLK=26 DT=27 SW=22 (polled rotation, interrupt button)
 Display initialized (GMT147SPI 1.47" 172x320)
 Initialization complete!

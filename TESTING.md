@@ -36,7 +36,7 @@ Settings: loaded from flash          (or "using defaults" on first boot)
 Hardware initialized
 SPI0 LCD initialized: SCK=18 MOSI=19
 SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
-TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
+TMC2130 configured: 800 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
 === TMC2130 DEBUG ===
 ...register dump...
 Encoder initialized: CLK=26 DT=27 SW=22 (polled rotation, interrupt button)

@@ -89,6 +89,14 @@ volatile bool faultLatched  = false;
 
 // ============= MOTION PARAMETERS =============
 const int FULL_STEPS_PER_REV = 200;  // typical 1.8 degree NEMA17 motor
+// Gear reduction between the motor pinion and the arm output gear. The arm turns
+// gearTeethMotor/gearTeethOutput as fast as the motor, so the motor must run
+// gearTeethOutput/gearTeethMotor steps per arm degree. Default 15:108 (= 7.2:1).
+int gearTeethMotor     = 15;
+int gearTeethOutput    = 108;
+// Backlash take-up: extra microsteps injected (motor only, not load) on each
+// direction reversal to absorb gear slack. 0 = disabled.
+int backlashMicrosteps = 0;
 int PARK_DEG_X10       = 50;
 int CENTER_DEG_X10     = 700;
 int ARM_LENGTH_MM      = 250;
@@ -131,15 +139,23 @@ const double MOTION_JERK_STEP_DEG_S3 = 200.0;
 int driverCurrent    = 800;
 int driverMicrosteps = 256;
 bool motorDirectionInverted = false;
-const float DRIVER_RUN_HOLD_MULTIPLIER = 0.25f;
-const float DRIVER_PARK_HOLD_MULTIPLIER = 0.10f;
+// Hold-current as a percentage of run current: applied while moving (run) and a
+// lower level while parked (park). Editable in Setup.
+int driverRunHoldPct  = 25;
+int driverParkHoldPct = 10;
+// Chopper mode: true = StealthChop (quiet, PWM), false = SpreadCycle (more torque).
+bool driverStealthChop = true;
 bool driverParkHoldMode = false;
+
+// Hold-current multipliers derived from the editable percentages above.
+inline float driverRunHoldMult()  { return driverRunHoldPct  / 100.0f; }
+inline float driverParkHoldMult() { return driverParkHoldPct / 100.0f; }
 
 const int MICROSTEP_TABLE[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 const int MICROSTEP_COUNT   = 9;
 
 const uint32_t SETTINGS_MAGIC = 0x4D534743UL;  // "MSGC"
-const uint16_t SETTINGS_VERSION = 10;
+const uint16_t SETTINGS_VERSION = 11;
 const size_t EEPROM_BYTES = 4096;
 
 // Auto-save: every Setup/Settings change is persisted, but writes are debounced so a
@@ -167,6 +183,12 @@ struct StoredSettings {
     int16_t sensorInputsEnabled;
     int16_t motionAccelDegS2;
     int16_t motionJerkDegS3;
+    int16_t gearTeethMotor;
+    int16_t gearTeethOutput;
+    int16_t backlashMicrosteps;
+    int16_t driverRunHoldPct;
+    int16_t driverParkHoldPct;
+    int16_t driverStealthChop;
     uint32_t checksum;
 };
 
@@ -283,9 +305,11 @@ volatile int  settingsIndex       = 0;
 volatile bool editingSettings     = false;
 volatile bool settingsNeedsRedraw = false;
 
-// Setup rows: Park, Centre, Arm, Cycles, Current, Mstep, Invert, Debug. No "< Back" row —
+// Setup rows: Park, Centre, Arm, GearIn, GearOut, Cycles, Accel, Jerk, Backlash,
+// Current, RunHold, ParkHold, Chop, Mstep, Invert, Debug. More rows than fit on
+// screen, so the Setup list scrolls vertically (see drawSetup). No "< Back" row —
 // a long press returns to the menu.
-const int SETUP_COUNT = 8;
+const int SETUP_COUNT = 16;
 volatile int  setupIndex       = 0;
 volatile bool editingSetup     = false;
 volatile bool setupNeedsRedraw = false;
@@ -491,16 +515,16 @@ void initTMC2130() {
     driver.setSPISpeed(1000000);
     driver.begin();
     driver.toff(5);
-    driver.rms_current(driverCurrent, DRIVER_RUN_HOLD_MULTIPLIER);
+    driver.rms_current(driverCurrent, driverRunHoldMult());
     driver.microsteps(driverMicrosteps);
     driver.iholddelay(15);
     driver.TPOWERDOWN(20);
     driver.intpol(true);
-    driver.en_pwm_mode(true);
+    driver.en_pwm_mode(driverStealthChop);   // StealthChop when true, SpreadCycle when false
     driver.pwm_autoscale(true);
-    Serial.printf("TMC2130 configured: %d mA, run hold %.0f%%, park hold %.0f%%, %dx microsteps, interpolation, StealthChop\n",
-                  driverCurrent, DRIVER_RUN_HOLD_MULTIPLIER * 100.0f,
-                  DRIVER_PARK_HOLD_MULTIPLIER * 100.0f, driverMicrosteps);
+    Serial.printf("TMC2130 configured: %d mA, run hold %d%%, park hold %d%%, %dx microsteps, interpolation, %s\n",
+                  driverCurrent, driverRunHoldPct, driverParkHoldPct, driverMicrosteps,
+                  driverStealthChop ? "StealthChop" : "SpreadCycle");
     dumpDriverStatus();
 }
 
@@ -571,6 +595,12 @@ void loadSettings() {
     SENSOR_INPUTS_ENABLED = stored.sensorInputsEnabled != 0;
     motionAccelDegS2 = constrain((double)stored.motionAccelDegS2, MOTION_ACCEL_MIN_DEG_S2, MOTION_ACCEL_MAX_DEG_S2);
     motionJerkDegS3 = constrain((double)stored.motionJerkDegS3, MOTION_JERK_MIN_DEG_S3, MOTION_JERK_MAX_DEG_S3);
+    gearTeethMotor = constrain((int)stored.gearTeethMotor, 1, 500);
+    gearTeethOutput = constrain((int)stored.gearTeethOutput, 1, 500);
+    backlashMicrosteps = constrain((int)stored.backlashMicrosteps, 0, 2000);
+    driverRunHoldPct = constrain((int)stored.driverRunHoldPct, 1, 100);
+    driverParkHoldPct = constrain((int)stored.driverParkHoldPct, 0, 100);
+    driverStealthChop = stored.driverStealthChop != 0;
     enforceMinimumSweepTime(true);
 
     Serial.printf("Settings: loaded from flash (v%u)\n", stored.version);
@@ -595,6 +625,12 @@ void saveSettings() {
     stored.sensorInputsEnabled = SENSOR_INPUTS_ENABLED ? 1 : 0;
     stored.motionAccelDegS2 = (int16_t)(motionAccelDegS2 + 0.5);
     stored.motionJerkDegS3 = (int16_t)(motionJerkDegS3 + 0.5);
+    stored.gearTeethMotor = gearTeethMotor;
+    stored.gearTeethOutput = gearTeethOutput;
+    stored.backlashMicrosteps = backlashMicrosteps;
+    stored.driverRunHoldPct = driverRunHoldPct;
+    stored.driverParkHoldPct = driverParkHoldPct;
+    stored.driverStealthChop = driverStealthChop ? 1 : 0;
     stored.checksum = settingsChecksum(stored);
 
     EEPROM.put(0, stored);
@@ -684,7 +720,8 @@ double sweepProfileFactor(int currentSteps, int startSteps, int targetSteps) {
     int sweepSteps = abs(targetSteps - startSteps);
     if (sweepSteps <= 0) return 1.0;
 
-    double dps = 360.0 / (double)(FULL_STEPS_PER_REV * driverMicrosteps);
+    double dps = 360.0 / (double)(FULL_STEPS_PER_REV * driverMicrosteps)
+                 * (double)gearTeethMotor / (double)gearTeethOutput;  // arm degrees per motor step
     int progressSteps = abs(currentSteps - startSteps);
     // Evaluate at the midpoint of this step so the endpoint distance is never zero
     double fromStartDeg = (progressSteps + 0.5) * dps;
@@ -739,7 +776,8 @@ unsigned long minimumSweepTimeMs() {
     if (backSteps == fwdSteps) return 500UL;
 
     // Minimum time = cycle time when running at the maximum step rate, fully S-curve constrained.
-    double dps  = 360.0 / (double)(FULL_STEPS_PER_REV * driverMicrosteps);
+    double dps  = 360.0 / (double)(FULL_STEPS_PER_REV * driverMicrosteps)
+                  * (double)gearTeethMotor / (double)gearTeethOutput;  // arm degrees per motor step
     double vMax = dps * 1.0e6 / (double)MIN_SWEEP_STEP_INTERVAL_US;
 
     double savedPeak = sweepVelocityPeakDegS;
@@ -769,7 +807,8 @@ void resetSweepTiming() {
 static void beginSweepLegTiming(unsigned long nowUs, int startSteps, int targetSteps) {
     int backSteps = sweepBackSteps();
     int fwdSteps  = sweepForwardSteps();
-    double dps    = 360.0 / (double)(FULL_STEPS_PER_REV * driverMicrosteps);
+    double dps    = 360.0 / (double)(FULL_STEPS_PER_REV * driverMicrosteps)
+                    * (double)gearTeethMotor / (double)gearTeethOutput;  // arm degrees per motor step
 
     // Binary search for sweepVelocityPeakDegS such that the total cycle time = SWEEP_TIME_MS.
     // Invariant: T(vLo) > target, T(vHi) <= target.
@@ -1375,8 +1414,10 @@ void adjustSettingsValue(int delta) {
     markSettingsDirty();
 }
 
-// Adjust Setup (hardware) parameter by encoder delta
+// Adjust Setup (hardware) parameter by encoder delta. Row order must match the
+// labels in drawSetupRow().
 void adjustSetupValue(int delta) {
+    int singleStep = delta > 0 ? 1 : -1;
     switch (setupIndex) {
         case 0: PARK_DEG_X10 = constrain(PARK_DEG_X10 + delta, 10, 1800); break;
         case 1:
@@ -1385,11 +1426,20 @@ void adjustSetupValue(int delta) {
             setupCenterLastChangeMillis = millis();
             break;
         case 2: ARM_LENGTH_MM = constrain(ARM_LENGTH_MM + delta * 5, 50, 1000); break;
-        case 3: OSCILLATION_CYCLES = (unsigned long)constrain(
+        case 3: gearTeethMotor  = constrain(gearTeethMotor + delta, 1, 500); break;
+        case 4: gearTeethOutput = constrain(gearTeethOutput + delta, 1, 500); break;
+        case 5: OSCILLATION_CYCLES = (unsigned long)constrain(
                     (long)OSCILLATION_CYCLES + delta, 0L, 100L); break;
-        case 4: driverCurrent = constrain(driverCurrent + delta * 50, 100, 1500); break;
-        case 5: {
-            int singleStep = delta > 0 ? 1 : -1;
+        case 6: motionAccelDegS2 = constrain(motionAccelDegS2 + delta * MOTION_ACCEL_STEP_DEG_S2,
+                    MOTION_ACCEL_MIN_DEG_S2, MOTION_ACCEL_MAX_DEG_S2); break;
+        case 7: motionJerkDegS3 = constrain(motionJerkDegS3 + delta * MOTION_JERK_STEP_DEG_S3,
+                    MOTION_JERK_MIN_DEG_S3, MOTION_JERK_MAX_DEG_S3); break;
+        case 8: backlashMicrosteps = constrain(backlashMicrosteps + delta, 0, 2000); break;
+        case 9: driverCurrent = constrain(driverCurrent + delta * 50, 100, 1500); break;
+        case 10: driverRunHoldPct  = constrain(driverRunHoldPct + delta, 1, 100); break;
+        case 11: driverParkHoldPct = constrain(driverParkHoldPct + delta, 0, 100); break;
+        case 12: driverStealthChop = !driverStealthChop; break;
+        case 13: {
             int idx = 4;
             for (int i = 0; i < MICROSTEP_COUNT; i++)
                 if (MICROSTEP_TABLE[i] == driverMicrosteps) { idx = i; break; }
@@ -1397,10 +1447,10 @@ void adjustSetupValue(int delta) {
             driverMicrosteps = MICROSTEP_TABLE[idx];
             break;
         }
-        case 6:
+        case 14:
             motorDirectionInverted = !motorDirectionInverted;
             break;
-        case 7:
+        case 15:
             SENSOR_INPUTS_ENABLED = !SENSOR_INPUTS_ENABLED;
             break;
     }
@@ -1410,14 +1460,16 @@ void adjustSetupValue(int delta) {
 
 void applyDriverSettings() {
     mutex_enter_blocking(&spi_mutex);
-    driver.rms_current(driverCurrent, driverParkHoldMode ? DRIVER_PARK_HOLD_MULTIPLIER : DRIVER_RUN_HOLD_MULTIPLIER);
+    driver.rms_current(driverCurrent, driverParkHoldMode ? driverParkHoldMult() : driverRunHoldMult());
     driver.microsteps(driverMicrosteps);
     driver.intpol(true);
+    driver.en_pwm_mode(driverStealthChop);   // StealthChop when true, SpreadCycle when false
     mutex_exit(&spi_mutex);
-    Serial.printf("Driver applied: %d mA, hold %.0f%%, %dx microsteps\n",
+    Serial.printf("Driver applied: %d mA, hold %d%%, %dx microsteps, %s\n",
                   driverCurrent,
-                  (driverParkHoldMode ? DRIVER_PARK_HOLD_MULTIPLIER : DRIVER_RUN_HOLD_MULTIPLIER) * 100.0f,
-                  driverMicrosteps);
+                  driverParkHoldMode ? driverParkHoldPct : driverRunHoldPct,
+                  driverMicrosteps,
+                  driverStealthChop ? "StealthChop" : "SpreadCycle");
 }
 
 void setDriverParkHold(bool parkHold) {
@@ -1425,11 +1477,11 @@ void setDriverParkHold(bool parkHold) {
 
     driverParkHoldMode = parkHold;
     mutex_enter_blocking(&spi_mutex);
-    driver.rms_current(driverCurrent, parkHold ? DRIVER_PARK_HOLD_MULTIPLIER : DRIVER_RUN_HOLD_MULTIPLIER);
+    driver.rms_current(driverCurrent, parkHold ? driverParkHoldMult() : driverRunHoldMult());
     mutex_exit(&spi_mutex);
-    Serial.printf("Driver hold mode: %s hold %.0f%%\n",
+    Serial.printf("Driver hold mode: %s hold %d%%\n",
                   parkHold ? "park" : "run",
-                  (parkHold ? DRIVER_PARK_HOLD_MULTIPLIER : DRIVER_RUN_HOLD_MULTIPLIER) * 100.0f);
+                  parkHold ? driverParkHoldPct : driverRunHoldPct);
 }
 
 void pollDriverStatus() {
@@ -1683,14 +1735,18 @@ int degreesToSteps(int degrees) {
     return (int)((steps + 180L) / 360L);
 }
 
+// Arm angle → motor steps, including the gear reduction (motor runs
+// gearTeethOutput/gearTeethMotor steps per arm degree). 64-bit math avoids
+// overflow at high microstep × gear ratios.
 int degX10ToSteps(int degX10) {
-    long steps = (long)degX10 * FULL_STEPS_PER_REV * driverMicrosteps;
-    return (int)((steps + 1800L) / 3600L);
+    long long steps = (long long)degX10 * FULL_STEPS_PER_REV * driverMicrosteps * gearTeethOutput;
+    long long denom = 3600LL * gearTeethMotor;
+    return (int)((steps + denom / 2) / denom);
 }
 
 int stepsToDegrees(int steps) {
-    long denom = (long)FULL_STEPS_PER_REV * driverMicrosteps;
-    long numerator = (long)steps * 360L;
+    long long denom = (long long)FULL_STEPS_PER_REV * driverMicrosteps * gearTeethOutput;
+    long long numerator = (long long)steps * 360LL * gearTeethMotor;
     if (numerator >= 0) {
         return (int)((numerator + denom / 2) / denom);
     }
@@ -1698,8 +1754,8 @@ int stepsToDegrees(int steps) {
 }
 
 int stepsToDegX10(int steps) {
-    long denom = (long)FULL_STEPS_PER_REV * driverMicrosteps;
-    long numerator = (long)steps * 3600L;
+    long long denom = (long long)FULL_STEPS_PER_REV * driverMicrosteps * gearTeethOutput;
+    long long numerator = (long long)steps * 3600LL * gearTeethMotor;
     if (numerator >= 0) {
         return (int)((numerator + denom / 2) / denom);
     }
@@ -1733,10 +1789,24 @@ int setupCenterAcceleration(unsigned long intervalMs) {
     return 1;
 }
 
+int motorLastStepDir = 0;  // last commanded step direction (for backlash take-up)
+
 void motorStep(int direction) {
     bool dirLevel = direction > 0;
     if (motorDirectionInverted) dirLevel = !dirLevel;
     digitalWrite(TMC_DIR, dirLevel ? HIGH : LOW);
+
+    // Backlash take-up: on a direction reversal, pulse extra microsteps that move the
+    // motor but not the load (not counted in motorPosition) so the load reaches the
+    // commanded position after the gear slack is absorbed.
+    if (backlashMicrosteps > 0 && motorLastStepDir != 0 && direction != motorLastStepDir) {
+        for (int i = 0; i < backlashMicrosteps; i++) {
+            digitalWrite(TMC_STEP, HIGH); delayMicroseconds(10);
+            digitalWrite(TMC_STEP, LOW);  delayMicroseconds(10);
+        }
+    }
+    motorLastStepDir = direction;
+
     digitalWrite(TMC_STEP, HIGH); delayMicroseconds(10);
     digitalWrite(TMC_STEP, LOW);  delayMicroseconds(10);
     motorPosition += (direction > 0) ? 1 : -1;
@@ -2188,65 +2258,110 @@ void drawSettings() {
 // ============= SETUP SCREEN (hardware params) =============
 void drawSetupRow(int i, int y, bool selected, bool editing) {
     const char* labels[] = {
-        "Park   ", "Centre ", "Arm    ", "Cycles ",
-        "Current", "Mstep  ", "Invert ", "Debug  "
+        "Park   ", "Centre ", "Arm    ", "Gear in", "Gearout", "Cycles ",
+        "Accel  ", "Jerk   ", "Backlsh", "Current", "RunHold", "PrkHold",
+        "Chop   ", "Mstep  ", "Invert ", "Debug  "
     };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
                   selected ? ST77XX_BLUE : ST77XX_BLACK;
-    tft.fillRect(0, y - 2, CONTENT_W, 18, bg);
+    tft.fillRect(0, y - 2, CONTENT_W, 20, bg);
     tft.setTextColor(ST77XX_WHITE, bg);
     tft.setTextSize(2);
     tft.setCursor(6, y);
     tft.print(labels[i]);
     tft.print(": ");
     switch (i) {
-        case 0: printDegX10(PARK_DEG_X10);              tft.print("deg ");  break;
-        case 1: printDegX10(CENTER_DEG_X10);            tft.print("deg ");  break;
-        case 2: tft.print(ARM_LENGTH_MM);               tft.print("mm  ");  break;
-        case 3:
-            if (OSCILLATION_CYCLES == 0) tft.print("inf   ");
-            else { tft.print(OSCILLATION_CYCLES); tft.print("      "); }
+        case 0:  printDegX10(PARK_DEG_X10);   tft.print(" deg"); break;
+        case 1:  printDegX10(CENTER_DEG_X10); tft.print(" deg"); break;
+        case 2:  tft.print(ARM_LENGTH_MM);    tft.print(" mm");  break;
+        case 3:  tft.print(gearTeethMotor);   tft.print(" t");   break;
+        case 4:  tft.print(gearTeethOutput);  tft.print(" t");   break;
+        case 5:
+            if (OSCILLATION_CYCLES == 0) tft.print("inf");
+            else tft.print(OSCILLATION_CYCLES);
             break;
-        case 4: tft.print(driverCurrent);               tft.print("mA  ");  break;
-        case 5: tft.print(driverMicrosteps);            tft.print("x     "); break;
-        case 6: tft.print(motorDirectionInverted ? "ON    " : "OFF   "); break;
-        case 7: tft.print(SENSOR_INPUTS_ENABLED ? "OFF   " : "ON    "); break;
+        case 6:  tft.print((int)(motionAccelDegS2 + 0.5)); break;   // deg/s^2
+        case 7:  tft.print((int)(motionJerkDegS3 + 0.5));  break;   // deg/s^3
+        case 8:  tft.print(backlashMicrosteps); tft.print(" us"); break;
+        case 9:  tft.print(driverCurrent);      tft.print(" mA"); break;
+        case 10: tft.print(driverRunHoldPct);   tft.print(" %");  break;
+        case 11: tft.print(driverParkHoldPct);  tft.print(" %");  break;
+        case 12: tft.print(driverStealthChop ? "Stealth" : "Spread"); break;
+        case 13: tft.print(driverMicrosteps); tft.print("x"); break;
+        case 14: tft.print(motorDirectionInverted ? "ON" : "OFF"); break;
+        case 15: tft.print(SENSOR_INPUTS_ENABLED ? "OFF" : "ON");   break;
     }
 }
 
 void drawSetup() {
-    static int  lastIdx     = -1;
-    static bool lastEdit    = false;
-    static int  lastVals[8] = {};
+    // Vertical scroll: the Setup list is taller than the screen, so a sliding window
+    // of SETUP_VISIBLE rows tracks the selected row. Yellow ▲/▼ marks more above/below.
+    const int SETUP_VISIBLE = 6;
+    const int ROW_Y0 = 26;   // first row (matches the Settings screen's roomier 22 px pitch)
+    const int ROW_DY = 22;
+
+    static int  lastIdx   = -1;
+    static bool lastEdit  = false;
+    static int  lastFirst = -1;
+    static int  first     = 0;
+    static int  lastVals[SETUP_COUNT] = {};
 
     if (setupNeedsRedraw) { setupNeedsRedraw = false; lastIdx = -1; }
 
     int  si = setupIndex;
     bool ed = editingSetup;
-    int  vals[8] = {
-        PARK_DEG_X10, CENTER_DEG_X10, ARM_LENGTH_MM, (int)OSCILLATION_CYCLES,
-        driverCurrent, driverMicrosteps, motorDirectionInverted ? 1 : 0,
+
+    // Keep the selected row inside the visible window.
+    if (si < first)                first = si;
+    if (si >= first + SETUP_VISIBLE) first = si - SETUP_VISIBLE + 1;
+    first = constrain(first, 0, SETUP_COUNT - SETUP_VISIBLE);
+
+    int vals[SETUP_COUNT] = {
+        PARK_DEG_X10, CENTER_DEG_X10, ARM_LENGTH_MM, gearTeethMotor, gearTeethOutput,
+        (int)OSCILLATION_CYCLES, (int)(motionAccelDegS2 + 0.5), (int)(motionJerkDegS3 + 0.5),
+        backlashMicrosteps, driverCurrent, driverRunHoldPct, driverParkHoldPct,
+        driverStealthChop ? 1 : 0, driverMicrosteps, motorDirectionInverted ? 1 : 0,
         SENSOR_INPUTS_ENABLED ? 1 : 0
     };
 
-    bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit);
-    for (int i = 0; i < 8 && !changed; i++) changed = (vals[i] != lastVals[i]);
+    bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit) || (first != lastFirst);
+    for (int i = 0; i < SETUP_COUNT && !changed; i++) changed = (vals[i] != lastVals[i]);
     if (!changed) return;
 
-    if (lastIdx == -1) {
+    bool fullRedraw = (lastIdx == -1) || (first != lastFirst);
+    if (fullRedraw) {
         tft.fillScreen(ST77XX_BLACK);
         tft.setTextWrap(false);
-        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-        tft.setTextSize(2);
-        tft.setCursor(6, 3);
-        tft.print("SETUP");
     }
 
-    for (int i = 0; i < SETUP_COUNT; i++)
-        drawSetupRow(i, 22 + i * 18, i == si, i == si && ed);
+    // Header: title + live "row/total" counter (repainted each change so it stays correct).
+    tft.fillRect(0, 0, CONTENT_W, 20, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(6, 3);
+    tft.print("SETUP");
+    char pos[12];
+    snprintf(pos, sizeof(pos), "%d/%d", si + 1, SETUP_COUNT);
+    tft.setCursor(CONTENT_W - (int)strlen(pos) * 12 - 6, 3);
+    tft.print(pos);
 
-    lastIdx = si; lastEdit = ed;
-    for (int i = 0; i < 8; i++) lastVals[i] = vals[i];
+    for (int r = 0; r < SETUP_VISIBLE; r++) {
+        int i = first + r;
+        if (i >= SETUP_COUNT) break;
+        drawSetupRow(i, ROW_Y0 + r * ROW_DY, i == si, i == si && ed);
+    }
+
+    // Scroll arrows at the right edge.
+    int xa   = CONTENT_W - 12;
+    int yTop = ROW_Y0;
+    int yBot = ROW_Y0 + (SETUP_VISIBLE - 1) * ROW_DY + 4;
+    if (first > 0)
+        tft.fillTriangle(xa, yTop, xa - 6, yTop + 8, xa + 6, yTop + 8, ST77XX_YELLOW);
+    if (first + SETUP_VISIBLE < SETUP_COUNT)
+        tft.fillTriangle(xa, yBot + 8, xa - 6, yBot, xa + 6, yBot, ST77XX_YELLOW);
+
+    lastIdx = si; lastEdit = ed; lastFirst = first;
+    for (int i = 0; i < SETUP_COUNT; i++) lastVals[i] = vals[i];
 }
 
 // ============= ABOUT SCREEN =============

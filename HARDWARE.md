@@ -169,20 +169,21 @@ Ultrasonic   ─────── 4      Active-low relay trigger. LOW = genera
 
 Configured over SPI1 at startup in `initTMC2130()` using the **TMCStepper** library.
 Settings persist to flash and can be changed on-device in the **Setup** menu (Current,
-Mstep, Invert).
+RunHold, PrkHold, Chop, Mstep, Invert).
 
 | Setting | Default | Notes |
 |---------|---------|-------|
-| `rms_current` | 600 mA | Run hold 25 %, park hold 10 % of run current |
-| `microsteps` | 256× | Editable; motion is angle-based, so no recalibration needed |
-| `en_pwm_mode` | true | StealthChop — quiet at low speed |
+| `rms_current` | 800 mA | Editable (`Current`). Run/park hold % below |
+| `microsteps` | 256× | Editable (`Mstep`); motion is angle-based, so no recalibration needed |
+| `en_pwm_mode` | true | Chopper mode, editable (`Chop`): `true` = StealthChop (quiet), `false` = SpreadCycle (more torque/high-speed) |
 | `pwm_autoscale` | true | Auto-tune StealthChop amplitude |
 | `intpol` | true | 256-microstep interpolation |
 | `toff` | 5 | Enables the chopper — required |
 
-Two hold-current modes reduce heat and holding torque when idle:
-- **Run hold** (`DRIVER_RUN_HOLD_MULTIPLIER`, 25 %) — while moving / staging.
-- **Park hold** (`DRIVER_PARK_HOLD_MULTIPLIER`, 10 %) — once settled at the park angle.
+Two hold-current modes reduce heat and holding torque when idle (both editable as a
+percentage of run current in **Setup**):
+- **Run hold** (`driverRunHoldPct`, default 25 %) — while moving / staging.
+- **Park hold** (`driverParkHoldPct`, default 10 %) — once settled at the park angle.
 
 The active hold mode (run/park) is reported over the serial log.
 
@@ -191,14 +192,15 @@ The active hold mode (run/park) is reported over the serial log.
 ## Angle-Based Motion (no steps-per-mm)
 
 There is **no `STEPS_PER_MM` calibration**. Motion is commanded in arm angle and
-converted to steps using the live microstep setting:
+converted to steps using the live microstep setting and the motor→arm gear reduction:
 
 ```
-steps = degrees × FULL_STEPS_PER_REV × microsteps / 360
+steps = degrees × FULL_STEPS_PER_REV × microsteps × (gearOutTeeth / gearInTeeth) / 360
 ```
 
-Changing microsteps therefore needs no recalibration — angles stay correct. The sweep
-width is derived from the selected wafer diameter and the arm length
+The gear ratio is set in **Setup** (`Gear in` / `Gear out`, default **15:108** = 7.2:1).
+Changing microsteps or gearing therefore needs no recalibration — arm angles stay correct.
+The sweep width is derived from the selected wafer diameter and the arm length
 (`ARM_LENGTH_MM`, set in Setup).
 
 ---

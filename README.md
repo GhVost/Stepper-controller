@@ -12,7 +12,7 @@ selected wafer diameter and the arm length.
 
 - **RP2040 microcontroller** – dual-core ARM, 133 MHz, 264 KB RAM
 - **Dual-core architecture** – Core 0 runs the state machine and I/O; Core 1 renders the LCD at ~20 fps
-- **TMC2130 stepper driver** – SPI-controlled, StealthChop, current limiting, run/park hold-current modes, live fault detection (overtemperature, short-to-ground, charge-pump UV)
+- **TMC2130 stepper driver** – SPI-controlled, selectable StealthChop/SpreadCycle chopper, current limiting, adjustable run/park hold-current %, live fault detection (overtemperature, short-to-ground, charge-pump UV)
 - **Hardware SPI LCD** – GMT147SPI 1.47" 172×320 ST7789 at 20 MHz on its own SPI bus
 - **Rotary encoder UI** – KY-040 quadrature + push-button; full menu, in-place value editing, and a basic/advanced menu unlock
 - **Angle-based motion** – park and centre angles in degrees; sweep angle computed from wafer Ø and arm length
@@ -75,9 +75,14 @@ the first, and vice versa.
   each row shows `label:value` in a large font with the value highlighted, and the arm
   animation (about a third of the screen height) sits underneath. The calculated sweep angle
   is shown in the side status bar.
-- **Setup** (hardware): park angle, centre angle (live jog while editing), arm length,
-  cycles, driver current, microsteps, direction invert, and the **Debug** toggle
-  (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active).
+- **Setup** (hardware): a 16-row list that **scrolls vertically** — a 6-row window tracks
+  the selection, with a `row/total` counter and ▲/▼ markers showing more above/below.
+  Rows: park angle, centre angle (live jog while editing), arm length, **gear ratio**
+  (`Gear in` / `Gear out` teeth, default 15:108), cycles, **Accel** (deg/s²), **Jerk**
+  (deg/s³), **Backlash** take-up (µsteps injected on reversal), driver current,
+  **RunHold** / **PrkHold** current (% of run), **Chop** (StealthChop ↔ SpreadCycle),
+  microsteps, direction invert, and the **Debug** toggle (`ON` = spray/flow ignored,
+  `OFF` = spray/flow safety inputs active).
 - **About**: firmware version and live TMC2130 driver status.
 - **Status bar** (right side of every screen): live state, arm angle, the sweep summary
   (sweep angle, time, wafer, type, profile), and spray/flow.
@@ -171,19 +176,28 @@ entirely from the menu.
 ## Motion Model
 
 Motion is expressed as **arm angle** rather than linear travel. Steps are derived from
-the angle, the motor's full-steps-per-revolution, and the current microstep setting:
+the angle, the motor's full-steps-per-revolution, the current microstep setting, and the
+**gear reduction** between the motor pinion and the arm output gear:
 
 ```cpp
-steps = degrees × FULL_STEPS_PER_REV × microsteps / 360
+steps = degrees × FULL_STEPS_PER_REV × microsteps × (gearOutTeeth / gearInTeeth) / 360
 ```
+
+The gear ratio is configurable in **Setup** (`Gear in` / `Gear out` teeth). The default is
+**15:108** (= 7.2:1), so the motor turns 7.2 steps per arm degree. All angle/velocity
+settings (accel, jerk) are expressed in **arm-frame degrees**, so they stay physically
+meaningful if the gearing or microstepping changes.
 
 Default parameters (all editable on-device and persisted to flash):
 
 ```cpp
 const int FULL_STEPS_PER_REV = 200;   // 1.8° NEMA17
-int  PARK_DEG_X10   = 70;             // 7.0° — park angle near the limit
-int  CENTER_DEG_X10 = 260;            // 26.0° — sweep centre (over wafer)
-int  ARM_LENGTH_MM  = 250;            // arm length (transducer radius)
+int  gearTeethMotor  = 15;            // motor pinion teeth
+int  gearTeethOutput = 108;           // arm output gear teeth (15:108 = 7.2:1)
+int  PARK_DEG_X10    = 50;            // 5.0° — park angle near the limit
+int  CENTER_DEG_X10  = 700;           // 70.0° — sweep centre (over wafer)
+int  ARM_LENGTH_MM   = 250;           // arm length (transducer radius)
+int  backlashMicrosteps = 0;          // extra µsteps injected on each direction reversal
 unsigned long SWEEP_TIME_MS    = 4000; // time for one full back-forward-back cycle
 unsigned long OSCILLATION_CYCLES = 4;  // full cycles to run (0 = run forever)
 ```
@@ -205,7 +219,12 @@ sweep = 2 · asin( (wafer_diameter / 2) / arm_length )
   reversal, with a ramp width derived from the configured **endpoint acceleration** (so
   faster profiles automatically get a wider deceleration zone) and a shape blended by the
   configured **endpoint jerk** (smoother/quintic at low jerk, sharper/cubic at high jerk).
-  Both are adjustable over serial (`a`/`A`, `j`/`J`) and persist to flash.
+  Both are adjustable in the **Setup** menu (`Accel` / `Jerk`) or over serial (`a`/`A`,
+  `j`/`J`), and persist to flash.
+
+**Backlash compensation**: if the gear train has slack, set `Backlash` (in Setup) to the
+number of extra microsteps to inject on each direction reversal. These steps move the
+motor but not the load, taking up the slack so the arm reaches the commanded angle.
 
 The ultrasonic generator is energised **only while the arm tip is over the wafer disk**.
 

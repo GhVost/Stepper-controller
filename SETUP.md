@@ -168,8 +168,8 @@ position is now unknown (`needsHoming`).
 **`motorMoveToBlocking(int target, us)`** — busy-loop to a target (used for the live
 Centre jog in Setup).
 
-**`degX10ToSteps()` / `stepsToDegX10()`** — convert between angle (0.1°) and microsteps
-using the live microstep setting.
+**`degX10ToSteps()` / `stepsToDegX10()`** — convert between arm angle (0.1°) and motor
+microsteps using the live microstep setting and the motor→arm gear ratio (default 15:108).
 
 ### Sensors / Input
 
