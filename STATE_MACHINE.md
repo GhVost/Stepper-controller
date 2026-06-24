@@ -103,10 +103,12 @@ wafer. The sweep half-width is derived from the wafer diameter and arm length.
 
 ### STATE_HOMING
 **Entry**: START or spray detected.
-**Actions**: motor enabled, steps toward the limit at `MOTOR_UPDATE_INTERVAL_US`,
+**Actions**: motor enabled, steps toward the limit at the positioning step rate derived
+from `Parking speed` (deg/s, gear/microstep-aware via `positioningStepInterval()`),
 yellow LED on.
-**Safety**: if the limit is not reached within `HOMING_MAX_DEG_X10` (70°) of travel,
-the motor is disabled and the state latches `ERROR`.
+**Safety**: if the limit is not reached within `HOMING_MAX_DEG_X10` (120°) of travel, or
+within `homingTimeoutMs()` (scales with the positioning step rate), the motor is disabled
+and the state latches `ERROR`.
 **Exit**: limit pressed → `motorPosition = 0`, `needsHoming = false` →
 `PARKED` (or `ERROR`/`IDLE` if a fault or stop/abort is pending).
 
@@ -175,14 +177,16 @@ undervoltage) detected by `pollDriverStatus()`, or a home-search timeout.
 ## Timing & Motion Parameters
 
 ```cpp
-int  PARK_DEG_X10   = 70;     // 7.0° park angle (near the limit)
-int  CENTER_DEG_X10 = 260;    // 26.0° sweep centre (over the wafer)
+int  PARK_DEG_X10   = 50;     // 5.0° park angle (near the limit)
+int  CENTER_DEG_X10 = 700;    // 70.0° sweep centre (over the wafer)
+int  parkingSpeedDegS = 10;   // arm deg/s for homing/park/staging (gear/µstep aware)
+int  gearTeethMotor = 15;     // motor pinion teeth  } 15:108 = 7.2:1
+int  gearTeethOutput = 108;   // arm output gear     }
 int  ARM_LENGTH_MM  = 250;    // arm length (transducer radius)
 unsigned long SWEEP_TIME_MS      = 4000;  // ms per full back-forward-back cycle
 unsigned long OSCILLATION_CYCLES = 4;     // full cycles to run (0 = run forever)
-const unsigned long SPRAY_ACTIVE_WAIT      = 2000; // ms settle before oscillation
-const unsigned long MOTOR_UPDATE_INTERVAL_US = 500; // µs per step (homing/parking)
-const int           HOMING_MAX_DEG_X10     = 700;  // 70° home-search limit
+const unsigned long SPRAY_ACTIVE_WAIT  = 2000; // ms settle before oscillation
+const int           HOMING_MAX_DEG_X10 = 1200; // 120° home-search travel limit
 ```
 
 Steps are derived from angle: `steps = degX10 × FULL_STEPS_PER_REV × microsteps × (gearOut/gearIn) / 3600` (gear default 15:108).

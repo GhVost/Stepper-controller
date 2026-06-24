@@ -41,8 +41,8 @@
 
   <div class="row">
     <span style="font-size:12.5px;color:#8b93a3">Setup row</span>
-    <input id="setupSel" type="range" min="0" max="15" value="3">
-    <span id="setupSelLbl" style="font-size:12.5px;width:120px">4/16 — Gear in</span>
+    <input id="setupSel" type="range" min="0" max="16" value="4">
+    <span id="setupSelLbl" style="font-size:12.5px;width:120px">5/17 — Gear in</span>
   </div>
 
   <div class="controls">
@@ -77,9 +77,10 @@
     each value runs for a few full oscillations and only changes when the arm is at the wafer
     edge. To record a GIF, capture the panel
     (Windows <code>Win+Alt+R</code> or ScreenToGif). The second panel shows the hidden hardware
-    <b>SETUP</b> menu — now 16 rows that scroll vertically with a sliding 6-row window, a
+    <b>SETUP</b> menu — now 17 rows that scroll vertically with a sliding 6-row window, a
     <code>row/total</code> counter and ▲/▼ markers. Drag <b>Setup row</b> to scroll: it includes
-    the new <b>gear ratio</b> (Gear in / Gear out, default 15:108), <b>Accel</b>/<b>Jerk</b>,
+    the new <b>gear ratio</b> (Gear in / Gear out, default 15:108), <b>Parkspd</b> (arm
+    positioning speed in deg/s for homing/park/staging), <b>Accel</b>/<b>Jerk</b>,
     <b>Backlash</b> take-up (µsteps), and the driver <b>RunHold</b>/<b>PrkHold</b> % and
     <b>Chop</b> (StealthChop/SpreadCycle) settings. The <i>About</i> screen is omitted.
   </div>
@@ -227,6 +228,7 @@ function render(){ use(cS); drawSettings(); }
 const SETUP_ROWS = [
   { label:"Park   ", val:"5.0 deg"   },
   { label:"Centre ", val:"70.0 deg"  },
+  { label:"Parkspd", val:"10 d/s"    },
   { label:"Arm    ", val:"250 mm"    },
   { label:"Gear in", val:"15 t"      },
   { label:"Gearout", val:"108 t"     },

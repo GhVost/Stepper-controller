@@ -67,11 +67,11 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 - **Sweep Settings**: Sweep time, Wafer diam., Sweep type, Speed prof. — each row shows
   `label:value` (large font, value highlighted) with the arm animation (~1/3 screen)
   underneath. Speed profiles are Sawtooth / Sine / Reciprocal; the sweep angle is in the status bar.
-- **Setup** (hardware): 16 rows, **scrolls vertically** (6-row window, `row/total` counter,
-  ▲/▼ markers). Park, Centre (live jog), Arm, Gear in / Gear out (teeth, default 15:108),
-  Cycles, Accel (deg/s²), Jerk (deg/s³), Backlsh (µsteps on reversal), Current, RunHold %,
-  PrkHold %, Chop (Stealth/Spread), Mstep, Invert, Debug (ON = ignore spray/flow, OFF = use
-  safety inputs).
+- **Setup** (hardware): 17 rows, **scrolls vertically** (6-row window, `row/total` counter,
+  ▲/▼ markers). Park, Centre (live jog), Parkspd (deg/s positioning speed), Arm,
+  Gear in / Gear out (teeth, default 15:108), Cycles, Accel (deg/s²), Jerk (deg/s³),
+  Backlsh (µsteps on reversal), Current, RunHold %, PrkHold %, Chop (Stealth/Spread),
+  Mstep, Invert, Debug (ON = ignore spray/flow, OFF = use safety inputs).
 - Edits persist to RP2040 flash EEPROM emulation and are reloaded at boot.
 
 ---
@@ -91,7 +91,7 @@ START always re-homes first (position is unknown whenever the motor was disabled
 | State | Duration |
 |-------|----------|
 | IDLE | Indefinite |
-| HOMING | Until limit switch (travel > 120° or timeout 10s → ERROR) |
+| HOMING | Until limit switch (travel > 120° or homing timeout → ERROR; timeout scales with Parking speed / gear) |
 | PARKED | Until at park angle, then branch |
 | WAITING_SPRAY | Until flow detected or spray lost (sensor mode) |
 | SPRAY_ACTIVE | ≥ 2 s + time to reach the sweep start |
@@ -153,6 +153,7 @@ gearTeethMotor    = 15      // motor pinion teeth   } 15:108 = 7.2:1 reduction
 gearTeethOutput   = 108     // arm output gear teeth }
 PARK_DEG_X10      = 50      // 5.0° park angle near the limit
 CENTER_DEG_X10    = 700     // 70.0° sweep centre over the wafer
+parkingSpeedDegS  = 10      // arm deg/s for homing/park/staging (gear+µstep aware)
 ARM_LENGTH_MM     = 250     // arm length (transducer radius)
 backlashMicrosteps = 0      // extra µsteps injected on each direction reversal
 SWEEP_TIME_MS     = 4000    // ms per full back-forward-back cycle

@@ -77,9 +77,10 @@ the first, and vice versa.
   is shown in the side status bar.
 - **Setup** (hardware): a 16-row list that **scrolls vertically** — a 6-row window tracks
   the selection, with a `row/total` counter and ▲/▼ markers showing more above/below.
-  Rows: park angle, centre angle (live jog while editing), arm length, **gear ratio**
-  (`Gear in` / `Gear out` teeth, default 15:108), cycles, **Accel** (deg/s²), **Jerk**
-  (deg/s³), **Backlash** take-up (µsteps injected on reversal), driver current,
+  Rows: park angle, centre angle (live jog while editing), **Parking speed** (deg/s — arm
+  speed for homing/park/staging moves), arm length, **gear ratio** (`Gear in` / `Gear out`
+  teeth, default 15:108), cycles, **Accel** (deg/s²), **Jerk** (deg/s³), **Backlash**
+  take-up (µsteps injected on reversal), driver current,
   **RunHold** / **PrkHold** current (% of run), **Chop** (StealthChop ↔ SpreadCycle),
   microsteps, direction invert, and the **Debug** toggle (`ON` = spray/flow ignored,
   `OFF` = spray/flow safety inputs active).
@@ -184,9 +185,12 @@ steps = degrees × FULL_STEPS_PER_REV × microsteps × (gearOutTeeth / gearInTee
 ```
 
 The gear ratio is configurable in **Setup** (`Gear in` / `Gear out` teeth). The default is
-**15:108** (= 7.2:1), so the motor turns 7.2 steps per arm degree. All angle/velocity
-settings (accel, jerk) are expressed in **arm-frame degrees**, so they stay physically
-meaningful if the gearing or microstepping changes.
+**15:108** (= 7.2:1), so the motor turns 7.2 steps per arm degree. **All motion quantities
+are expressed in the arm frame** — position (angles), velocity (sweep cycle time and the
+`Parking speed` for homing/park/staging), acceleration and jerk — so they stay physically
+meaningful when the gearing or microstepping changes. The constant-speed positioning moves
+derive their motor step rate from `Parking speed` (deg/s), clamped to the motor's fastest
+safe rate, and the homing timeout scales automatically with the resulting step rate.
 
 Default parameters (all editable on-device and persisted to flash):
 

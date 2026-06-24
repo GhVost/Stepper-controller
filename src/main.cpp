@@ -97,6 +97,10 @@ int gearTeethOutput    = 108;
 // Backlash take-up: extra microsteps injected (motor only, not load) on each
 // direction reversal to absorb gear slack. 0 = disabled.
 int backlashMicrosteps = 0;
+// Arm positioning speed (deg/s) for homing, park and pre-sweep staging moves. The motor
+// step interval is derived from this together with the microstep setting and the gear
+// ratio, then clamped to the motor's fastest safe step rate.
+int parkingSpeedDegS   = 10;
 int PARK_DEG_X10       = 50;
 int CENTER_DEG_X10     = 700;
 int ARM_LENGTH_MM      = 250;
@@ -155,7 +159,7 @@ const int MICROSTEP_TABLE[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
 const int MICROSTEP_COUNT   = 9;
 
 const uint32_t SETTINGS_MAGIC = 0x4D534743UL;  // "MSGC"
-const uint16_t SETTINGS_VERSION = 11;
+const uint16_t SETTINGS_VERSION = 12;
 const size_t EEPROM_BYTES = 4096;
 
 // Auto-save: every Setup/Settings change is persisted, but writes are debounced so a
@@ -189,6 +193,7 @@ struct StoredSettings {
     int16_t driverRunHoldPct;
     int16_t driverParkHoldPct;
     int16_t driverStealthChop;
+    int16_t parkingSpeedDegS;
     uint32_t checksum;
 };
 
@@ -305,11 +310,11 @@ volatile int  settingsIndex       = 0;
 volatile bool editingSettings     = false;
 volatile bool settingsNeedsRedraw = false;
 
-// Setup rows: Park, Centre, Arm, GearIn, GearOut, Cycles, Accel, Jerk, Backlash,
-// Current, RunHold, ParkHold, Chop, Mstep, Invert, Debug. More rows than fit on
-// screen, so the Setup list scrolls vertically (see drawSetup). No "< Back" row —
+// Setup rows: Park, Centre, Park spd, Arm, GearIn, GearOut, Cycles, Accel, Jerk,
+// Backlash, Current, RunHold, ParkHold, Chop, Mstep, Invert, Debug. More rows than fit
+// on screen, so the Setup list scrolls vertically (see drawSetup). No "< Back" row —
 // a long press returns to the menu.
-const int SETUP_COUNT = 16;
+const int SETUP_COUNT = 17;
 volatile int  setupIndex       = 0;
 volatile bool editingSetup     = false;
 volatile bool setupNeedsRedraw = false;
@@ -360,6 +365,8 @@ void handleState();
 int motorShaftRevSteps();
 int degreesToSteps(int degrees);
 int stepsToDegrees(int steps);
+unsigned long positioningStepInterval();
+unsigned long homingTimeoutMs();
 void motorStep(int direction);
 void motorSetEnable(bool enable);
 void motorMoveTo(int target);
@@ -601,6 +608,7 @@ void loadSettings() {
     driverRunHoldPct = constrain((int)stored.driverRunHoldPct, 1, 100);
     driverParkHoldPct = constrain((int)stored.driverParkHoldPct, 0, 100);
     driverStealthChop = stored.driverStealthChop != 0;
+    parkingSpeedDegS = constrain((int)stored.parkingSpeedDegS, 1, 120);
     enforceMinimumSweepTime(true);
 
     Serial.printf("Settings: loaded from flash (v%u)\n", stored.version);
@@ -631,6 +639,7 @@ void saveSettings() {
     stored.driverRunHoldPct = driverRunHoldPct;
     stored.driverParkHoldPct = driverParkHoldPct;
     stored.driverStealthChop = driverStealthChop ? 1 : 0;
+    stored.parkingSpeedDegS = parkingSpeedDegS;
     stored.checksum = settingsChecksum(stored);
 
     EEPROM.put(0, stored);
@@ -1077,7 +1086,7 @@ void updateStateMachine() {
             break;
 
         case STATE_HOMING: {
-            bool homingTimedOut = millis() - homingStartMillis > HOMING_TIMEOUT_MS;
+            bool homingTimedOut = millis() - homingStartMillis > homingTimeoutMs();
             bool homingTravelExceeded = abs(motorPosition - homingStartPosition) >= degX10ToSteps(HOMING_MAX_DEG_X10);
             if (homingTimedOut || homingTravelExceeded) {
                 motorSetEnable(false);
@@ -1227,7 +1236,7 @@ void handleState() {
             setDriverParkHold(false);
             motorSetEnable(true);
             setLED(LED_GREEN, false); setLED(LED_YELLOW, true);
-            if (stepNow - lastMotorStepMicros >= MOTOR_UPDATE_INTERVAL_US) {
+            if (stepNow - lastMotorStepMicros >= positioningStepInterval()) {
                 motorStep(-1); lastMotorStepMicros = stepNow;
             }
             break;
@@ -1236,7 +1245,7 @@ void handleState() {
             motorSetEnable(true);
             if (motorPosition != degX10ToSteps(PARK_DEG_X10)) {
                 setDriverParkHold(false);
-                if (stepNow - lastMotorStepMicros >= MOTOR_UPDATE_INTERVAL_US) {
+                if (stepNow - lastMotorStepMicros >= positioningStepInterval()) {
                     motorMoveTo(degX10ToSteps(PARK_DEG_X10)); lastMotorStepMicros = stepNow;
                 }
             } else {
@@ -1258,7 +1267,7 @@ void handleState() {
             setFan(FAN_FULL); setUltrasonic(armOverWafer());   // generator only over the wafer
             setLED(LED_GREEN, true); setLED(LED_YELLOW, false);
             motorSetEnable(true);
-            if (stepNow - lastMotorStepMicros >= MOTOR_UPDATE_INTERVAL_US) {
+            if (stepNow - lastMotorStepMicros >= positioningStepInterval()) {
                 motorMoveTo(sweepBackSteps()); lastMotorStepMicros = stepNow;
             }
             break;
@@ -1425,21 +1434,22 @@ void adjustSetupValue(int delta) {
             setupCenterTargetSteps = degX10ToSteps(CENTER_DEG_X10);
             setupCenterLastChangeMillis = millis();
             break;
-        case 2: ARM_LENGTH_MM = constrain(ARM_LENGTH_MM + delta * 5, 50, 1000); break;
-        case 3: gearTeethMotor  = constrain(gearTeethMotor + delta, 1, 500); break;
-        case 4: gearTeethOutput = constrain(gearTeethOutput + delta, 1, 500); break;
-        case 5: OSCILLATION_CYCLES = (unsigned long)constrain(
+        case 2: parkingSpeedDegS = constrain(parkingSpeedDegS + delta, 1, 120); break;
+        case 3: ARM_LENGTH_MM = constrain(ARM_LENGTH_MM + delta * 5, 50, 1000); break;
+        case 4: gearTeethMotor  = constrain(gearTeethMotor + delta, 1, 500); break;
+        case 5: gearTeethOutput = constrain(gearTeethOutput + delta, 1, 500); break;
+        case 6: OSCILLATION_CYCLES = (unsigned long)constrain(
                     (long)OSCILLATION_CYCLES + delta, 0L, 100L); break;
-        case 6: motionAccelDegS2 = constrain(motionAccelDegS2 + delta * MOTION_ACCEL_STEP_DEG_S2,
+        case 7: motionAccelDegS2 = constrain(motionAccelDegS2 + delta * MOTION_ACCEL_STEP_DEG_S2,
                     MOTION_ACCEL_MIN_DEG_S2, MOTION_ACCEL_MAX_DEG_S2); break;
-        case 7: motionJerkDegS3 = constrain(motionJerkDegS3 + delta * MOTION_JERK_STEP_DEG_S3,
+        case 8: motionJerkDegS3 = constrain(motionJerkDegS3 + delta * MOTION_JERK_STEP_DEG_S3,
                     MOTION_JERK_MIN_DEG_S3, MOTION_JERK_MAX_DEG_S3); break;
-        case 8: backlashMicrosteps = constrain(backlashMicrosteps + delta, 0, 2000); break;
-        case 9: driverCurrent = constrain(driverCurrent + delta * 50, 100, 1500); break;
-        case 10: driverRunHoldPct  = constrain(driverRunHoldPct + delta, 1, 100); break;
-        case 11: driverParkHoldPct = constrain(driverParkHoldPct + delta, 0, 100); break;
-        case 12: driverStealthChop = !driverStealthChop; break;
-        case 13: {
+        case 9: backlashMicrosteps = constrain(backlashMicrosteps + delta, 0, 2000); break;
+        case 10: driverCurrent = constrain(driverCurrent + delta * 50, 100, 1500); break;
+        case 11: driverRunHoldPct  = constrain(driverRunHoldPct + delta, 1, 100); break;
+        case 12: driverParkHoldPct = constrain(driverParkHoldPct + delta, 0, 100); break;
+        case 13: driverStealthChop = !driverStealthChop; break;
+        case 14: {
             int idx = 4;
             for (int i = 0; i < MICROSTEP_COUNT; i++)
                 if (MICROSTEP_TABLE[i] == driverMicrosteps) { idx = i; break; }
@@ -1447,10 +1457,10 @@ void adjustSetupValue(int delta) {
             driverMicrosteps = MICROSTEP_TABLE[idx];
             break;
         }
-        case 14:
+        case 15:
             motorDirectionInverted = !motorDirectionInverted;
             break;
-        case 15:
+        case 16:
             SENSOR_INPUTS_ENABLED = !SENSOR_INPUTS_ENABLED;
             break;
     }
@@ -1731,8 +1741,9 @@ int motorShaftRevSteps() {
 }
 
 int degreesToSteps(int degrees) {
-    long steps = (long)degrees * FULL_STEPS_PER_REV * driverMicrosteps;
-    return (int)((steps + 180L) / 360L);
+    long long steps = (long long)degrees * FULL_STEPS_PER_REV * driverMicrosteps * gearTeethOutput;
+    long long denom = 360LL * gearTeethMotor;
+    return (int)((steps + denom / 2) / denom);
 }
 
 // Arm angle → motor steps, including the gear reduction (motor runs
@@ -1760,6 +1771,28 @@ int stepsToDegX10(int steps) {
         return (int)((numerator + denom / 2) / denom);
     }
     return (int)((numerator - denom / 2) / denom);
+}
+
+// Motor step interval (µs) that moves the ARM at parkingSpeedDegS, accounting for
+// microstepping and the gear reduction, clamped to the motor's fastest safe rate.
+// Used for the constant-speed positioning moves (homing, park, pre-sweep staging).
+unsigned long positioningStepInterval() {
+    double stepsPerArmDeg = (double)FULL_STEPS_PER_REV * driverMicrosteps * gearTeethOutput
+                            / (360.0 * gearTeethMotor);
+    double speed = (double)max(parkingSpeedDegS, 1);
+    double us = 1.0e6 / (speed * stepsPerArmDeg);
+    unsigned long iv = (unsigned long)(us + 0.5);
+    return iv < MIN_SWEEP_STEP_INTERVAL_US ? MIN_SWEEP_STEP_INTERVAL_US : iv;
+}
+
+// Homing must finish before this timeout. Derived from the worst-case search travel
+// (HOMING_MAX_DEG_X10) at the positioning step rate, so it scales with gear/microsteps,
+// plus margin, and never shorter than the legacy floor.
+unsigned long homingTimeoutMs() {
+    uint64_t steps = (uint64_t)abs(degX10ToSteps(HOMING_MAX_DEG_X10));
+    uint64_t us    = steps * (uint64_t)positioningStepInterval();
+    unsigned long ms = (unsigned long)(us / 1000ULL) + 3000UL;   // + 3 s margin
+    return ms < HOMING_TIMEOUT_MS ? HOMING_TIMEOUT_MS : ms;
 }
 
 void printDegX10(int degX10) {
@@ -2258,7 +2291,7 @@ void drawSettings() {
 // ============= SETUP SCREEN (hardware params) =============
 void drawSetupRow(int i, int y, bool selected, bool editing) {
     const char* labels[] = {
-        "Park   ", "Centre ", "Arm    ", "Gear in", "Gearout", "Cycles ",
+        "Park   ", "Centre ", "Parkspd", "Arm    ", "Gear in", "Gearout", "Cycles ",
         "Accel  ", "Jerk   ", "Backlsh", "Current", "RunHold", "PrkHold",
         "Chop   ", "Mstep  ", "Invert ", "Debug  "
     };
@@ -2273,23 +2306,24 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
     switch (i) {
         case 0:  printDegX10(PARK_DEG_X10);   tft.print(" deg"); break;
         case 1:  printDegX10(CENTER_DEG_X10); tft.print(" deg"); break;
-        case 2:  tft.print(ARM_LENGTH_MM);    tft.print(" mm");  break;
-        case 3:  tft.print(gearTeethMotor);   tft.print(" t");   break;
-        case 4:  tft.print(gearTeethOutput);  tft.print(" t");   break;
-        case 5:
+        case 2:  tft.print(parkingSpeedDegS); tft.print(" d/s"); break;
+        case 3:  tft.print(ARM_LENGTH_MM);    tft.print(" mm");  break;
+        case 4:  tft.print(gearTeethMotor);   tft.print(" t");   break;
+        case 5:  tft.print(gearTeethOutput);  tft.print(" t");   break;
+        case 6:
             if (OSCILLATION_CYCLES == 0) tft.print("inf");
             else tft.print(OSCILLATION_CYCLES);
             break;
-        case 6:  tft.print((int)(motionAccelDegS2 + 0.5)); break;   // deg/s^2
-        case 7:  tft.print((int)(motionJerkDegS3 + 0.5));  break;   // deg/s^3
-        case 8:  tft.print(backlashMicrosteps); tft.print(" us"); break;
-        case 9:  tft.print(driverCurrent);      tft.print(" mA"); break;
-        case 10: tft.print(driverRunHoldPct);   tft.print(" %");  break;
-        case 11: tft.print(driverParkHoldPct);  tft.print(" %");  break;
-        case 12: tft.print(driverStealthChop ? "Stealth" : "Spread"); break;
-        case 13: tft.print(driverMicrosteps); tft.print("x"); break;
-        case 14: tft.print(motorDirectionInverted ? "ON" : "OFF"); break;
-        case 15: tft.print(SENSOR_INPUTS_ENABLED ? "OFF" : "ON");   break;
+        case 7:  tft.print((int)(motionAccelDegS2 + 0.5)); break;   // deg/s^2
+        case 8:  tft.print((int)(motionJerkDegS3 + 0.5));  break;   // deg/s^3
+        case 9:  tft.print(backlashMicrosteps); tft.print(" us"); break;
+        case 10: tft.print(driverCurrent);      tft.print(" mA"); break;
+        case 11: tft.print(driverRunHoldPct);   tft.print(" %");  break;
+        case 12: tft.print(driverParkHoldPct);  tft.print(" %");  break;
+        case 13: tft.print(driverStealthChop ? "Stealth" : "Spread"); break;
+        case 14: tft.print(driverMicrosteps); tft.print("x"); break;
+        case 15: tft.print(motorDirectionInverted ? "ON" : "OFF"); break;
+        case 16: tft.print(SENSOR_INPUTS_ENABLED ? "OFF" : "ON");   break;
     }
 }
 
@@ -2317,8 +2351,9 @@ void drawSetup() {
     first = constrain(first, 0, SETUP_COUNT - SETUP_VISIBLE);
 
     int vals[SETUP_COUNT] = {
-        PARK_DEG_X10, CENTER_DEG_X10, ARM_LENGTH_MM, gearTeethMotor, gearTeethOutput,
-        (int)OSCILLATION_CYCLES, (int)(motionAccelDegS2 + 0.5), (int)(motionJerkDegS3 + 0.5),
+        PARK_DEG_X10, CENTER_DEG_X10, parkingSpeedDegS, ARM_LENGTH_MM,
+        gearTeethMotor, gearTeethOutput, (int)OSCILLATION_CYCLES,
+        (int)(motionAccelDegS2 + 0.5), (int)(motionJerkDegS3 + 0.5),
         backlashMicrosteps, driverCurrent, driverRunHoldPct, driverParkHoldPct,
         driverStealthChop ? 1 : 0, driverMicrosteps, motorDirectionInverted ? 1 : 0,
         SENSOR_INPUTS_ENABLED ? 1 : 0
