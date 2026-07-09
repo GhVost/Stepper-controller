@@ -54,7 +54,7 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 | FLOW_SENSOR | 3 (INPUT_PULLDOWN, HIGH = flowing) |
 | LED_GREEN / LED_YELLOW | 8 / 7 |
 | FAN_PWM | 21 |
-| ULTRASONIC | 4 (LOW = ON, active-low relay) |
+| ULTRASONIC | 4 (HIGH = ON, BJT driver) |
 
 ---
 

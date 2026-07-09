@@ -34,7 +34,7 @@ const int FLOW_SENSOR  = 3;    // HIGH = flowing
 const int LED_GREEN    = 8;
 const int LED_YELLOW   = 7;
 const int FAN_PWM      = 21;
-const int ULTRASONIC   = 4;    // Active-low relay: LOW = ON
+const int ULTRASONIC   = 4;    // BJT driver, active-high: HIGH = ON
 
 // ============= TMC2130 DRIVER =============
 #define R_SENSE 0.11f
@@ -508,7 +508,7 @@ void initHardware() {
     digitalWrite(LED_GREEN,  LOW);
     digitalWrite(LED_YELLOW, LOW);
     analogWrite(FAN_PWM, 0);
-    digitalWrite(ULTRASONIC, HIGH);  // relay OFF at startup
+    digitalWrite(ULTRASONIC, LOW);   // generator OFF at startup
 
     Serial.println("Hardware initialized");
 }
@@ -1997,7 +1997,7 @@ void motorMoveToBlocking(int target, unsigned int stepDelayUs) {
 // ============= OUTPUTS =============
 void setLED(int ledPin, bool state) { digitalWrite(ledPin, state ? HIGH : LOW); }
 void setFan(int speed) { analogWrite(FAN_PWM, constrain(speed, 0, 255)); }
-void setUltrasonic(bool on) { digitalWrite(ULTRASONIC, on ? LOW : HIGH); ultrasonicActive = on; }
+void setUltrasonic(bool on) { digitalWrite(ULTRASONIC, on ? HIGH : LOW); ultrasonicActive = on; }
 
 // True when the arm tip is over the wafer disk (within ±half-sweep of centre),
 // i.e. |currentAngle - centre| <= half the calculated sweep.

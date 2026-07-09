@@ -159,7 +159,7 @@ Component           GPIO    Notes
 LED Green    ─────── 8      3V3 through 470 Ω resistor
 LED Yellow   ─────── 7      3V3 through 470 Ω resistor
 Fan PWM      ─────── 21     To fan driver / MOSFET gate (12 V fan)
-Ultrasonic   ─────── 4      Active-low relay trigger. LOW = generator ON.
+Ultrasonic   ─────── 4      BJT driver, active-high. HIGH = generator ON.
                             Energised only while the arm is over the wafer.
 ```
 

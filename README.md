@@ -150,7 +150,7 @@ The TMC2130 and the LCD are on **separate** SPI buses (no shared bus).
 | LED_G | 8  | Green status LED |
 | LED_Y | 7  | Yellow status LED |
 | Fan   | 21 | Fan PWM (0–255) |
-| Sonic | 4  | Ultrasonic generator relay (active-low, LOW = ON) |
+| Sonic | 4  | Ultrasonic generator via BJT driver (active-high, HIGH = ON) |
 
 See [HARDWARE.md](HARDWARE.md) for complete wiring details.
 

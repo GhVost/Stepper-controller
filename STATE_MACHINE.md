@@ -247,7 +247,7 @@ both cores (LCD on SPI0, TMC2130 on SPI1).
 | WAITING_SPRAY | 128 | 50 % |
 | SPRAY_ACTIVE / OSCILLATING | 255 | 100 % |
 
-### Ultrasonic Generator (GPIO 4, active-low)
+### Ultrasonic Generator (GPIO 4, active-high)
 
 | State | Relay |
 |-------|-------|
