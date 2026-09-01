@@ -84,7 +84,12 @@ TMC2130 2A / 2B → NEMA17 coil 2 (B, B−)
 
 ---
 
-### LCD Display (GMT147SPI — 1.47" 172×320 ST7789)
+### LCD Display — two supported variants
+
+The firmware supports two panels, selected by PlatformIO environment
+(`pio run -e pico` or `pio run -e pico-st7796`). Both use the **same LCD pins**.
+
+#### Variant A (fallback, env `pico`): GMT147SPI — 1.47" 172×320 ST7789
 
 Module: **GMT147SPI** 1.47" SPI display, ST7789 controller, 172×320 pixels.
 Driven with `Adafruit_ST7789`, initialised as `tft.init(172, 320)` then
@@ -105,6 +110,32 @@ GND     ────────── GND
 
 > Do not connect the display VDD to 5 V — the module is 3.3 V only.
 > BL can be tied directly to 3V3 for an always-on backlight (omit GPIO 20).
+
+#### Variant B (env `pico-st7796`): Hosyond 4.0" 480×320 ST7796S + capacitive touch
+
+Module: 4.0" SPI display, ST7796S controller, 320×480 pixels, FT6336 capacitive
+touch on I2C. Driven with `TFT_eSPI` (rotation 1 = landscape 480×320). The touch
+controller sits on **I2C0** (GPIO 16/17); the tap targets mirror the encoder UI.
+
+```
+RP2040 Pico         Display Module
+───────────         ──────────────
+GPIO 9  ────────── LCD_CS   (Chip Select, active LOW)
+GPIO 5  ────────── LCD_RS   (Data/Command)
+GPIO 6  ────────── LCD_RST  (Reset)  ── also to CTP_RST (one line resets both)
+GPIO 18 ────────── SCK      (SPI0 Clock)
+GPIO 19 ────────── SDI      (SPI0 MOSI)
+GPIO 20 ────────── LED      (Backlight — HIGH = on)
+GPIO 16 ────────── CTP_SDA  (I2C0 SDA, touch)
+GPIO 17 ────────── CTP_SCL  (I2C0 SCL, touch)
+GPIO 0  ────────── CTP_INT  (touch interrupt, LOW = finger down)
+VSYS/5V ────────── VCC      (5 V recommended; 3.3 V works, dimmer backlight)
+GND     ────────── GND
+                   SDO, SD_CS — not connected (no MISO / SD card use)
+```
+
+> If taps land mirrored/rotated on the real panel, adjust the axis mapping in
+> `readTouchPoint()` in `main.cpp` — panel batches differ in touch orientation.
 
 ---
 

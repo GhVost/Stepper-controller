@@ -2,8 +2,22 @@
 #include <SPI.h>
 #include <EEPROM.h>
 #include <TMCStepper.h>
+#ifdef LCD_ST7796
+#include <TFT_eSPI.h>   // ST7796S driver/pins configured via build_flags in platformio.ini
+#include <Wire.h>       // FT6336 capacitive touch on I2C0
+#else
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+// The draw code uses TFT_eSPI colour names; alias them onto the Adafruit equivalents.
+#define TFT_BLACK   ST77XX_BLACK
+#define TFT_WHITE   ST77XX_WHITE
+#define TFT_RED     ST77XX_RED
+#define TFT_GREEN   ST77XX_GREEN
+#define TFT_BLUE    ST77XX_BLUE
+#define TFT_CYAN    ST77XX_CYAN
+#define TFT_MAGENTA ST77XX_MAGENTA
+#define TFT_YELLOW  ST77XX_YELLOW
+#endif
 #include <pico/mutex.h>
 
 // ============= PIN DEFINITIONS =============
@@ -15,13 +29,22 @@ const int TMC_STEP = 14;
 const int TMC_DIR  = 15;
 const int TMC_EN   = 1;
 
-// GMT147SPI 1.47" 172x320 ST7789 on SPI0
+// LCD on SPI0 — same wiring for both display variants:
+//   default:      GMT147SPI 1.47" 172x320 ST7789
+//   -DLCD_ST7796: Hosyond 4.0" 480x320 ST7796S (pins repeated in platformio.ini build_flags)
 const int LCD_CS  = 9;
 const int LCD_DC  = 5;
-const int LCD_RST = 6;
+const int LCD_RST = 6;   // ST7796 module: also wire CTP_RST here (one line resets LCD + touch)
 const int LCD_BL  = 20;
 const int LCD_MOSI = 19;
 const int LCD_SCK  = 18;
+
+#ifdef LCD_ST7796
+// FT6336 capacitive touch on I2C0
+const int TP_SDA = 16;
+const int TP_SCL = 17;
+const int TP_INT = 0;    // LOW while a finger is down
+#endif
 
 // KY-040 rotary encoder: CLK=A, DT=B, SW=push-button
 const int ENC_A  = 26;
@@ -286,6 +309,27 @@ const uint8_t ENCODER_STABLE_SAMPLES = 1;
 const unsigned long SENSOR_DEBOUNCE = 50;
 
 // ============= DISPLAY / MENU =============
+#ifdef LCD_ST7796
+TFT_eSPI tft = TFT_eSPI();   // 480x320 landscape (rotation 1)
+
+// Side status column
+const int STATUS_X = 352;
+const int STATUS_W = 128;
+const int CONTENT_W = STATUS_X - 2;
+
+// Arm-position animation region (main menu + Sweep Settings), anchored at the bottom.
+const int ANIM_X = 4;
+const int ANIM_W = STATUS_X - 8;
+const int ANIM_H = 100;
+const int ANIM_Y = 320 - ANIM_H;
+
+// Row layout shared by the draw code and the touch → row mapping.
+const int MENU_ROW_Y0     = 36,  MENU_ROW_DY     = 56;
+const int SETTINGS_ROW_Y0 = 40,  SETTINGS_ROW_DY = 34;
+const int SETUP_ROW_Y0    = 40,  SETUP_ROW_DY    = 38;
+const int SETUP_VISIBLE   = 7;
+volatile int setupFirstVisible = 0;   // Setup scroll offset, written by drawSetup (core 1)
+#else
 Adafruit_ST7789 tft = Adafruit_ST7789(LCD_CS, LCD_DC, LCD_RST);
 
 // Status column narrowed slightly (was 232/88) so the textSize-2 Sweep Settings rows fit
@@ -300,6 +344,7 @@ const int ANIM_X = 4;
 const int ANIM_W = STATUS_X - 8;
 const int ANIM_H = 57;             // ≈ 1/3 of the screen height
 const int ANIM_Y = 172 - ANIM_H;   // 115 — flush to the bottom edge
+#endif
 
 // Main menu — 4 items, no HOME
 const char* menuItems[] = { "START/STOP", "Settings", "Setup", "About" };
@@ -346,6 +391,10 @@ mutex_t spi_mutex;
 void initHardware();
 void initSPI();
 void initEncoder();
+#ifdef LCD_ST7796
+void initTouch();
+void handleTouch();
+#endif
 int8_t pollEncoderRotation();
 void encoderButtonIsr();
 void initTMC2130();
@@ -432,6 +481,9 @@ void setup() {
     initTMC2130();
     initEncoder();
     initDisplay();
+#ifdef LCD_ST7796
+    initTouch();
+#endif
 
     currentState    = STATE_IDLE;
     lastStateChange = millis();
@@ -459,6 +511,10 @@ void loop() {
         readEncoder();
         lastEncoderRead = now;
     }
+
+#ifdef LCD_ST7796
+    handleTouch();
+#endif
 
     if (menuButtonPressed) {
         menuButtonPressed = false;
@@ -514,9 +570,13 @@ void initHardware() {
 }
 
 void initSPI() {
+#ifndef LCD_ST7796
+    // TFT_eSPI configures SPI0 itself in tft.init(); only the Adafruit driver needs this.
     SPI.setTX(LCD_MOSI);
     SPI.setSCK(LCD_SCK);
     SPI.begin();
+    Serial.printf("SPI0 LCD initialized: SCK=%d MOSI=%d\n", LCD_SCK, LCD_MOSI);
+#endif
 
     SPI1.setRX(TMC_MISO);
     SPI1.setTX(TMC_MOSI);
@@ -524,7 +584,6 @@ void initSPI() {
     SPI1.begin();
 
     mutex_init(&spi_mutex);
-    Serial.printf("SPI0 LCD initialized: SCK=%d MOSI=%d\n", LCD_SCK, LCD_MOSI);
     Serial.printf("SPI1 TMC initialized: SCK=%d MOSI=%d MISO=%d\n", TMC_SCK, TMC_MOSI, TMC_MISO);
 }
 
@@ -562,15 +621,114 @@ void initTMC2130() {
     dumpDriverStatus();
 }
 
+#ifdef LCD_ST7796
+void initDisplay() {
+    tft.init();
+    tft.setRotation(1);   // 480x320 landscape; use 3 if the panel is mounted upside down
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextWrap(false);
+    // No cp437() needed: TFT_eSPI's GLCD font draws the full classic table, so the
+    // sweep-type arrow (0x1D) and bullet (0x07) glyphs render as-is.
+    Serial.println("Display initialized (ST7796S 4.0\" 480x320)");
+}
+
+// ============= TOUCH (FT6336 @0x38 on I2C0) =============
+// ponytail: raw register poll, no library — only TD_STATUS + the P1 coordinate regs are needed.
+void initTouch() {
+    pinMode(TP_INT, INPUT_PULLUP);
+    Wire.setSDA(TP_SDA);
+    Wire.setSCL(TP_SCL);
+    Wire.begin();
+    Wire.beginTransmission(0x38);
+    bool found = (Wire.endTransmission() == 0);
+    Serial.printf("Touch FT6336 @0x38 %s (SDA=%d SCL=%d INT=%d)\n",
+                  found ? "found" : "NOT found", TP_SDA, TP_SCL, TP_INT);
+}
+
+// Read the first touch point in screen (rotation-1 landscape) coordinates.
+bool readTouchPoint(int& x, int& y) {
+    if (digitalRead(TP_INT) == HIGH) return false;   // no finger down, skip the I2C traffic
+    Wire.beginTransmission(0x38);
+    Wire.write(0x02);                                // TD_STATUS
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(0x38, 5) != 5) return false;
+    int n  = Wire.read() & 0x0F;
+    int xh = Wire.read(), xl = Wire.read();
+    int yh = Wire.read(), yl = Wire.read();
+    if (n < 1 || n > 2) return false;
+    int tx = ((xh & 0x0F) << 8) | xl;   // 0..319, panel-native portrait frame
+    int ty = ((yh & 0x0F) << 8) | yl;   // 0..479
+    // Map the portrait touch frame onto the rotation-1 landscape screen. Panel batches
+    // differ in axis orientation — if taps land mirrored, flip the subtractions here.
+    x = ty;
+    y = 319 - tx;
+    return true;
+}
+
+// A tap routes into the same flags the encoder uses, so both inputs share one code path.
+void touchTap(int x, int y) {
+    switch (displayMode) {
+        case DISP_MENU: {
+            int visibleCount = advancedMenuUnlocked ? MENU_COUNT : BASIC_MENU_COUNT;
+            int rel = y - (MENU_ROW_Y0 - 2);
+            if (x < CONTENT_W && rel >= 0) {
+                int i = rel / MENU_ROW_DY;
+                if (i < visibleCount) {
+                    menuIndex = i;
+                    menuButtonPressed = true;   // same path as an encoder click
+                }
+            }
+            break;
+        }
+        case DISP_SETTINGS: {
+            if (y < SETTINGS_ROW_Y0 - 2) { longPressBack = true; break; }   // header = back
+            int i = (y - (SETTINGS_ROW_Y0 - 2)) / SETTINGS_ROW_DY;
+            if (x < CONTENT_W && i < SETTINGS_COUNT) {
+                if (i == settingsIndex) menuButtonPressed = true;   // toggle edit
+                else { editingSettings = false; settingsIndex = i; }
+            }
+            break;
+        }
+        case DISP_SETUP: {
+            if (y < SETUP_ROW_Y0 - 2) { longPressBack = true; break; }      // header = back
+            int r = (y - (SETUP_ROW_Y0 - 2)) / SETUP_ROW_DY;
+            int i = setupFirstVisible + r;
+            if (x < CONTENT_W && r < SETUP_VISIBLE && i < SETUP_COUNT) {
+                if (i == setupIndex) menuButtonPressed = true;
+                else { editingSetup = false; setupIndex = i; }
+            }
+            break;
+        }
+        case DISP_ABOUT:
+            menuButtonPressed = true;   // tap = return
+            break;
+    }
+}
+
+void handleTouch() {
+    static unsigned long lastPoll   = 0;
+    static bool          wasTouched = false;
+    unsigned long now = millis();
+    if (now - lastPoll < 30) return;
+    lastPoll = now;
+
+    int x, y;
+    if (!readTouchPoint(x, y)) { wasTouched = false; return; }
+    if (wasTouched) return;      // act on initial contact only (no repeat / drag)
+    wasTouched = true;
+    touchTap(x, y);
+}
+#else
 void initDisplay() {
     tft.init(172, 320);
     tft.setSPISpeed(20000000);
     tft.setRotation(1);
-    tft.fillScreen(ST77XX_BLACK);
+    tft.fillScreen(TFT_BLACK);
     tft.setTextWrap(false);
     tft.cp437(true);   // CP437 glyphs so the sweep-type arrow (0x1D) and bullet (0x07) render
     Serial.println("Display initialized (GMT147SPI 1.47\" 172x320)");
 }
+#endif
 
 // ============= PERSISTENT SETTINGS =============
 uint32_t fnv1aBytes(const uint8_t* bytes, size_t len) {
@@ -2019,6 +2177,7 @@ const char* stateLabel(SystemState state) {
     return "----";
 }
 
+#ifndef LCD_ST7796
 // Side status bar. Top half: live STATE + arm ANGLE. Middle: the SWEEP config summary
 // (calculated sweep angle, time, wafer, type, profile). Bottom: spray/flow sensors.
 void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
@@ -2036,19 +2195,19 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     bool sensorChanged = (SENSOR_INPUTS_ENABLED != drawnSensorEnabled);
 
     if (forceRedraw) {
-        tft.fillRect(STATUS_X, 0, STATUS_W, tft.height(), ST77XX_BLACK);
+        tft.fillRect(STATUS_X, 0, STATUS_W, tft.height(), TFT_BLACK);
         tft.drawFastVLine(STATUS_X, 0, tft.height(), tft.color565(70, 70, 70));
 
         tft.setTextWrap(false);
         tft.setTextSize(1);
-        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
         tft.setCursor(x, 4);  tft.print("STATUS");
-        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setCursor(x, 24); tft.print("STATE");
         tft.setCursor(x, 54); tft.print("ANGLE");
-        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
         tft.setCursor(x, 86); tft.print("SWEEP");
-        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setCursor(x, 148); tft.print("SPRAY");
         tft.setCursor(x, 158); tft.print("FLOW");
 
@@ -2062,19 +2221,19 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     // DEBUG ON indicator: re-drawn whenever the sensor-bypass toggle changes,
     // not just on a full redraw, so flipping it in Setup updates live.
     if (forceRedraw || sensorChanged) {
-        tft.fillRect(x, 14, valueW, 8, ST77XX_BLACK);
+        tft.fillRect(x, 14, valueW, 8, TFT_BLACK);
         if (!SENSOR_INPUTS_ENABLED) {
-            tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+            tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
             tft.setCursor(x, 14); tft.print("DEBUG ON");
         }
         drawnSensorEnabled = SENSOR_INPUTS_ENABLED;
     }
 
     if (forceRedraw || state != drawnState || collisionLatched != drawnCollision) {
-        tft.fillRect(x, 34, valueW, 16, ST77XX_BLACK);
+        tft.fillRect(x, 34, valueW, 16, TFT_BLACK);
         if (state == STATE_ERROR) {
             // ERROR is red; a StallGuard trip is spelled out as "COLLISION".
-            tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+            tft.setTextColor(TFT_RED, TFT_BLACK);
             if (collisionLatched) {
                 tft.setTextSize(1);
                 tft.setCursor(x, 34); tft.print("COLLISION");
@@ -2085,7 +2244,7 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
             }
         } else {
             tft.setTextSize(2);
-            tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+            tft.setTextColor(TFT_YELLOW, TFT_BLACK);
             tft.setCursor(x, 34); tft.print(stateLabel(state));
         }
         drawnState = state;
@@ -2093,9 +2252,9 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     }
 
     if (forceRedraw || posDeg != drawnPosDeg) {
-        tft.fillRect(x, 64, valueW, 16, ST77XX_BLACK);
+        tft.fillRect(x, 64, valueW, 16, TFT_BLACK);
         tft.setTextSize(2);
-        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
         tft.setCursor(x, 64); tft.print(posDeg);
         tft.setTextSize(1); tft.print(" deg");
         drawnPosDeg = posDeg;
@@ -2104,57 +2263,57 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     // SWEEP config summary (updates live while editing on the Settings screen).
     int sweepAng = travelSweepDegX10();
     if (forceRedraw || sweepAng != drawnSweepAng) {
-        tft.fillRect(x, 96, valueW, 8, ST77XX_BLACK);
-        tft.setTextSize(1); tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+        tft.fillRect(x, 96, valueW, 8, TFT_BLACK);
+        tft.setTextSize(1); tft.setTextColor(TFT_YELLOW, TFT_BLACK);
         tft.setCursor(x, 96); printDegX10(sweepAng); tft.print("deg");
         drawnSweepAng = sweepAng;
     }
     if (forceRedraw || (int)SWEEP_TIME_MS != drawnTime) {
-        tft.fillRect(x, 106, valueW, 8, ST77XX_BLACK);
-        tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.fillRect(x, 106, valueW, 8, TFT_BLACK);
+        tft.setTextSize(1); tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setCursor(x, 106); tft.print((SWEEP_TIME_MS + 500) / 1000); tft.print("s");
         drawnTime = (int)SWEEP_TIME_MS;
     }
     if (forceRedraw || sampleIndex != drawnWafer) {
-        tft.fillRect(x, 116, valueW, 8, ST77XX_BLACK);
-        tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.fillRect(x, 116, valueW, 8, TFT_BLACK);
+        tft.setTextSize(1); tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setCursor(x, 116); tft.print(waferDiameterMm()); tft.print("mm");
         drawnWafer = sampleIndex;
     }
     if (forceRedraw || sweepType != drawnType) {
-        tft.fillRect(x, 126, valueW, 8, ST77XX_BLACK);
-        tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.fillRect(x, 126, valueW, 8, TFT_BLACK);
+        tft.setTextSize(1); tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setCursor(x, 126); tft.print(sweepTypeLabel());
         drawnType = sweepType;
     }
     if (forceRedraw || sweepProfile != drawnProfile) {
-        tft.fillRect(x, 136, valueW, 8, ST77XX_BLACK);
-        tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.fillRect(x, 136, valueW, 8, TFT_BLACK);
+        tft.setTextSize(1); tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setCursor(x, 136); tft.print(sweepProfileLabel());
         drawnProfile = sweepProfile;
     }
 
     if (forceRedraw || sprayActive != drawnSpray || sensorChanged) {
-        tft.fillRect(x + 38, 148, valueW - 38, 8, ST77XX_BLACK);
+        tft.fillRect(x + 38, 148, valueW - 38, 8, TFT_BLACK);
         tft.setTextSize(1);
         if (SENSOR_INPUTS_ENABLED) {
-            tft.setTextColor(sprayActive ? ST77XX_GREEN : ST77XX_RED, ST77XX_BLACK);
+            tft.setTextColor(sprayActive ? TFT_GREEN : TFT_RED, TFT_BLACK);
             tft.setCursor(x + 38, 148); tft.print(sprayActive ? "ON" : "OFF");
         } else {
-            tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+            tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
             tft.setCursor(x + 38, 148); tft.print("DIS");
         }
         drawnSpray = sprayActive;
     }
 
     if (forceRedraw || flowDetected != drawnFlow || sensorChanged) {
-        tft.fillRect(x + 38, 158, valueW - 38, 8, ST77XX_BLACK);
+        tft.fillRect(x + 38, 158, valueW - 38, 8, TFT_BLACK);
         tft.setTextSize(1);
         if (SENSOR_INPUTS_ENABLED) {
-            tft.setTextColor(flowDetected ? ST77XX_GREEN : ST77XX_RED, ST77XX_BLACK);
+            tft.setTextColor(flowDetected ? TFT_GREEN : TFT_RED, TFT_BLACK);
             tft.setCursor(x + 38, 158); tft.print(flowDetected ? "YES" : "NO");
         } else {
-            tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
+            tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
             tft.setCursor(x + 38, 158); tft.print("DIS");
         }
         drawnFlow = flowDetected;
@@ -2184,7 +2343,7 @@ void drawIcon(int id, int x, int y, uint16_t color) {
             tft.fillRect(x+5, y+13, 6, 5, color);   // bottom tooth
             tft.fillRect(x,    y+5, 4, 6, color);   // left tooth
             tft.fillRect(x+13, y+5, 5, 6, color);   // right tooth
-            tft.fillCircle(x+8, y+8, 3, ST77XX_BLACK);  // hole
+            tft.fillCircle(x+8, y+8, 3, TFT_BLACK);  // hole
             break;
         case 3:  // ℹ info circle
             tft.drawCircle(x+8, y+8, 8, color);
@@ -2195,8 +2354,8 @@ void drawIcon(int id, int x, int y, uint16_t color) {
 }
 
 void drawMenuRow(int i, int y, bool selected) {
-    uint16_t bg   = selected ? ST77XX_BLUE : ST77XX_BLACK;
-    uint16_t icnc = selected ? ST77XX_WHITE : ST77XX_CYAN;
+    uint16_t bg   = selected ? TFT_BLUE : TFT_BLACK;
+    uint16_t icnc = selected ? TFT_WHITE : TFT_CYAN;
 
     tft.fillRect(6, y - 2, CONTENT_W - 12, 28, bg);
 
@@ -2207,7 +2366,7 @@ void drawMenuRow(int i, int y, bool selected) {
         drawIcon(i, 8, y + 2, icnc);
     }
 
-    tft.setTextColor(ST77XX_WHITE, bg);
+    tft.setTextColor(TFT_WHITE, bg);
     tft.setTextSize(3);
     tft.setCursor(36, y);
     tft.print(menuItems[i]);
@@ -2227,7 +2386,7 @@ void drawMenu() {
     }
 
     if (menuDrawState == -1) {
-        tft.fillScreen(ST77XX_BLACK);
+        tft.fillScreen(TFT_BLACK);
 
         // Ultrasonic wave logo: 3 zigzag bumps in cyan
         uint16_t wc = tft.color565(0, 200, 255);
@@ -2239,7 +2398,7 @@ void drawMenu() {
         tft.drawLine(23, 6, 26, 12, wc);
 
         tft.setTextSize(2);
-        tft.setTextColor(wc, ST77XX_BLACK);
+        tft.setTextColor(wc, TFT_BLACK);
         tft.setCursor(28, 2);
         tft.print("MEGASONIC CLEANER");
 
@@ -2256,6 +2415,244 @@ void drawMenu() {
     menuDrawState = mi;
 }
 
+#else  // ============= LCD_ST7796: 480x320 status column + menu =============
+
+// Side status bar (480x320). Same content as the small display, scaled up.
+void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
+    static SystemState drawnState = (SystemState)-1;
+    static int  drawnPosDeg = -9999;
+    static bool drawnSpray = false;
+    static bool drawnFlow  = false;
+    static int  drawnSweepAng = -1, drawnTime = -1, drawnWafer = -1, drawnType = -1, drawnProfile = -1;
+    static bool drawnSensorEnabled = true;
+    static bool drawnCollision = false;
+
+    int x = STATUS_X + 6;          // 358
+    int valueW = STATUS_W - 8;     // 120
+
+    bool sensorChanged = (SENSOR_INPUTS_ENABLED != drawnSensorEnabled);
+
+    if (forceRedraw) {
+        tft.fillRect(STATUS_X, 0, STATUS_W, tft.height(), TFT_BLACK);
+        tft.drawFastVLine(STATUS_X, 0, tft.height(), tft.color565(70, 70, 70));
+
+        tft.setTextWrap(false);
+        tft.setTextSize(2);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setCursor(x, 6);   tft.print("STATUS");
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor(x, 50);  tft.print("STATE");
+        tft.setCursor(x, 106); tft.print("ANGLE");
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setCursor(x, 156); tft.print("SWEEP");
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor(x, 280); tft.print("SPRAY");
+        tft.setCursor(x, 300); tft.print("FLOW");
+
+        drawnState = (SystemState)-1;
+        drawnPosDeg = -9999;
+        drawnSpray = !sprayActive;
+        drawnFlow  = !flowDetected;
+        drawnSweepAng = drawnTime = drawnWafer = drawnType = drawnProfile = -1;
+    }
+
+    // DEBUG ON indicator: re-drawn whenever the sensor-bypass toggle changes.
+    if (forceRedraw || sensorChanged) {
+        tft.fillRect(x, 26, valueW, 16, TFT_BLACK);
+        if (!SENSOR_INPUTS_ENABLED) {
+            tft.setTextSize(2);
+            tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
+            tft.setCursor(x, 26); tft.print("DEBUG ON");
+        }
+        drawnSensorEnabled = SENSOR_INPUTS_ENABLED;
+    }
+
+    if (forceRedraw || state != drawnState || collisionLatched != drawnCollision) {
+        tft.fillRect(x, 70, valueW, 32, TFT_BLACK);
+        if (state == STATE_ERROR) {
+            // ERROR is red; a StallGuard trip is spelled out as "COLLISION".
+            tft.setTextColor(TFT_RED, TFT_BLACK);
+            if (collisionLatched) {
+                tft.setTextSize(2);
+                tft.setCursor(x, 70); tft.print("COLLISION");
+                tft.setTextSize(1);
+                tft.setCursor(x, 88); tft.print("arm stalled");
+            } else {
+                tft.setTextSize(3);
+                tft.setCursor(x, 70); tft.print("ERROR");
+            }
+        } else {
+            tft.setTextSize(3);
+            tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+            tft.setCursor(x, 70); tft.print(stateLabel(state));
+        }
+        drawnState = state;
+        drawnCollision = collisionLatched;
+    }
+
+    if (forceRedraw || posDeg != drawnPosDeg) {
+        tft.fillRect(x, 126, valueW, 24, TFT_BLACK);
+        tft.setTextSize(3);
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setCursor(x, 126); tft.print(posDeg);
+        tft.setTextSize(2); tft.print(" deg");
+        drawnPosDeg = posDeg;
+    }
+
+    // SWEEP config summary (updates live while editing on the Settings screen).
+    int sweepAng = travelSweepDegX10();
+    if (forceRedraw || sweepAng != drawnSweepAng) {
+        tft.fillRect(x, 176, valueW, 16, TFT_BLACK);
+        tft.setTextSize(2); tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setCursor(x, 176); printDegX10(sweepAng); tft.print("deg");
+        drawnSweepAng = sweepAng;
+    }
+    if (forceRedraw || (int)SWEEP_TIME_MS != drawnTime) {
+        tft.fillRect(x, 196, valueW, 16, TFT_BLACK);
+        tft.setTextSize(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor(x, 196); tft.print((SWEEP_TIME_MS + 500) / 1000); tft.print("s");
+        drawnTime = (int)SWEEP_TIME_MS;
+    }
+    if (forceRedraw || sampleIndex != drawnWafer) {
+        tft.fillRect(x, 216, valueW, 16, TFT_BLACK);
+        tft.setTextSize(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor(x, 216); tft.print(waferDiameterMm()); tft.print("mm");
+        drawnWafer = sampleIndex;
+    }
+    if (forceRedraw || sweepType != drawnType) {
+        tft.fillRect(x, 236, valueW, 16, TFT_BLACK);
+        tft.setTextSize(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor(x, 236); tft.print(sweepTypeLabel());
+        drawnType = sweepType;
+    }
+    if (forceRedraw || sweepProfile != drawnProfile) {
+        tft.fillRect(x, 256, valueW, 16, TFT_BLACK);
+        tft.setTextSize(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor(x, 256); tft.print(sweepProfileLabel());
+        drawnProfile = sweepProfile;
+    }
+
+    if (forceRedraw || sprayActive != drawnSpray || sensorChanged) {
+        tft.fillRect(x + 66, 280, valueW - 66, 16, TFT_BLACK);
+        tft.setTextSize(2);
+        if (SENSOR_INPUTS_ENABLED) {
+            tft.setTextColor(sprayActive ? TFT_GREEN : TFT_RED, TFT_BLACK);
+            tft.setCursor(x + 66, 280); tft.print(sprayActive ? "ON" : "OFF");
+        } else {
+            tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
+            tft.setCursor(x + 66, 280); tft.print("DIS");
+        }
+        drawnSpray = sprayActive;
+    }
+
+    if (forceRedraw || flowDetected != drawnFlow || sensorChanged) {
+        tft.fillRect(x + 66, 300, valueW - 66, 16, TFT_BLACK);
+        tft.setTextSize(2);
+        if (SENSOR_INPUTS_ENABLED) {
+            tft.setTextColor(flowDetected ? TFT_GREEN : TFT_RED, TFT_BLACK);
+            tft.setCursor(x + 66, 300); tft.print(flowDetected ? "YES" : "NO");
+        } else {
+            tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
+            tft.setCursor(x + 66, 300); tft.print("DIS");
+        }
+        drawnFlow = flowDetected;
+    }
+}
+
+// Draw icon id into a 40×40 box at (x,y) — the 20×20 icons of the small display doubled.
+// id: 0=play/stop (START/STOP), 1=sliders (Settings), 2=gear (Setup), 3=info (About)
+void drawIcon(int id, int x, int y, uint16_t color) {
+    switch (id) {
+        case 0:  // ▶ play triangle
+            tft.fillTriangle(x, y+2, x, y+34, x+28, y+18, color);
+            break;
+        case 1:  // ≡ three-slider equaliser
+            tft.fillRect(x,    y+4,  32, 4, color);
+            tft.fillRect(x,    y+16, 32, 4, color);
+            tft.fillRect(x,    y+28, 32, 4, color);
+            tft.fillCircle(x+8,  y+6,  6, color);
+            tft.fillCircle(x+24, y+18, 6, color);
+            tft.fillCircle(x+16, y+30, 6, color);
+            break;
+        case 2:  // ⚙ gear
+            tft.fillCircle(x+16, y+16, 14, color);
+            tft.fillRect(x+10, y,    12, 8,  color);   // top tooth
+            tft.fillRect(x+10, y+26, 12, 10, color);   // bottom tooth
+            tft.fillRect(x,    y+10, 8,  12, color);   // left tooth
+            tft.fillRect(x+26, y+10, 10, 12, color);   // right tooth
+            tft.fillCircle(x+16, y+16, 6, TFT_BLACK);  // hole
+            break;
+        case 3:  // ℹ info circle
+            tft.drawCircle(x+16, y+16, 16, color);
+            tft.fillRect(x+12, y+6,  8, 6,  color);  // dot
+            tft.fillRect(x+12, y+16, 8, 12, color);  // stem
+            break;
+    }
+}
+
+void drawMenuRow(int i, int y, bool selected) {
+    uint16_t bg   = selected ? TFT_BLUE : TFT_BLACK;
+    uint16_t icnc = selected ? TFT_WHITE : TFT_CYAN;
+
+    tft.fillRect(6, y - 2, CONTENT_W - 12, 52, bg);
+
+    // Item 0: show stop square (■) when motor is running, play triangle otherwise
+    if (i == 0 && currentState != STATE_IDLE) {
+        tft.fillRect(14, y + 8, 28, 28, icnc);
+    } else {
+        drawIcon(i, 10, y + 4, icnc);
+    }
+
+    tft.setTextColor(TFT_WHITE, bg);
+    tft.setTextSize(4);
+    tft.setCursor(64, y + 8);
+    tft.print(menuItems[i]);
+}
+
+void drawMenu() {
+    // Layout (landscape 480×320):
+    //   Wave + title  y=4   (textSize 3)
+    //   Items         from MENU_ROW_Y0, step MENU_ROW_DY  (textSize 4)
+    //   Arm animation at the bottom (basic menu only), status column on the right
+
+    int visibleCount = advancedMenuUnlocked ? MENU_COUNT : BASIC_MENU_COUNT;
+    int mi = menuIndex;  // snapshot to avoid race with Core 0
+    if (mi >= visibleCount) {
+        mi = 0;
+        menuIndex = 0;
+    }
+
+    if (menuDrawState == -1) {
+        tft.fillScreen(TFT_BLACK);
+
+        // Ultrasonic wave logo: 3 zigzag bumps in cyan
+        uint16_t wc = tft.color565(0, 200, 255);
+        tft.drawLine(4, 20,  8,  8, wc);
+        tft.drawLine(8,  8, 12, 20, wc);
+        tft.drawLine(12, 20, 16,  8, wc);
+        tft.drawLine(16,  8, 20, 20, wc);
+        tft.drawLine(20, 20, 24,  8, wc);
+        tft.drawLine(24,  8, 28, 20, wc);
+
+        tft.setTextSize(3);
+        tft.setTextColor(wc, TFT_BLACK);
+        tft.setCursor(36, 4);
+        tft.print("MEGASONIC CLEANER");
+
+        for (int i = 0; i < visibleCount; i++)
+            drawMenuRow(i, MENU_ROW_Y0 + i * MENU_ROW_DY, i == mi);
+
+    } else if (menuDrawState != mi) {
+        if (menuDrawState >= 0 && menuDrawState < visibleCount) {
+            drawMenuRow(menuDrawState, MENU_ROW_Y0 + menuDrawState * MENU_ROW_DY, false);
+        }
+        drawMenuRow(mi, MENU_ROW_Y0 + mi * MENU_ROW_DY, true);
+    }
+
+    menuDrawState = mi;
+}
+#endif  // LCD_ST7796
+
 // Circle outline (Bresenham midpoint) clipped to a vertical [yTop, yBot] window,
 // so an oversized wafer can be cropped top and bottom instead of overflowing.
 void drawCircleClipped(int cx, int cy, int r, int yTop, int yBot, uint16_t color) {
@@ -2264,7 +2661,7 @@ void drawCircleClipped(int cx, int cy, int r, int yTop, int yBot, uint16_t color
         const int px[8] = { cx + x, cx - x, cx + x, cx - x, cx + y, cx - y, cx + y, cx - y };
         const int py[8] = { cy + y, cy + y, cy - y, cy - y, cy + x, cy + x, cy - x, cy - x };
         for (int i = 0; i < 8; i++)
-            if (py[i] >= yTop && py[i] <= yBot && px[i] >= 0 && px[i] < 320)
+            if (py[i] >= yTop && py[i] <= yBot && px[i] >= 0 && px[i] < tft.width())
                 tft.drawPixel(px[i], py[i], color);
         if (d < 0) d += 4 * x + 6; else { d += 4 * (x - y) + 10; y--; }
         x++;
@@ -2278,6 +2675,109 @@ void drawCircleClipped(int cx, int cy, int r, int yTop, int yBot, uint16_t color
 // ARM_LENGTH * sin(angle - centre), so the sweep extremes land on the wafer edges.
 // The scale is fixed to the largest selectable wafer (150 mm) so the circle is drawn
 // as large as possible; it is cropped top and bottom by the [yTop, yBot] window.
+#ifdef LCD_ST7796
+void drawArmAnim(bool fullRedraw, int posDegX10) {
+    const int axisY   = ANIM_Y + ANIM_H / 2;         // wafer centre / arrow-tip line
+    const int yTop    = ANIM_Y;                      // crop window top
+    const int yBot    = ANIM_Y + ANIM_H - 1;         // crop window bottom
+    const int headH   = 12;                          // arrowhead height
+    const int tipY    = axisY;                       // arrow points down onto the plane
+    const uint16_t gray = tft.color565(60, 60, 60);
+
+    static int   prevArmX    = -1;
+    static int   lastAnimDeg = -9999;                // whole degrees, for the 1° flicker gate
+    static bool  prevPulse   = false;                // last lightning-sign blink state
+    static int   cPark = -1, cCenter = -1, cArm = -1, cWafer = -1;
+    static int   waferCx = 0, radiusPx = 0, parkX = 0, startX = 0, drawnW = 0, axL = 0, axR = 0;
+    static float sScale = 1.0f, sLo = 0.0f;
+
+    const float toRad     = 3.14159265f / 180.0f;
+    const float centerDeg = CENTER_DEG_X10 * 0.1f;
+
+    // Static layout depends only on park / centre / arm length / wafer settings.
+    bool redrawStatic = fullRedraw || cPark != PARK_DEG_X10 || cCenter != CENTER_DEG_X10 ||
+                        cArm != ARM_LENGTH_MM || cWafer != sampleIndex;
+
+    if (redrawStatic) {
+        cPark = PARK_DEG_X10; cCenter = CENTER_DEG_X10;
+        cArm = ARM_LENGTH_MM; cWafer = sampleIndex;
+
+        float parkDeg   = PARK_DEG_X10 * 0.1f;
+        float waferR    = waferDiameterMm() * 0.5f;
+        float waferRmax = SAMPLE_TABLE[SAMPLE_COUNT - 1] * 0.5f;   // 150 mm wafer
+        float parkOff   = ARM_LENGTH_MM * sinf((parkDeg - centerDeg) * toRad);
+
+        // Fixed scale sized for the largest wafer so the circle fills the width;
+        // taller-than-the-window circles are cropped top/bottom by drawCircleClipped.
+        float lo = fminf(parkOff, -waferRmax);
+        float hi = fmaxf(parkOff,  waferRmax);
+        float spanMm = hi - lo; if (spanMm < 1.0f) spanMm = 1.0f;
+        sScale = (ANIM_W - 24) / spanMm;
+        sLo    = lo;
+
+        drawnW   = (int)lroundf(spanMm * sScale);
+        startX   = ANIM_X + (ANIM_W - drawnW) / 2;
+        radiusPx = (int)lroundf(waferR * sScale);
+        waferCx  = startX + (int)lroundf((0.0f    - lo) * sScale);
+        parkX    = startX + (int)lroundf((parkOff - lo) * sScale);
+        axL = max(ANIM_X,       min(parkX, waferCx - radiusPx) - 6);
+        axR = min(STATUS_X - 2, waferCx + radiusPx + 6);
+
+        // Clear region and paint the static scene.
+        tft.fillRect(ANIM_X, ANIM_Y - 2, ANIM_W, ANIM_H + 2, TFT_BLACK);
+        tft.drawFastHLine(ANIM_X, ANIM_Y - 4, ANIM_W, gray);            // separator
+        tft.drawFastHLine(axL, axisY, axR - axL, gray);                 // sweep axis
+        drawCircleClipped(waferCx, axisY, radiusPx, yTop, yBot, TFT_CYAN);
+        tft.fillCircle(waferCx, axisY, 3, TFT_CYAN);                    // wafer centre dot
+        tft.drawFastVLine(parkX, axisY - 10, 21, TFT_GREEN);            // park tick
+        tft.setTextSize(2);
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setCursor(parkX - 5, axisY + 14);
+        tft.print("P");
+
+        prevArmX = -1; lastAnimDeg = -9999; prevPulse = false;  // force the arrow to repaint
+    }
+
+    // Live arm position.
+    float armOff = ARM_LENGTH_MM * sinf((posDegX10 * 0.1f - centerDeg) * toRad);
+    int   armX   = startX + (int)lroundf((armOff - sLo) * sScale);
+    armX = constrain(armX, startX, startX + drawnW);
+
+    // Generator lightning sign blinks ~2 Hz while the ultrasonic generator is on.
+    bool pulseOn = ultrasonicActive && ((millis() / 250) & 1);
+
+    // Redraw the arrow when it moved ≥1° (flicker gate) or when the pulse toggled.
+    int  curDeg    = (posDegX10 + (posDegX10 >= 0 ? 5 : -5)) / 10;
+    bool angleStep = redrawStatic || abs(curDeg - lastAnimDeg) >= 1;
+    bool moved     = angleStep && (armX != prevArmX);
+    if (!redrawStatic && !moved && pulseOn == prevPulse && prevArmX >= 0) return;
+    if (angleStep) lastAnimDeg = curDeg;
+
+    // Erase the old arrow + sign within the crop window, then restore the scene.
+    if (prevArmX >= 0) {
+        tft.fillRect(prevArmX - 8, yTop, 26, (tipY + 1) - yTop, TFT_BLACK);
+        tft.drawFastHLine(axL, axisY, axR - axL, gray);
+        drawCircleClipped(waferCx, axisY, radiusPx, yTop, yBot, TFT_CYAN);
+        tft.fillCircle(waferCx, axisY, 3, TFT_CYAN);
+        tft.drawFastVLine(parkX, axisY - 10, 21, TFT_GREEN);
+    }
+
+    // Draw the arrow (red): tall shaft from the crop top + downward head onto the plane.
+    tft.fillRect(armX - 1, yTop, 3, (tipY - headH) - yTop, TFT_RED);
+    tft.fillTriangle(armX - 7, tipY - headH, armX + 7, tipY - headH, armX, tipY, TFT_RED);
+
+    // Pulsing lightning bolt next to the arrow while the generator is energised.
+    if (pulseOn) {
+        int bx = armX + 9, by = yTop + 2;
+        tft.drawLine(bx + 5, by,     bx,     by + 8,  TFT_YELLOW);
+        tft.drawLine(bx,     by + 8, bx + 6, by + 8,  TFT_YELLOW);
+        tft.drawLine(bx + 6, by + 8, bx + 1, by + 17, TFT_YELLOW);
+        tft.drawLine(bx + 4, by,     bx - 1, by + 8,  TFT_YELLOW);  // thicken upper stroke
+    }
+    prevPulse = pulseOn;
+    prevArmX  = armX;
+}
+#else
 void drawArmAnim(bool fullRedraw, int posDegX10) {
     const int axisY   = ANIM_Y + ANIM_H / 2;        // 126: wafer centre / arrow-tip line
     const int yTop    = ANIM_Y;                      // crop window top
@@ -2326,14 +2826,14 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
         axR = min(STATUS_X - 2, waferCx + radiusPx + 4);
 
         // Clear region and paint the static scene.
-        tft.fillRect(ANIM_X, ANIM_Y - 2, ANIM_W, ANIM_H + 2, ST77XX_BLACK);
+        tft.fillRect(ANIM_X, ANIM_Y - 2, ANIM_W, ANIM_H + 2, TFT_BLACK);
         tft.drawFastHLine(ANIM_X, ANIM_Y - 4, ANIM_W, gray);            // separator
         tft.drawFastHLine(axL, axisY, axR - axL, gray);                 // sweep axis
-        drawCircleClipped(waferCx, axisY, radiusPx, yTop, yBot, ST77XX_CYAN);
-        tft.fillCircle(waferCx, axisY, 2, ST77XX_CYAN);                 // wafer centre dot
-        tft.drawFastVLine(parkX, axisY - 6, 13, ST77XX_GREEN);          // park tick
+        drawCircleClipped(waferCx, axisY, radiusPx, yTop, yBot, TFT_CYAN);
+        tft.fillCircle(waferCx, axisY, 2, TFT_CYAN);                 // wafer centre dot
+        tft.drawFastVLine(parkX, axisY - 6, 13, TFT_GREEN);          // park tick
         tft.setTextSize(1);
-        tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
         tft.setCursor(parkX - 2, axisY + 10);
         tft.print("P");
 
@@ -2357,29 +2857,31 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
 
     // Erase the old arrow + sign within the crop window, then restore the scene.
     if (prevArmX >= 0) {
-        tft.fillRect(prevArmX - 5, yTop, 17, (tipY + 1) - yTop, ST77XX_BLACK);
+        tft.fillRect(prevArmX - 5, yTop, 17, (tipY + 1) - yTop, TFT_BLACK);
         tft.drawFastHLine(axL, axisY, axR - axL, gray);
-        drawCircleClipped(waferCx, axisY, radiusPx, yTop, yBot, ST77XX_CYAN);
-        tft.fillCircle(waferCx, axisY, 2, ST77XX_CYAN);
-        tft.drawFastVLine(parkX, axisY - 6, 13, ST77XX_GREEN);
+        drawCircleClipped(waferCx, axisY, radiusPx, yTop, yBot, TFT_CYAN);
+        tft.fillCircle(waferCx, axisY, 2, TFT_CYAN);
+        tft.drawFastVLine(parkX, axisY - 6, 13, TFT_GREEN);
     }
 
     // Draw the arrow (red): tall shaft from the crop top + downward head onto the plane.
-    tft.fillRect(armX - 1, yTop, 2, (tipY - headH) - yTop, ST77XX_RED);
-    tft.fillTriangle(armX - 4, tipY - headH, armX + 4, tipY - headH, armX, tipY, ST77XX_RED);
+    tft.fillRect(armX - 1, yTop, 2, (tipY - headH) - yTop, TFT_RED);
+    tft.fillTriangle(armX - 4, tipY - headH, armX + 4, tipY - headH, armX, tipY, TFT_RED);
 
     // Pulsing lightning bolt next to the arrow while the generator is energised.
     if (pulseOn) {
         int bx = armX + 5, by = yTop + 1;
-        tft.drawLine(bx + 3, by,     bx,     by + 5,  ST77XX_YELLOW);
-        tft.drawLine(bx,     by + 5, bx + 4, by + 5,  ST77XX_YELLOW);
-        tft.drawLine(bx + 4, by + 5, bx + 1, by + 11, ST77XX_YELLOW);
-        tft.drawLine(bx + 2, by,     bx - 1, by + 5,  ST77XX_YELLOW);  // thicken upper stroke
+        tft.drawLine(bx + 3, by,     bx,     by + 5,  TFT_YELLOW);
+        tft.drawLine(bx,     by + 5, bx + 4, by + 5,  TFT_YELLOW);
+        tft.drawLine(bx + 4, by + 5, bx + 1, by + 11, TFT_YELLOW);
+        tft.drawLine(bx + 2, by,     bx - 1, by + 5,  TFT_YELLOW);  // thicken upper stroke
     }
     prevPulse = pulseOn;
     prevArmX  = armX;
 }
+#endif  // LCD_ST7796
 
+#ifndef LCD_ST7796
 // ============= SETTINGS SCREEN (sweep params) =============
 // Rows show "label:value" at textSize 2 (matching the larger UI), with the changeable
 // value drawn in yellow so it stands out. The space after each title is dropped so the
@@ -2387,14 +2889,14 @@ void drawArmAnim(bool fullRedraw, int posDegX10) {
 void drawSettingsRow(int i, int y, bool selected, bool editing) {
     const char* labels[] = { "Sweep time", "Wafer diam.", "Sweep type", "Profile" };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
-                  selected ? ST77XX_BLUE : ST77XX_BLACK;
+                  selected ? TFT_BLUE : TFT_BLACK;
     tft.fillRect(0, y - 2, CONTENT_W, 16, bg);
     tft.setTextSize(2);
-    tft.setTextColor(ST77XX_WHITE, bg);
+    tft.setTextColor(TFT_WHITE, bg);
     tft.setCursor(2, y);
     tft.print(labels[i]);
     tft.print(":");
-    tft.setTextColor(ST77XX_YELLOW, bg);   // highlight the changeable value
+    tft.setTextColor(TFT_YELLOW, bg);   // highlight the changeable value
     switch (i) {
         case 0: tft.print((SWEEP_TIME_MS + 500) / 1000); tft.print(" s."); break;
         case 1: tft.print(SAMPLE_TABLE[sampleIndex]);  tft.print(" mm"); break;
@@ -2419,9 +2921,9 @@ void drawSettings() {
     if (!changed) return;
 
     if (lastIdx == -1) {
-        tft.fillScreen(ST77XX_BLACK);
+        tft.fillScreen(TFT_BLACK);
         tft.setTextWrap(false);
-        tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
         tft.setTextSize(2);
         tft.setCursor(6, 3);
         tft.print("SWEEP SETTINGS");
@@ -2442,9 +2944,9 @@ void drawSetupRow(int i, int y, bool selected, bool editing) {
         "Chop   ", "Mstep  ", "Interp ", "Invert ", "Debug  ", "Stall  ", "StallSG"
     };
     uint16_t bg = editing  ? tft.color565(0, 140, 0) :
-                  selected ? ST77XX_BLUE : ST77XX_BLACK;
+                  selected ? TFT_BLUE : TFT_BLACK;
     tft.fillRect(0, y - 2, CONTENT_W, 20, bg);
-    tft.setTextColor(ST77XX_WHITE, bg);
+    tft.setTextColor(TFT_WHITE, bg);
     tft.setTextSize(2);
     tft.setCursor(6, y);
     tft.print(labels[i]);
@@ -2515,13 +3017,13 @@ void drawSetup() {
 
     bool fullRedraw = (lastIdx == -1) || (first != lastFirst);
     if (fullRedraw) {
-        tft.fillScreen(ST77XX_BLACK);
+        tft.fillScreen(TFT_BLACK);
         tft.setTextWrap(false);
     }
 
     // Header: title + live "row/total" counter (repainted each change so it stays correct).
-    tft.fillRect(0, 0, CONTENT_W, 20, ST77XX_BLACK);
-    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    tft.fillRect(0, 0, CONTENT_W, 20, TFT_BLACK);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
     tft.setTextSize(2);
     tft.setCursor(6, 3);
     tft.print("SETUP");
@@ -2541,9 +3043,9 @@ void drawSetup() {
     int yTop = ROW_Y0;
     int yBot = ROW_Y0 + (SETUP_VISIBLE - 1) * ROW_DY + 4;
     if (first > 0)
-        tft.fillTriangle(xa, yTop, xa - 6, yTop + 8, xa + 6, yTop + 8, ST77XX_YELLOW);
+        tft.fillTriangle(xa, yTop, xa - 6, yTop + 8, xa + 6, yTop + 8, TFT_YELLOW);
     if (first + SETUP_VISIBLE < SETUP_COUNT)
-        tft.fillTriangle(xa, yBot + 8, xa - 6, yBot, xa + 6, yBot, ST77XX_YELLOW);
+        tft.fillTriangle(xa, yBot + 8, xa - 6, yBot, xa + 6, yBot, TFT_YELLOW);
 
     lastIdx = si; lastEdit = ed; lastFirst = first;
     for (int i = 0; i < SETUP_COUNT; i++) lastVals[i] = vals[i];
@@ -2564,18 +3066,18 @@ void drawAbout() {
 
     if (!titleDrawn) {
         titleDrawn = true;
-        tft.fillScreen(ST77XX_BLACK);
+        tft.fillScreen(TFT_BLACK);
         tft.setTextWrap(false);
-        tft.setTextColor(ST77XX_CYAN,  ST77XX_BLACK);
+        tft.setTextColor(TFT_CYAN,  TFT_BLACK);
         tft.setTextSize(2);
         tft.setCursor(8, 3);   tft.print("MEGASONIC v1.2");
-        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setCursor(8, 22);  tft.print("RP2040 earlephilhower");
         tft.setCursor(8, 40);  tft.print("GMT147SPI 172x320");
         tft.setCursor(8, 58);  tft.print("Authors: LK & AG");
-        tft.setTextColor(ST77XX_CYAN,  ST77XX_BLACK);
+        tft.setTextColor(TFT_CYAN,  TFT_BLACK);
         tft.setCursor(8, 76);  tft.print("Driver Status:");
-        tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
         tft.setCursor(8, 154); tft.print("Press to return");
     }
 
@@ -2593,21 +3095,248 @@ void drawAbout() {
     tft.setTextSize(2);
 
     tft.setCursor(8, 94);
-    tft.setTextColor(ot   ? ST77XX_RED    : ST77XX_WHITE, ST77XX_BLACK);
+    tft.setTextColor(ot   ? TFT_RED    : TFT_WHITE, TFT_BLACK);
     tft.print("OT:");   tft.print(ot   ? "YES " : "NO  ");
-    tft.setTextColor(otpw ? ST77XX_YELLOW : ST77XX_WHITE, ST77XX_BLACK);
+    tft.setTextColor(otpw ? TFT_YELLOW : TFT_WHITE, TFT_BLACK);
     tft.print("OTPW:"); tft.print(otpw ? "YES " : "NO  ");
 
     tft.setCursor(8, 114);
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.print("CS:"); tft.print(cs); tft.print("  ");
     tft.print("SG:"); tft.print(sg); tft.print("  ");
 
     tft.setCursor(8, 134);
     tft.print("STST:"); tft.print(stst ? "YES " : "NO  ");
-    tft.setTextColor(drverr ? ST77XX_RED : ST77XX_WHITE, ST77XX_BLACK);
+    tft.setTextColor(drverr ? TFT_RED : TFT_WHITE, TFT_BLACK);
     tft.print("ERR:"); tft.print(drverr ? "YES" : "NO ");
 }
+
+#else  // ============= LCD_ST7796: 480x320 Settings / Setup / About =============
+
+// Rows show "label:value" at textSize 3, changeable value in yellow. Row 2's label is
+// shortened to "Type" so "Type:Edge↔Edge" fits the content width left of the status bar.
+void drawSettingsRow(int i, int y, bool selected, bool editing) {
+    const char* labels[] = { "Sweep time", "Wafer diam.", "Type", "Profile" };
+    uint16_t bg = editing  ? tft.color565(0, 140, 0) :
+                  selected ? TFT_BLUE : TFT_BLACK;
+    tft.fillRect(0, y - 2, CONTENT_W, 28, bg);
+    tft.setTextSize(3);
+    tft.setTextColor(TFT_WHITE, bg);
+    tft.setCursor(2, y);
+    tft.print(labels[i]);
+    tft.print(":");
+    tft.setTextColor(TFT_YELLOW, bg);   // highlight the changeable value
+    switch (i) {
+        case 0: tft.print((SWEEP_TIME_MS + 500) / 1000); tft.print(" s."); break;
+        case 1: tft.print(SAMPLE_TABLE[sampleIndex]);  tft.print(" mm"); break;
+        case 2: tft.print(sweepTypeLabel());    break;
+        case 3: tft.print(sweepProfileLabel()); break;
+    }
+}
+
+void drawSettings() {
+    static int  lastIdx     = -1;
+    static bool lastEdit    = false;
+    static int  lastVals[4] = {};
+
+    if (settingsNeedsRedraw) { settingsNeedsRedraw = false; lastIdx = -1; }
+
+    int  si = settingsIndex;
+    bool ed = editingSettings;
+    int  vals[4] = { (int)(SWEEP_TIME_MS / 100), sampleIndex, sweepType, sweepProfile };
+
+    bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit);
+    for (int i = 0; i < 4 && !changed; i++) changed = (vals[i] != lastVals[i]);
+    if (!changed) return;
+
+    if (lastIdx == -1) {
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextWrap(false);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setTextSize(3);
+        tft.setCursor(6, 4);
+        tft.print("SWEEP SETTINGS");
+    }
+
+    for (int i = 0; i < SETTINGS_COUNT; i++)
+        drawSettingsRow(i, SETTINGS_ROW_Y0 + i * SETTINGS_ROW_DY, i == si, i == si && ed);
+
+    lastIdx = si; lastEdit = ed;
+    for (int i = 0; i < 4; i++) lastVals[i] = vals[i];
+}
+
+void drawSetupRow(int i, int y, bool selected, bool editing) {
+    const char* labels[] = {
+        "Park   ", "Centre ", "Parkspd", "Arm    ", "Gear in", "Gearout", "Cycles ",
+        "Accel  ", "Jerk   ", "Backlsh", "Current", "RunHold", "PrkHold",
+        "Chop   ", "Mstep  ", "Interp ", "Invert ", "Debug  ", "Stall  ", "StallSG"
+    };
+    uint16_t bg = editing  ? tft.color565(0, 140, 0) :
+                  selected ? TFT_BLUE : TFT_BLACK;
+    tft.fillRect(0, y - 2, CONTENT_W, 30, bg);
+    tft.setTextColor(TFT_WHITE, bg);
+    tft.setTextSize(3);
+    tft.setCursor(6, y);
+    tft.print(labels[i]);
+    tft.print(": ");
+    switch (i) {
+        case 0:  printDegX10(PARK_DEG_X10);   tft.print(" deg"); break;
+        case 1:  printDegX10(CENTER_DEG_X10); tft.print(" deg"); break;
+        case 2:  tft.print(parkingSpeedDegS); tft.print(" d/s"); break;
+        case 3:  tft.print(ARM_LENGTH_MM);    tft.print(" mm");  break;
+        case 4:  tft.print(gearTeethMotor);   tft.print(" t");   break;
+        case 5:  tft.print(gearTeethOutput);  tft.print(" t");   break;
+        case 6:
+            if (OSCILLATION_CYCLES == 0) tft.print("inf");
+            else tft.print(OSCILLATION_CYCLES);
+            break;
+        case 7:  tft.print((int)(motionAccelDegS2 + 0.5)); break;   // deg/s^2
+        case 8:  tft.print((int)(motionJerkDegS3 + 0.5));  break;   // deg/s^3
+        case 9:  tft.print(backlashMicrosteps); tft.print(" us"); break;
+        case 10: tft.print(driverCurrent);      tft.print(" mA"); break;
+        case 11: tft.print(driverRunHoldPct);   tft.print(" %");  break;
+        case 12: tft.print(driverParkHoldPct);  tft.print(" %");  break;
+        case 13: tft.print(driverStealthChop ? "Stealth" : "Spread"); break;
+        case 14: tft.print(driverMicrosteps); tft.print("x"); break;
+        case 15: tft.print(driverInterpolation ? "ON" : "OFF"); break;
+        case 16: tft.print(motorDirectionInverted ? "ON" : "OFF"); break;
+        case 17: tft.print(SENSOR_INPUTS_ENABLED ? "OFF" : "ON");   break;
+        case 18: tft.print(stallParkEnabled ? "ON" : "OFF"); break;
+        case 19: tft.print(stallThreshold); break;
+    }
+}
+
+void drawSetup() {
+    // Vertical scroll: a sliding window of SETUP_VISIBLE rows tracks the selected row.
+    // Yellow ▲/▼ marks more above/below. The scroll offset is exported through
+    // setupFirstVisible so the touch → row mapping stays in sync.
+    static int  lastIdx   = -1;
+    static bool lastEdit  = false;
+    static int  lastFirst = -1;
+    static int  lastVals[SETUP_COUNT] = {};
+
+    if (setupNeedsRedraw) { setupNeedsRedraw = false; lastIdx = -1; }
+
+    int  si = setupIndex;
+    bool ed = editingSetup;
+
+    // Keep the selected row inside the visible window.
+    int first = setupFirstVisible;
+    if (si < first)                  first = si;
+    if (si >= first + SETUP_VISIBLE) first = si - SETUP_VISIBLE + 1;
+    first = constrain(first, 0, SETUP_COUNT - SETUP_VISIBLE);
+    setupFirstVisible = first;
+
+    int vals[SETUP_COUNT] = {
+        PARK_DEG_X10, CENTER_DEG_X10, parkingSpeedDegS, ARM_LENGTH_MM,
+        gearTeethMotor, gearTeethOutput, (int)OSCILLATION_CYCLES,
+        (int)(motionAccelDegS2 + 0.5), (int)(motionJerkDegS3 + 0.5),
+        backlashMicrosteps, driverCurrent, driverRunHoldPct, driverParkHoldPct,
+        driverStealthChop ? 1 : 0, driverMicrosteps, driverInterpolation ? 1 : 0,
+        motorDirectionInverted ? 1 : 0, SENSOR_INPUTS_ENABLED ? 1 : 0,
+        stallParkEnabled ? 1 : 0, stallThreshold
+    };
+
+    bool changed = (lastIdx == -1) || (si != lastIdx) || (ed != lastEdit) || (first != lastFirst);
+    for (int i = 0; i < SETUP_COUNT && !changed; i++) changed = (vals[i] != lastVals[i]);
+    if (!changed) return;
+
+    bool fullRedraw = (lastIdx == -1) || (first != lastFirst);
+    if (fullRedraw) {
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextWrap(false);
+    }
+
+    // Header: title + live "row/total" counter (repainted each change so it stays correct).
+    tft.fillRect(0, 0, CONTENT_W, 32, TFT_BLACK);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setTextSize(3);
+    tft.setCursor(6, 4);
+    tft.print("SETUP");
+    char pos[12];
+    snprintf(pos, sizeof(pos), "%d/%d", si + 1, SETUP_COUNT);
+    tft.setCursor(CONTENT_W - (int)strlen(pos) * 18 - 6, 4);
+    tft.print(pos);
+
+    for (int r = 0; r < SETUP_VISIBLE; r++) {
+        int i = first + r;
+        if (i >= SETUP_COUNT) break;
+        drawSetupRow(i, SETUP_ROW_Y0 + r * SETUP_ROW_DY, i == si, i == si && ed);
+    }
+
+    // Scroll arrows at the right edge.
+    int xa   = CONTENT_W - 16;
+    int yTop = SETUP_ROW_Y0;
+    int yBot = SETUP_ROW_Y0 + (SETUP_VISIBLE - 1) * SETUP_ROW_DY + 6;
+    if (first > 0)
+        tft.fillTriangle(xa, yTop, xa - 9, yTop + 12, xa + 9, yTop + 12, TFT_YELLOW);
+    if (first + SETUP_VISIBLE < SETUP_COUNT)
+        tft.fillTriangle(xa, yBot + 12, xa - 9, yBot, xa + 9, yBot, TFT_YELLOW);
+
+    lastIdx = si; lastEdit = ed; lastFirst = first;
+    for (int i = 0; i < SETUP_COUNT; i++) lastVals[i] = vals[i];
+}
+
+// ============= ABOUT SCREEN =============
+void drawAbout() {
+    static bool     titleDrawn = false;
+    static uint32_t lastDrvSt  = 0xFFFFFFFF;
+    static uint32_t lastGStat  = 0xFFFFFFFF;
+
+    if (aboutNeedsRedraw) {
+        aboutNeedsRedraw = false;
+        titleDrawn = false;
+        lastDrvSt  = 0xFFFFFFFF;
+        lastGStat  = 0xFFFFFFFF;
+    }
+
+    if (!titleDrawn) {
+        titleDrawn = true;
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextWrap(false);
+        tft.setTextColor(TFT_CYAN,  TFT_BLACK);
+        tft.setTextSize(3);
+        tft.setCursor(8, 4);    tft.print("MEGASONIC v1.2");
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setCursor(8, 36);   tft.print("RP2040 earlephilhower");
+        tft.setCursor(8, 62);   tft.print("ST7796S 480x320 touch");
+        tft.setCursor(8, 88);   tft.print("Authors: LK & AG");
+        tft.setTextColor(TFT_CYAN,  TFT_BLACK);
+        tft.setCursor(8, 118);  tft.print("Driver Status:");
+        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setCursor(8, 290);  tft.print("Press to return");
+    }
+
+    uint32_t ds = driverDrvStatus, gs = driverGStat;
+    if (ds == lastDrvSt && gs == lastGStat) return;
+    lastDrvSt = ds; lastGStat = gs;
+
+    bool     stst   = (ds >> 31) & 1;
+    bool     ot     = (ds >> 25) & 1;
+    bool     otpw   = (ds >> 26) & 1;
+    bool     drverr = (gs >> 1)  & 1;
+    uint8_t  cs     = (ds >> 16) & 0x1F;
+    uint16_t sg     = ds & 0x3FF;
+
+    tft.setTextSize(3);
+
+    tft.setCursor(8, 150);
+    tft.setTextColor(ot   ? TFT_RED    : TFT_WHITE, TFT_BLACK);
+    tft.print("OT:");   tft.print(ot   ? "YES " : "NO  ");
+    tft.setTextColor(otpw ? TFT_YELLOW : TFT_WHITE, TFT_BLACK);
+    tft.print("OTPW:"); tft.print(otpw ? "YES " : "NO  ");
+
+    tft.setCursor(8, 180);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.print("CS:"); tft.print(cs); tft.print("  ");
+    tft.print("SG:"); tft.print(sg); tft.print("  ");
+
+    tft.setCursor(8, 210);
+    tft.print("STST:"); tft.print(stst ? "YES " : "NO  ");
+    tft.setTextColor(drverr ? TFT_RED : TFT_WHITE, TFT_BLACK);
+    tft.print("ERR:"); tft.print(drverr ? "YES" : "NO ");
+}
+#endif  // LCD_ST7796
 
 // ============= UPDATE DISPLAY (Core 1) =============
 void updateDisplay() {
