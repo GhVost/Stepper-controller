@@ -15,7 +15,7 @@
   .lcd .cap { font-size:12.5px; color:#8b93a3; }
   .bezel { padding:14px; background:#0a0b0e; border-radius:12px;
            box-shadow:0 0 0 2px #2b2f3a, 0 8px 24px rgba(0,0,0,.55); }
-  canvas { display:block; width:460px; height:auto; border-radius:4px; }
+  canvas { display:block; width:440px; height:auto; border-radius:4px; }
   .controls { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; max-width:980px; }
   button { background:var(--panel); color:#cdd3df; border:1px solid #333a47;
            padding:8px 14px; border-radius:8px; font-size:13px; cursor:pointer; }
@@ -26,16 +26,22 @@
   input[type=range] { width:240px; }
   code { background:#23262e; padding:1px 6px; border-radius:4px; color:#d8dee9; }
   label.feat { display:inline-flex; gap:6px; align-items:center; font-size:13px; color:#cdd3df; }
+  .swatches { display:flex; flex-wrap:wrap; gap:10px; justify-content:center; max-width:940px; }
+  .sw { display:flex; align-items:center; gap:6px; font-size:12px; color:#8b93a3; }
+  .sw i { width:16px; height:16px; border-radius:3px; display:inline-block;
+          box-shadow:inset 0 0 0 1px rgba(0,0,0,.35); }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1><span>MEGASONIC CLEANER</span> &mdash; LCD GUI preview (320&times;172, ST7789)</h1>
+  <h1><span>MEGASONIC CLEANER</span> &mdash; LCD GUI preview (480&times;320, ST7796S + touch)</h1>
 
   <div class="screens">
+    <div class="lcd"><div class="cap">MAIN MENU — icons, arm animation, live status bar</div>
+      <div class="bezel"><canvas id="lcdMenu"></canvas></div></div>
     <div class="lcd"><div class="cap">SWEEP SETTINGS — change a value, watch the arm react</div>
       <div class="bezel"><canvas id="lcdS"></canvas></div></div>
-    <div class="lcd"><div class="cap">SETUP — hidden hardware menu, scrolls vertically (16 rows)</div>
+    <div class="lcd"><div class="cap">SETUP — hidden hardware menu, scrolls vertically (20 rows)</div>
       <div class="bezel"><canvas id="lcdSetup"></canvas></div></div>
   </div>
 
@@ -48,6 +54,8 @@
   <div class="controls">
     <button id="bAuto" class="on">▶ Auto tour</button>
     <button id="bRun">Start / Stop</button>
+    <button id="bSpray">Spray on/off</button>
+    <button id="bDebug" class="on">Debug mode</button>
   </div>
 
   <div class="controls" id="features">
@@ -66,45 +74,61 @@
     <span id="angleLbl" style="font-size:12.5px;width:54px">7.0&deg;</span>
   </div>
 
+  <div class="swatches" id="swatches"></div>
+
   <div class="hint">
-    The panel renders pixel-for-pixel from the firmware draw code: the <b>SWEEP SETTINGS</b>
-    screen with the arm animation underneath and the live status bar on the right. Editing a
-    value shows the effect immediately — wafer circle size (sized to the 150&nbsp;mm max and
-    cropped top/bottom), sweep extent (Edge↔(•) vs Edge↔Edge), the park tick, and the red arm
-    arrow. The arm speed follows the <b>cycle time</b> and <b>speed profile</b>; the generator
-    runs <b>only over the wafer</b>, where a pulsing ⚡ appears next to the arrow. Use
-    <b>Tour shows</b> to pick the demonstrated features and <b>Play speed</b> to scale the tour;
-    each value runs for a few full oscillations and only changes when the arm is at the wafer
-    edge. To record a GIF, capture the panel
-    (Windows <code>Win+Alt+R</code> or ScreenToGif). The second panel shows the hidden hardware
-    <b>SETUP</b> menu — now 20 rows that scroll vertically with a sliding 6-row window, a
-    <code>row/total</code> counter and ▲/▼ markers. Drag <b>Setup row</b> to scroll: it includes
-    the new <b>gear ratio</b> (Gear in / Gear out, default 15:108), <b>Parkspd</b> (arm
-    positioning speed in deg/s for homing/park/staging), <b>Accel</b>/<b>Jerk</b>,
-    <b>Backlash</b> take-up (µsteps), the driver <b>RunHold</b>/<b>PrkHold</b> %,
-    <b>Chop</b> (StealthChop/SpreadCycle) and <b>Interp</b> (microstep interpolation), and
-    <b>Stall</b>/<b>StallSG</b> (StallGuard collision detection → park + red COLLISION on a
-    blocked arm). The <i>About</i> screen is omitted.
+    The panels render from the firmware draw code at the ST7796S geometry: the
+    <b>main menu</b>, the <b>SWEEP SETTINGS</b> screen, and the hidden hardware <b>SETUP</b>
+    list, each with the arm animation and the live status bar. Colours are quantised to
+    <b>RGB565</b>, so what you see is what the panel shows.
+    <br><br>
+    The palette is chosen for the <b>yellow non-actinic safelight</b> the cleaner runs
+    under. There the eye is adapted to ~580&nbsp;nm and blue/cyan collapse toward black, so
+    nothing encodes meaning in blue and every pair that must be told apart differs in
+    <i>luminance</i> as well as hue. Amber marks headings, plum marks the changeable half of
+    a settings row, red is the arm and alarms, olive is ON/park.
+    <br><br>
+    Editing a value shows the effect immediately — wafer circle size (sized to the
+    150&nbsp;mm max and cropped top/bottom), sweep extent (Edge&lt;&gt;Ctr vs
+    Edge&lt;&gt;Edge), the park tick and the red arm arrow. The arm speed follows the
+    <b>cycle time</b> and <b>speed profile</b>; the generator runs <b>only over the
+    wafer</b>, where a pulsing ⚡ appears next to the arrow. <b>Spray on/off</b> starts the
+    mist at the arrow tip and the <b>TIMER</b> in the status bar; <b>Debug mode</b> switches
+    the title between <code>Status Debug</code> and <code>Status Work</code> and the sensor
+    rows between <code>DIS</code> and live values. Drag <b>Setup row</b> to scroll the
+    20-row list through its 7-row window. To record a GIF, capture a panel
+    (Windows <code>Win+Alt+R</code> or ScreenToGif). The <i>About</i> screen is omitted.
   </div>
 </div>
 
 <script>
-// ===================== device geometry / palette =====================
-const W = 320, H = 172, SS = 2;
-const cS = document.getElementById('lcdS');
-cS.width = W*SS; cS.height = H*SS;
+// ===================== device geometry =====================
+const W = 480, H = 320, SS = 2;
+const cMenu  = document.getElementById('lcdMenu');
+const cS     = document.getElementById('lcdS');
 const cSetup = document.getElementById('lcdSetup');
-cSetup.width = W*SS; cSetup.height = H*SS;
+[cMenu,cS,cSetup].forEach(c=>{ c.width=W*SS; c.height=H*SS; });
 let ctx = cS.getContext('2d');
 function use(c){ ctx = c.getContext('2d'); }
 
+// ---- palette, quantised to RGB565 exactly as the panel stores it ----
+function q565(r,g,b){ return `rgb(${r&0xF8},${g&0xFC},${b&0xF8})`; }
 const C = {
-  black:'#000000', white:'#FFFFFF', blue:'#0000FF', cyan:'#00FFFF',
-  red:'#FF0000', green:'#00FF00', yellow:'#FFFF00', magenta:'#FF00FF',
-  wave:'#00C8FF', editgreen:'#008C00', grey70:'#464646', grey60:'#3C3C3C'
+  bg:     q565(232,228,218),   // UI_BG     page ground, warm light grey
+  panel:  q565(250,248,242),   // UI_PANEL  status column, lifted off the page
+  text:   q565( 26, 24, 20),   // UI_TEXT   primary, near-black
+  muted:  q565(102, 96, 86),   // UI_MUTED  labels, units
+  line:   q565(158,152,140),   // UI_LINE   rules, wafer outline
+  accent: q565(176, 88,  0),   // UI_ACCENT headings, icons, generator mark
+  value:  q565(120, 40, 96),   // UI_VALUE  changeable half of a settings row
+  sel:    q565(255,214,145),   // UI_SEL    selected row fill
+  edit:   q565(245,158, 25),   // UI_EDIT   row being edited
+  alarm:  q565(186, 28, 20),   // UI_ALARM  errors, OFF, the arm arrow
+  ok:     q565( 54,110, 30),   // UI_OK     ON / flowing / park tick
+  mist:   q565(108,132,152),   // UI_MIST   spray droplets
 };
 
-// ---- primitives mirroring Adafruit_GFX (logical px, supersampled) ----
+// ---- primitives mirroring the TFT_eSPI calls (logical px, supersampled) ----
 function rect(x,y,w,h,c){ ctx.fillStyle=c; ctx.fillRect(x*SS,y*SS,w*SS,h*SS); }
 function hline(x,y,w,c){ rect(x,y,w,1,c); }
 function vline(x,y,h,c){ rect(x,y,1,h,c); }
@@ -118,24 +142,39 @@ function fillTri(x0,y0,x1,y1,x2,y2,c){
   ctx.fillStyle=c; ctx.beginPath();
   ctx.moveTo(x0*SS,y0*SS); ctx.lineTo(x1*SS,y1*SS); ctx.lineTo(x2*SS,y2*SS); ctx.closePath(); ctx.fill();
 }
-function text(x,y,str,size,c){
-  ctx.fillStyle=c; ctx.textBaseline='top';
-  ctx.font = 'bold ' + (7*size*SS) + 'px "Consolas","Courier New",monospace';
-  for(let i=0;i<str.length;i++) ctx.fillText(str[i], (x+i*6*size)*SS, y*SS);
+
+// ---- FreeSansBold, drawn the way drawString()/TL_DATUM places it ----
+// The free fonts sit on the baseline, and TFT_eSPI's top-left datum offsets by the cap
+// height; Arial Bold's cap is ~0.716 em, so the same correction reproduces the layout.
+const F9 = 18, F12 = 24, F18 = 35;      // px sizes matching 9/12/18 pt cap heights
+let curFont = F9;
+function useFont(px){ curFont=px; ctx.font='bold '+(px*SS)+'px Arial,Helvetica,sans-serif';
+                      ctx.textBaseline='alphabetic'; }
+function strW(s){ return ctx.measureText(s).width/SS; }
+// datum 'TL' = x is the left edge, 'TR' = x is the right edge. Returns the width drawn.
+function drawStr(s,x,y,c,datum){
+  ctx.fillStyle=c;
+  const w = strW(s);
+  const px = (datum==='TR') ? x-w : x;
+  ctx.fillText(s, px*SS, (y+curFont*0.716)*SS);
+  return w;
 }
 function clipRegion(){ ctx.beginPath(); ctx.rect(ANIM_X*SS, ANIM_Y*SS, ANIM_W*SS, ANIM_H*SS); ctx.clip(); }
 
 // ===================== firmware constants & helpers =====================
-const STATUS_X=244, STATUS_W=76, CONTENT_W=242;
-const ANIM_X=4, ANIM_W=236, ANIM_H=57, ANIM_Y=172-ANIM_H;   // anim flush to bottom (115..172)
+const STATUS_X=352, STATUS_W=128, CONTENT_W=350;
+const ANIM_X=4, ANIM_W=STATUS_X-8, ANIM_H=100, ANIM_Y=H-ANIM_H;      // 220..320
+const MENU_ROW_Y0=36, MENU_ROW_DY=56;
+const SETTINGS_ROW_Y0=40, SETTINGS_ROW_DY=34;
+const SETUP_ROW_Y0=40, SETUP_ROW_DY=38, SETUP_VISIBLE=7;
 const SAMPLE=[10,20,50,75,100,150];
-const SENSORS=false;                  // SENSOR_INPUTS_ENABLED default (Setup is hidden)
 
 const S = {
-  running:false, state:'IDLE', hold:true, angleX10:70,
+  running:false, state:'IDLE', angleX10:70,
   park:70, center:260, arm:250, sampleIndex:4,
   sweepTimeMs:4000, sweepType:1, profile:0,
-  settingsIndex:2, editing:false
+  settingsIndex:2, editing:false,
+  menuIndex:0, sensors:false, spray:false, sprayMs:0
 };
 const waferMm = () => SAMPLE[S.sampleIndex];
 function calcSweepX10(){
@@ -146,87 +185,155 @@ function travelSweepX10(){ const f=calcSweepX10(); return S.sweepType===0 ? Math
 function degStr(d){ return (d/10|0)+'.'+Math.abs(d%10); }
 function armOverWafer(){ return Math.abs(S.angleX10 - S.center) <= calcSweepX10()/2; }
 function genOn(){ return S.running && armOverWafer(); }
+// Matches sweepTypeLabelAscii(): the free fonts carry no CP437 arrow glyph.
+function sweepTypeLabel(){ return S.sweepType===0 ? "Edge<>Ctr" : "Edge<>Edge"; }
+function profileLabel(){ return S.profile===0?"Sawtooth":S.profile===1?"Sine":"Reciprocal"; }
+function mmss(ms){ const s=ms/1000|0; return (s/60|0)+':'+String(s%60).padStart(2,'0'); }
 
-// ===================== screen renderers =====================
+// ===================== arm animation =====================
 function armAnim(){
-  const axisY=ANIM_Y+ANIM_H/2, headH=7, tipY=axisY, yTopArm=ANIM_Y;
+  const axisY=ANIM_Y+ANIM_H/2, headH=12, tipY=axisY, yTopArm=ANIM_Y;
   const toRad=Math.PI/180, cDeg=S.center/10, pDeg=S.park/10;
   const wR=waferMm()/2, wRmax=SAMPLE[SAMPLE.length-1]/2;
   const parkOff=S.arm*Math.sin((pDeg-cDeg)*toRad);
   const lo=Math.min(parkOff,-wRmax), hi=Math.max(parkOff,wRmax), span=Math.max(hi-lo,1);
-  const scale=(ANIM_W-16)/span;
+  const scale=(ANIM_W-24)/span;
   const drawnW=Math.round(span*scale), startX=ANIM_X+Math.floor((ANIM_W-drawnW)/2);
   const rPx=Math.round(wR*scale), waferCx=startX+Math.round((0-lo)*scale), parkX=startX+Math.round((parkOff-lo)*scale);
-  const axL=Math.max(ANIM_X, Math.min(parkX,waferCx-rPx)-4), axR=Math.min(STATUS_X-2, waferCx+rPx+4);
+  const axL=Math.max(ANIM_X, Math.min(parkX,waferCx-rPx)-6), axR=Math.min(STATUS_X-2, waferCx+rPx+6);
 
-  rect(ANIM_X,ANIM_Y-2,ANIM_W,ANIM_H+2,C.black);
-  hline(ANIM_X,ANIM_Y-4,ANIM_W,C.grey60);
-  hline(axL,axisY,axR-axL,C.grey60);
-  ctx.save(); clipRegion(); drawCircle(waferCx,axisY,rPx,C.cyan); ctx.restore();
-  fillCircle(waferCx,axisY,2,C.cyan);
-  vline(parkX,axisY-6,13,C.green); text(parkX-2,axisY+10,"P",1,C.green);
+  rect(ANIM_X,ANIM_Y-2,ANIM_W,ANIM_H+2,C.bg);
+  hline(ANIM_X,ANIM_Y-4,ANIM_W,C.line);
+  hline(axL,axisY,axR-axL,C.line);
+  ctx.save(); clipRegion(); drawCircle(waferCx,axisY,rPx,C.line); ctx.restore();
+  fillCircle(waferCx,axisY,3,C.line);
+  vline(parkX,axisY-10,21,C.ok);
+  useFont(F9); drawStr("P",parkX-5,axisY+14,C.ok,'TL');
 
   const armOff=S.arm*Math.sin((S.angleX10/10-cDeg)*toRad);
   let armX=startX+Math.round((armOff-lo)*scale);
   armX=Math.max(startX,Math.min(startX+drawnW,armX));
   ctx.save(); clipRegion();
-  rect(armX-1,yTopArm,2,(tipY-headH)-yTopArm,C.red);
-  fillTri(armX-4,tipY-headH, armX+4,tipY-headH, armX,tipY, C.red);
-  // pulsing lightning while generator energised (only over the wafer)
+  rect(armX-1,yTopArm,3,(tipY-headH)-yTopArm,C.alarm);
+  fillTri(armX-7,tipY-headH, armX+7,tipY-headH, armX,tipY, C.alarm);
+  // Pulsing bolt while the generator is energised. Amber, not yellow: yellow on a
+  // near-white ground has almost no luminance contrast, and none under the safelight.
   if(genOn() && ((vt/250|0)&1)){
-    const bx=armX+5, by=yTopArm+1;
-    line(bx+3,by, bx,by+5, C.yellow); line(bx,by+5, bx+4,by+5, C.yellow);
-    line(bx+4,by+5, bx+1,by+11, C.yellow); line(bx+2,by, bx-1,by+5, C.yellow);
+    const bx=armX+9, by=yTopArm+2;
+    line(bx+5,by, bx,by+8, C.accent);  line(bx,by+8, bx+6,by+8, C.accent);
+    line(bx+6,by+8, bx+1,by+17, C.accent); line(bx+4,by, bx-1,by+8, C.accent);
+  }
+  // Spray mist: three drops falling from the tip, each one cycle behind the last.
+  if(S.spray){
+    const phase=(vt/150|0)%3, dx=[-6,0,7], dy0=[2,5,3];
+    for(let i=0;i<3;i++) fillCircle(armX+dx[i], tipY+dy0[i]+((phase+i)%3)*4, 2, C.mist);
   }
   ctx.restore();
 }
+
+// ===================== status column =====================
+// Four groups on one rhythm: 12 rows at a 20px pitch, 42px between groups.
 function statusColumn(){
-  const x=STATUS_X+6;
-  rect(STATUS_X,0,STATUS_W,H,C.black); vline(STATUS_X,0,H,C.grey70);
-  text(x,4,"STATUS",1,C.cyan);
-  if(!SENSORS) text(x,14,"DEBUG ON",1,C.magenta);
-  // live state + arm angle
-  text(x,24,"STATE",1,C.white); text(x,34,S.state,2,C.yellow);
-  text(x,54,"ANGLE",1,C.white);
-  const ang=String(Math.round(S.angleX10/10));   // whole degrees
-  text(x,64,ang,2,C.yellow); text(x+ang.length*12,64," deg",1,C.yellow);
-  // sweep config summary
-  text(x,86,"SWEEP",1,C.cyan);
-  text(x,96,degStr(travelSweepX10())+"deg",1,C.yellow);
-  text(x,106,(S.sweepTimeMs/1000).toFixed(1)+"s",1,C.white);
-  text(x,116,waferMm()+"mm",1,C.white);
-  text(x,126,(S.sweepType===0?"Edge↔(•)":"Edge↔Edge"),1,C.white);
-  text(x,136,(S.profile===0?"Sawtooth":S.profile===1?"Sine":"Reciprocal"),1,C.white);
-  // sensors
-  text(x,148,"SPRAY",1,C.white); text(x+38,148,SENSORS?"OFF":"DIS",1,SENSORS?C.red:C.magenta);
-  text(x,158,"FLOW",1,C.white);  text(x+38,158,SENSORS?"NO":"DIS",1,SENSORS?C.red:C.magenta);
+  const x=STATUS_X+6, valueW=STATUS_W-6, xr=x+valueW-2;
+  rect(STATUS_X,0,STATUS_W,H,C.panel); vline(STATUS_X,0,H,C.line);
+  useFont(F9);
+
+  // Mode group: title doubles as the Work/Debug readout, then the spray timer.
+  let tx = x + drawStr("Status ",x,6,C.accent,'TL');
+  drawStr(S.sensors?"Work":"Debug", tx,6, S.sensors?C.ok:C.alarm, 'TL');
+  drawStr("TIMER",x,26,C.muted,'TL');
+  drawStr(mmss(S.sprayMs),xr,26, S.spray?C.ok:C.muted, 'TR');
+
+  // Live group.
+  drawStr("STATE",x,68,C.muted,'TL');
+  drawStr(S.state,xr,68,C.text,'TR');
+  drawStr("ANGLE",x,88,C.muted,'TL');
+  drawStr(Math.round(S.angleX10/10)+" deg",xr,88,C.text,'TR');
+
+  // Sweep summary group.
+  drawStr("SWEEP",x,130,C.accent,'TL');
+  drawStr(degStr(travelSweepX10())+" deg",x,150,C.text,'TL');
+  drawStr((S.sweepTimeMs/1000).toFixed(0)+" s",x,170,C.text,'TL');
+  drawStr(waferMm()+" mm",x,190,C.text,'TL');
+  drawStr(sweepTypeLabel(),x,210,C.text,'TL');
+  drawStr(profileLabel(),x,230,C.text,'TL');
+
+  // Sensor group.
+  drawStr("SPRAY",x,272,C.muted,'TL');
+  drawStr("FLOW", x,292,C.muted,'TL');
+  if(S.sensors){
+    drawStr(S.spray?"ON":"OFF", xr,272, S.spray?C.ok:C.alarm,'TR');
+    drawStr(S.spray?"YES":"NO", xr,292, S.spray?C.ok:C.alarm,'TR');
+  } else {
+    drawStr("DIS",xr,272,C.accent,'TR');
+    drawStr("DIS",xr,292,C.accent,'TR');
+  }
 }
-function settingsRow(i,y,sel,edit){
-  const labels=["Sweep time","Wafer diam.","Sweep type","Speed prof."];
-  const bg=edit?C.editgreen:(sel?C.blue:C.black);
-  rect(0,y-2,CONTENT_W,16,bg);
-  const lab=labels[i]+":";
-  text(2,y,lab,2,C.white);
-  let val;
-  if(i===0) val=(S.sweepTimeMs/1000).toFixed(1)+" s.";
-  else if(i===1) val=waferMm()+" mm";
-  else if(i===2) val=(S.sweepType===0?"Edge↔(•)":"Edge↔Edge");
-  else val=(S.profile===0?"Sawtooth":S.profile===1?"Sine":"Reciprocal");
-  text(2+lab.length*12,y,val,2,C.yellow);   // highlight the changeable value
+
+// ===================== main menu =====================
+function drawIcon(id,x,y,color,holeBg){
+  if(id===0){ fillTri(x,y+2, x,y+34, x+28,y+18, color); }
+  else if(id===1){
+    rect(x,y+4,32,4,color); rect(x,y+16,32,4,color); rect(x,y+28,32,4,color);
+    fillCircle(x+8,y+6,6,color); fillCircle(x+24,y+18,6,color); fillCircle(x+16,y+30,6,color);
+  } else if(id===2){
+    fillCircle(x+16,y+16,14,color);
+    rect(x+10,y,12,8,color); rect(x+10,y+26,12,10,color);
+    rect(x,y+10,8,12,color); rect(x+26,y+10,10,12,color);
+    fillCircle(x+16,y+16,6,holeBg);
+  } else {
+    drawCircle(x+16,y+16,16,color);
+    rect(x+12,y+6,8,6,color); rect(x+12,y+16,8,12,color);
+  }
 }
-function drawSettings(){
-  rect(0,0,W,H,C.black);
-  text(6,3,"SWEEP SETTINGS",2,C.cyan);
-  for(let i=0;i<4;i++)
-    settingsRow(i,26+i*22, i===S.settingsIndex, S.editing && i===S.settingsIndex);
+const MENU_ITEMS=["START/STOP","Settings","Setup","About"];
+function menuRow(i,y,sel){
+  const bg = sel ? C.sel : C.bg;
+  const icnc = sel ? C.text : C.accent;
+  rect(6,y-2,CONTENT_W-12,52,bg);
+  if(i===0 && S.state!=='IDLE') rect(14,y+8,28,28,icnc);
+  else drawIcon(i,10,y+4,icnc,bg);
+  useFont(F18); drawStr(MENU_ITEMS[i],64,y+8,C.text,'TL');
+}
+function drawMenu(){
+  rect(0,0,W,H,C.bg);
+  // Ultrasonic wave logo: 3 zigzag bumps, drawn twice for an even stroke weight
+  for(let p=0;p<2;p++){
+    const o=p;
+    line(4,20+o, 8,8+o, C.accent);   line(8,8+o, 12,20+o, C.accent);
+    line(12,20+o, 16,8+o, C.accent); line(16,8+o, 20,20+o, C.accent);
+    line(20,20+o, 24,8+o, C.accent); line(24,8+o, 28,20+o, C.accent);
+  }
+  useFont(F12); drawStr("MEGASONIC CLEANER",36,2,C.accent,'TL');
+  for(let i=0;i<2;i++) menuRow(i, MENU_ROW_Y0+i*MENU_ROW_DY, i===S.menuIndex);
   armAnim();
   statusColumn();
 }
-function render(){ use(cS); drawSettings(); }
 
-// ---- SETUP screen (hidden hardware menu): 16 rows, vertical scroll window ----
-// Labels are padded to 7 chars and values are white (mirrors the firmware drawSetupRow).
-// Defaults match the firmware boot values, incl. the 15:108 gear ratio.
+// ===================== sweep settings =====================
+function settingsRow(i,y,sel,edit){
+  const labels=["Sweep time","Wafer diam.","Type","Profile"];
+  const bg = edit ? C.edit : (sel ? C.sel : C.bg);
+  rect(0,y-2,CONTENT_W,28,bg);
+  let val;
+  if(i===0) val=(S.sweepTimeMs/1000).toFixed(0)+" s";
+  else if(i===1) val=waferMm()+" mm";
+  else if(i===2) val=sweepTypeLabel();
+  else val=profileLabel();
+  useFont(F12);
+  const x = 4 + drawStr(labels[i]+": ",4,y,C.text,'TL');
+  drawStr(val,x,y, edit?C.text:C.value, 'TL');
+}
+function drawSettings(){
+  rect(0,0,W,H,C.bg);
+  useFont(F12); drawStr("SWEEP SETTINGS",6,4,C.accent,'TL');
+  for(let i=0;i<4;i++)
+    settingsRow(i, SETTINGS_ROW_Y0+i*SETTINGS_ROW_DY, i===S.settingsIndex, S.editing && i===S.settingsIndex);
+  armAnim();
+  statusColumn();
+}
+
+// ===================== setup (hidden hardware menu) =====================
 const SETUP_ROWS = [
   { label:"Park   ", val:"5.0 deg"   },
   { label:"Centre ", val:"70.0 deg"  },
@@ -249,34 +356,35 @@ const SETUP_ROWS = [
   { label:"Stall  ", val:"OFF"       },
   { label:"StallSG", val:"0"         },
 ];
-let setupSel = 3;
+let setupSel = 4;
 function setupRow(i,y,sel){
-  const bg = sel ? C.blue : C.black;
-  rect(0,y-2,CONTENT_W,20,bg);
-  const lab = SETUP_ROWS[i].label + ": ";
-  text(6,y,lab,2,C.white);
-  text(6+lab.length*12,y,SETUP_ROWS[i].val,2,C.white);
+  const bg = sel ? C.sel : C.bg;
+  rect(0,y-2,CONTENT_W,30,bg);
+  useFont(F12);
+  const x = 6 + drawStr(SETUP_ROWS[i].label+": ",6,y,C.text,'TL');
+  drawStr(SETUP_ROWS[i].val,x,y,C.value,'TL');
 }
 function drawSetupScreen(){
-  const VIS=6, Y0=26, DY=22, N=SETUP_ROWS.length;
-  rect(0,0,W,H,C.black);
-  let first=0, si=setupSel;
+  const N=SETUP_ROWS.length, si=setupSel;
+  rect(0,0,W,H,C.bg);
+  let first=0;
   if(si<first) first=si;
-  if(si>=first+VIS) first=si-VIS+1;
-  first=Math.max(0,Math.min(first,N-VIS));
-  text(6,3,"SETUP",2,C.cyan);
-  const pos=(si+1)+'/'+N;
-  text(CONTENT_W-pos.length*12-6,3,pos,2,C.cyan);
-  for(let r=0;r<VIS;r++){ const i=first+r; if(i>=N) break; setupRow(i,Y0+r*DY,i===si); }
-  const xa=CONTENT_W-12, yTop=Y0, yBot=Y0+(VIS-1)*DY+4;
-  if(first>0)       fillTri(xa,yTop, xa-6,yTop+8, xa+6,yTop+8, C.yellow);
-  if(first+VIS<N)   fillTri(xa,yBot+8, xa-6,yBot, xa+6,yBot, C.yellow);
+  if(si>=first+SETUP_VISIBLE) first=si-SETUP_VISIBLE+1;
+  first=Math.max(0,Math.min(first,N-SETUP_VISIBLE));
+  useFont(F12);
+  drawStr("SETUP",6,4,C.accent,'TL');
+  drawStr((si+1)+'/'+N, CONTENT_W-6, 4, C.accent, 'TR');
+  for(let r=0;r<SETUP_VISIBLE;r++){ const i=first+r; if(i>=N) break; setupRow(i,SETUP_ROW_Y0+r*SETUP_ROW_DY,i===si); }
+  const xa=CONTENT_W-16, yTop=SETUP_ROW_Y0, yBot=SETUP_ROW_Y0+(SETUP_VISIBLE-1)*SETUP_ROW_DY+6;
+  if(first>0)                      fillTri(xa,yTop, xa-9,yTop+12, xa+9,yTop+12, C.accent);
+  if(first+SETUP_VISIBLE<N)        fillTri(xa,yBot+12, xa-9,yBot, xa+9,yBot, C.accent);
 }
 function renderSetup(){ use(cSetup); drawSetupScreen(); }
+function render(){ use(cS); drawSettings(); use(cMenu); drawMenu(); }
 
 // ===================== auto tour (checkbox-driven feature segments) =====================
-// `vt` is a virtual clock advanced by (real dt × speed); the tour and the lightning
-// blink both run off it, so the Play-speed slider scales the whole demonstration.
+// `vt` is a virtual clock advanced by (real dt × speed); the tour, the bolt blink and the
+// mist all run off it, so the Play-speed slider scales the whole demonstration.
 let auto=true, speed=1, vt=0, armPhase=0, lastFrame=performance.now();
 function sweepBounds(){
   const cDeg=S.center/10, half=calcSweepX10()/20;
@@ -285,27 +393,22 @@ function sweepBounds(){
 // Position fraction (0..1) along one sweep leg for the selected speed profile.
 function profileEase(u){
   if(S.profile===1) return 0.5-0.5*Math.cos(Math.PI*u);            // sine: ease in/out at the turns
-  if(S.profile===2){ return u<0.5 ? 2*u*u : 1-2*(1-u)*(1-u); }        // reciprocal: fastest at the centre, eases to a stop at the edges
+  if(S.profile===2){ return u<0.5 ? 2*u*u : 1-2*(1-u)*(1-u); }     // reciprocal: fastest at the centre
   return u;                                                        // sawtooth: constant speed
 }
-// Arm angle from the continuous cycle phase (0..1): forward leg, then return leg. The full
-// back-forward-back cycle spans sweepTimeMs, so changing the time or profile changes the speed.
 function sweepAngleFromPhase(){
   const b=sweepBounds();
   let e = armPhase<0.5 ? profileEase(armPhase/0.5) : 1-profileEase((armPhase-0.5)/0.5);
   return Math.round((b.left+(b.fwd-b.left)*e)*10);
 }
-// Oscillation-driven tour: each value is demonstrated for OSC_PER_VALUE full
-// back-forward-back oscillations, and the value (or feature) only changes at a wrap point —
-// i.e. when the arm is back at the wafer edge (armPhase 0) — so there are no mid-sweep jumps.
 const OSC_PER_VALUE = 2;
 
 const FEATURES=[
   { key:'parking', label:'Parking',       row:5, sweeps:false, dur:3800, run:(fr)=>{
       const b=sweepBounds(), k=Math.min(1,fr/0.5);
       S.angleX10=Math.round((b.left+(S.park/10-b.left)*k)*10);
-      if(fr<0.5){ S.running=true; S.state='HOME'; S.hold=false; }
-      else      { S.running=false; S.state='PARK'; S.hold=true; } } },
+      if(fr<0.5){ S.running=true; S.state='HOME'; }
+      else      { S.running=false; S.state='PARK'; S.spray=false; } } },
   { key:'time',    label:'Sweep time',    row:0, sweeps:true, values:[2000,4000,6000], apply:v=>S.sweepTimeMs=v },
   { key:'wafer',   label:'Wafer size',    row:1, sweeps:true, values:[2,3,4,5],         apply:v=>S.sampleIndex=v },
   { key:'path',    label:'Sweep type',    row:2, sweeps:true, values:[1,0],             apply:v=>S.sweepType=v },
@@ -331,16 +434,15 @@ function buildTour(){
   fIdx=0; vt=0;
   if(tour.length) enterFeature();
 }
-
 function advanceTour(dtv){
   const f=curFeature();
   if(f.sweeps){
     armPhase += dtv/Math.max(S.sweepTimeMs,1);
     while(armPhase>=1){
-      armPhase-=1;                                 // one full oscillation completed, arm at the edge
+      armPhase-=1;                                 // one full oscillation, arm at the edge
       if(++oscCount>=OSC_PER_VALUE){
         oscCount=0;
-        if(++vIdx>=f.values.length){ nextFeature(); return; }  // advance feature, also at the edge
+        if(++vIdx>=f.values.length){ nextFeature(); return; }
       }
     }
   } else {
@@ -353,16 +455,19 @@ function applyTour(){
   S.settingsIndex=f.row; S.editing=(f.row<4);
   if(f.sweeps){
     f.apply(f.values[vIdx]);
-    S.running=true; S.state='SPRAY'; S.hold=false;
+    S.running=true; S.state='SPRAY'; S.spray=true;
     S.angleX10=sweepAngleFromPhase();
   } else {
     f.run(Math.min(1, parkClock/f.dur));
   }
 }
 
+// The timer accumulates only while spraying and holds its last value afterwards, the
+// same segment accounting updateSprayTimer() does on core 0.
 function tick(now){
   const dtv=(now-lastFrame)*speed; vt+=dtv; lastFrame=now;
   if(auto && tour.length){ advanceTour(dtv); applyTour(); syncSlider(); }
+  if(S.spray) S.sprayMs+=dtv;
   render();
   requestAnimationFrame(tick);
 }
@@ -371,7 +476,12 @@ function tick(now){
 function stopAuto(){ auto=false; document.getElementById('bAuto').classList.remove('on'); }
 document.getElementById('bAuto').onclick=(e)=>{ auto=!auto; e.target.classList.toggle('on',auto); if(auto) buildTour(); };
 document.getElementById('bRun').onclick=()=>{ stopAuto(); S.running=!S.running;
-  S.state=S.running?'SPRAY':'PARK'; S.hold=!S.running; };
+  S.state=S.running?'SPRAY':'PARK'; };
+document.getElementById('bSpray').onclick=(e)=>{ stopAuto(); S.spray=!S.spray;
+  if(S.spray) S.sprayMs=0; e.target.classList.toggle('on',S.spray); };
+document.getElementById('bDebug').onclick=(e)=>{ S.sensors=!S.sensors;
+  e.target.classList.toggle('on',!S.sensors); };
+
 const spd=document.getElementById('speed'), spdLbl=document.getElementById('speedLbl');
 spd.oninput=()=>{ speed=+spd.value; spdLbl.innerHTML=speed.toFixed(1)+'&times;'; };
 
@@ -385,6 +495,17 @@ setupSlider.oninput=()=>{
   setupSelLbl.textContent=(setupSel+1)+'/'+SETUP_ROWS.length+' — '+SETUP_ROWS[setupSel].label.trim();
   renderSetup();
 };
+
+// Palette legend, generated from the same table the panels draw from.
+const SW=[['Page',C.bg],['Panel',C.panel],['Text',C.text],['Muted',C.muted],['Line',C.line],
+          ['Accent',C.accent],['Value',C.value],['Selected',C.sel],['Editing',C.edit],
+          ['Alarm',C.alarm],['OK',C.ok],['Mist',C.mist]];
+const swBox=document.getElementById('swatches');
+SW.forEach(([n,c])=>{
+  const d=document.createElement('span'); d.className='sw';
+  d.innerHTML=`<i style="background:${c}"></i>${n}`;
+  swBox.appendChild(d);
+});
 
 const fbox=document.getElementById('features');
 FEATURES.forEach(f=>{
