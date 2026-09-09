@@ -186,7 +186,9 @@ firmware's polled quadrature decoder works without the capacitors, but is much
 
 **UI gestures:** rotate to navigate / edit, click to select. On the main menu a short
 click immediately followed by a long press (≥ 1000 ms, within 400 ms of the release)
-toggles the advanced menu (Setup / About).
+toggles the advanced menu (Setup / About); a plain long press on the START/PAUSE row is
+the full stop. The push-button is polled and debounced in software (25 ms settle), so the
+switch needs no RC network of its own.
 
 ---
 

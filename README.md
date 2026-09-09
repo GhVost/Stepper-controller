@@ -80,11 +80,21 @@ menu from the Sweep Settings / Setup screens (there is no "< Back" row). Item li
 (main menu, Sweep Settings, Setup) wrap around — rotating past the last row selects
 the first, and vice versa.
 
-- **Basic menu** (default): `START/STOP` and `Settings`. An arm-position animation under
+- **Basic menu** (default): `START/PAUSE` and `Settings`. An arm-position animation under
   the rows shows the wafer (circle), the park tick, the live arm position (red arrow), and
   a blinking lightning sign while the ultrasonic generator is energised.
 - **Advanced menu**: a short-click immediately followed by a long-press toggles the
-  advanced items (`Setup` and `About`) on/off.
+  advanced items (`Setup` and `About`) on/off. A badge in the header shows the state and
+  doubles as the touch control: `ADV` when the menu is locked (tap to show the advanced
+  items), `LOCK` while it is unlocked (tap to hide them again). The arm animation has no
+  room while the advanced items are shown, so the badge is also the way back to it.
+- **START / PAUSE / STOP**: a press on the first row starts a job (homes, parks, then
+  sweeps). A press while it runs **pauses**: the arm parks and holds there with its
+  position still known, and the spray timer freezes. The next press **resumes** the sweep
+  from park — no re-homing, and the timer carries on. **Holding** the first row (encoder
+  or touch, ≥ 1000 ms) is the full **stop**: park, disable the motor, back to `IDLE`. Only
+  a start out of `IDLE` zeroes the spray timer, so a job is finished with a hold, not with
+  a pause.
 - **Sweep Settings**: sweep time, wafer diameter, **sweep type**, and **speed profile** —
   each row shows `label:value` in a large font with the value highlighted, and the arm
   animation (about a third of the screen height) sits underneath. The calculated sweep angle
@@ -104,18 +114,21 @@ the first, and vice versa.
   (`Status Work` / `Status Debug`) and the spray **TIMER**; live `STATE` and `ANGLE`;
   the `SWEEP` summary (sweep angle, time, wafer, type, profile); and the `SPRAY` / `FLOW`
   sensor readouts.
-- **Spray timer**: total time the spray has been on for the current job. It accumulates
-  in segments, so an error part-way through a run and the operator's restart do **not**
-  discard the time already sprayed — only a run started from `IDLE` counts as a new job
-  and zeroes it. It runs in Debug mode too (driven by the cycle state, since the spray
-  sensor is bypassed there), and holds the last run's duration in grey once spraying stops.
+- **Spray timer**: total time the arm has actually been sweeping under flow for the current
+  job (the `SPRAY` and `OSC` states). An open spray valve on its own does not run it, so the
+  `WAIT` for flow is not counted. It accumulates in segments, so an error part-way through a
+  run, a pause, and the operator's restart do **not** discard the time already sprayed — only
+  a run started from `IDLE` counts as a new job and zeroes it. A pause freezes it even if the
+  spray valve is still open. It works the same in Debug mode, where the same cycle states run
+  with the sensors bypassed, and it holds the last run's duration in grey once spraying stops.
 
 ### Touch controls (ST7796 variant)
 
 | Gesture | Action |
 |---------|--------|
 | Tap a menu row | Select / activate it |
-| Tap the title | Toggle the advanced menu (`Setup`, `About`) — the encoder's click-then-hold combo has no touch equivalent |
+| Tap the title or the `ADV` / `LOCK` badge | Toggle the advanced menu (`Setup`, `About`) — the encoder's click-then-hold combo has no touch equivalent |
+| Hold the `START/PAUSE` row | Full stop: park, disable the motor, back to `IDLE` |
 | Tap a settings row | Select it; tap the selected row again to enter edit mode |
 | Tap left / right third of a row being edited | Step the value down / up; **hold to repeat** |
 | Tap the middle third of a row being edited | Confirm and leave edit mode |

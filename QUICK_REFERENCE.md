@@ -62,13 +62,19 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 ## On-Device UI
 
 - **Rotate** = navigate / change value, **Click** = select / edit / confirm.
-- **Long press** = back to the menu from Sweep Settings / Setup (no "< Back" row).
+- **Long press** = back to the menu from Sweep Settings / Setup (no "< Back" row); on the
+  main menu, holding `START/PAUSE` is the full stop (park, motor off, `IDLE`).
 - **Touch** (ST7796): tap a row to select, tap it again to edit; while editing the row
   splits into thirds — left = −, right = +, middle = confirm — and holding a ± zone
   repeats. Tap the ▲/▼ markers to page Setup, the header to go back, and the **title** to
   toggle the advanced menu (the encoder's click-then-hold combo has no touch equivalent).
-- **Basic menu**: START/STOP, Settings (+ arm-position animation).
-- **Advanced menu** (Setup, About): short-click then long-press to toggle.
+- **Basic menu**: START/PAUSE, Settings (+ arm-position animation).
+- **Advanced menu** (Setup, About): short-click then long-press to toggle, or tap the
+  header badge (`ADV` = locked, tap to show; `LOCK` = unlocked, tap to hide). The arm
+  animation is hidden while the advanced items are shown.
+- **START/PAUSE**: press = start, press while running = pause (parks, holds position,
+  freezes the spray timer), press again = resume without re-homing. Hold = full stop; only
+  a start out of `IDLE` zeroes the timer.
 - **Sweep Settings**: Sweep time, Wafer diam., Sweep type, Speed prof. — each row shows
   `label:value` (large font, value highlighted) with the arm animation (~1/3 screen)
   underneath. Speed profiles are Sawtooth / Sine / Reciprocal; the sweep angle is in the status bar.

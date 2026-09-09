@@ -189,7 +189,14 @@ explicitly. Startup prints `Touch FT6336 @0x38 found (SDA=16 SCL=17 INT=0)`.
 | Fan duty per state | Multimeter GPIO 21 | ☐ |
 | Ultrasonic LOW over wafer | Multimeter GPIO 4 | ☐ |
 | Oscillation reverses & counts | Serial `Sweep N/…` | ☐ |
-| STOP parks then idles | Menu STOP | ☐ |
+| TIMER still during WAIT | Open the spray valve with no flow: `STATE` reads `WAIT`, TIMER does not advance | ☐ |
+| PAUSE parks and holds | Menu press while sweeping: `STATE` reads `PAUSE`, arm stays at park, TIMER frozen | ☐ |
+| RESUME continues the job | Press again: sweeps without homing, TIMER continues, cycle count not restarted | ☐ |
+| Hold = full stop, then idles | Hold `START/PAUSE` ≥ 1 s (encoder or touch) | ☐ |
+| Encoder click works every press | 20 short clicks in a row on the menu, all register | ☐ |
+| One touch = one action | Tap `START/PAUSE` once: exactly one `Menu:` line on serial | ☐ |
+| FLOW alarm blinks | Spray on with no flow (sensor mode): FLOW value flashes red | ☐ |
+| Animation returns from Setup | Leave Setup, tap the `LOCK` badge: arm animation is back | ☐ |
 | Home timeout → ERROR | Block the limit switch | ☐ |
 | START recovers from ERROR | Menu START | ☐ |
 | TMC2130 status readable | About screen / `d` | ☐ |

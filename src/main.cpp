@@ -110,6 +110,13 @@ volatile bool homingTimeoutLatched = false;
 volatile bool needsHoming   = true;
 // Park the arm, then disable the motor and return to IDLE (normal stop / end of cycle).
 volatile bool stopRequested = false;
+// PAUSE: hold at park with the position still known, so the next press resumes the sweep
+// without re-homing and without restarting the spray timer. A full stop (hold START/PAUSE)
+// clears it and drops to IDLE, which is what resets the timer on the following start.
+volatile bool jobPaused = false;
+// Oscillation count carried across a pause so a resumed job continues its cycle budget
+// instead of counting from zero again.
+unsigned long pausedOscCount = 0;
 // A driver fault was detected: park the arm, then disable the motor and latch ERROR.
 volatile bool faultLatched  = false;
 // The fault was a StallGuard collision (arm blocked / stalled) — shown as red "COLLISION".
@@ -278,9 +285,6 @@ double        sweepTimingCompletedFactorSum = 0.0;
 double        sweepTimingBaseUs = 1.0;
 double        sweepVelocityPeakDegS = 1.0; // cruise peak speed for the active leg (deg/s), set by beginSweepLegTiming
 unsigned long lastEncoderRead = 0;
-volatile bool    encoderButtonEdgePending = false;
-volatile bool    encoderButtonRawState = HIGH;
-volatile unsigned long encoderButtonEdgeMillis = 0;
 
 // Buxton quadrature state table: rows are states, columns are pinState = (B<<1 | A).
 const uint8_t ENC_R_START   = 0x0;
@@ -315,9 +319,15 @@ const unsigned long SETUP_CENTER_UPDATE_INTERVAL_US = 50;
 const unsigned long SETUP_CENTER_FOLLOW_DELAY_MS = 150;
 const unsigned long MIN_SWEEP_STEP_INTERVAL_US = 100;
 const unsigned long ENCODER_STEP_MIN_INTERVAL = 5;
-const unsigned long ENCODER_BUTTON_DEBOUNCE = 120;
+// Settle time for the push-button level (not a lockout): the switch must read the
+// same level for this long before the press or release counts. readEncoder() samples
+// it every millisecond, so 25 ms swallows contact bounce without feeling sluggish.
+const unsigned long ENCODER_BUTTON_DEBOUNCE = 25;
 const uint8_t ENCODER_STABLE_SAMPLES = 1;
 const unsigned long SENSOR_DEBOUNCE = 50;
+// A contact must read empty for this long before the next report counts as a new tap.
+// The panel is polled every 30 ms, so this rides out ~4 dropped reports.
+const unsigned long TOUCH_RELEASE_MS = 120;
 
 // ============= DISPLAY / MENU =============
 #ifdef LCD_ST7796
@@ -386,7 +396,7 @@ const int ANIM_Y = 172 - ANIM_H;   // 115 — flush to the bottom edge
 #endif
 
 // Main menu — 4 items, no HOME
-const char* menuItems[] = { "START/STOP", "Settings", "Setup", "About" };
+const char* menuItems[] = { "START/PAUSE", "Settings", "Setup", "About" };
 const int   MENU_COUNT  = 4;
 const int   BASIC_MENU_COUNT = 2;
 const unsigned long LONG_PRESS_MS = 1000;  // hold time that counts as a "long" click
@@ -435,7 +445,6 @@ void initTouch();
 void handleTouch();
 #endif
 int8_t pollEncoderRotation();
-void encoderButtonIsr();
 void initTMC2130();
 void initDisplay();
 uint32_t settingsChecksum(const StoredSettings& settings);
@@ -484,6 +493,9 @@ void motorSetEnable(bool enable);
 void motorMoveTo(int target);
 void motorMoveToBlocking(int target, unsigned int stepDelayUs);
 void handleMenuSelect();
+void requestFullStop();
+bool flowAlarm();
+bool alarmPhase();
 void exitToMenu();
 void adjustSettingsValue(int delta);
 void adjustSetupValue(int delta);
@@ -637,10 +649,7 @@ void initEncoder() {
     pinMode(ENC_B,  INPUT_PULLUP);
     pinMode(ENC_SW, INPUT_PULLUP);
     encoderRotState = ENC_R_START;
-    encoderButtonRawState = digitalRead(ENC_SW);
-    encoderButtonEdgePending = false;
-    attachInterrupt(digitalPinToInterrupt(ENC_SW), encoderButtonIsr, CHANGE);
-    Serial.printf("Encoder initialized: CLK=%d DT=%d SW=%d (polled rotation, interrupt button)\n", ENC_A, ENC_B, ENC_SW);
+    Serial.printf("Encoder initialized: CLK=%d DT=%d SW=%d (polled rotation and button)\n", ENC_A, ENC_B, ENC_SW);
 }
 
 void initTMC2130() {
@@ -814,14 +823,31 @@ void handleTouch() {
     static bool          wasTouched   = false;
     static unsigned long contactStart = 0;
     static unsigned long lastRepeat   = 0;
+    static unsigned long lastSeen     = 0;
+    static bool          holdFired    = false;
     unsigned long now = millis();
     if (now - lastPoll < 30) return;
     lastPoll = now;
 
     int x, y;
-    if (!readTouchPoint(x, y)) { wasTouched = false; return; }
+    if (!readTouchPoint(x, y)) {
+        // The FT6236 drops the occasional report mid-contact (TD_STATUS momentarily 0).
+        // Re-arming on the first empty read turned one finger press into two taps, which
+        // on the main menu meant the second tap immediately undid the first.
+        if (wasTouched && now - lastSeen < TOUCH_RELEASE_MS) return;
+        wasTouched = false;
+        return;
+    }
+    lastSeen = now;
 
     if (wasTouched) {
+        // Holding the START/PAUSE row is the full stop; touch has no other long press.
+        if (!holdFired && displayMode == DISP_MENU && now - contactStart >= LONG_PRESS_MS &&
+            x < CONTENT_W && y >= MENU_ROW_Y0 - 2 && (y - (MENU_ROW_Y0 - 2)) / MENU_ROW_DY == 0) {
+            holdFired = true;
+            requestFullStop();
+            return;
+        }
         // Only the ± edit zones repeat; every other target stays initial-contact only so
         // a resting finger cannot walk the menu.
         if (now - contactStart < 500 || now - lastRepeat < 150) return;
@@ -830,6 +856,7 @@ void handleTouch() {
     }
 
     wasTouched   = true;
+    holdFired    = false;
     contactStart = now;
     lastRepeat   = now;
     if (touchDiagEnabled) {
@@ -1278,12 +1305,6 @@ int8_t pollEncoderRotation() {
     return result;
 }
 
-void encoderButtonIsr() {
-    encoderButtonRawState = digitalRead(ENC_SW);
-    encoderButtonEdgeMillis = millis();
-    encoderButtonEdgePending = true;
-}
-
 void readEncoder() {
     static unsigned long lastStepTime     = 0;
     static int           pendingDetents   = 0;
@@ -1328,47 +1349,45 @@ void readEncoder() {
         }
     }
 
-    static bool          stableBtn    = HIGH;
-    static unsigned long lastBtnTime  = 0;
-    static unsigned long pressStart   = 0;
-    static bool          longFired    = false;
+    // Push-button: sampled level, not edges. The interrupt version kept only the LAST
+    // edge seen before the main loop read it, so a bouncing switch usually left a level
+    // matching the current stable one — that edge was then discarded and the whole press
+    // vanished (presses were lost, not merely delayed). Sampling the level every
+    // millisecond and requiring it to hold for ENCODER_BUTTON_DEBOUNCE cannot lose a
+    // press: the finger holds the pin down far longer than the settle time.
+    static bool          stableBtn   = HIGH;
+    static bool          lastRawBtn  = HIGH;
+    static unsigned long lastRawEdge = 0;
+    static unsigned long pressStart  = 0;
+    static bool          longFired   = false;
 
-    bool edgePending = false;
-    bool rawBtn = HIGH;
-    unsigned long edgeTime = 0;
-    noInterrupts();
-    edgePending = encoderButtonEdgePending;
-    if (edgePending) {
-        rawBtn = encoderButtonRawState;
-        edgeTime = encoderButtonEdgeMillis;
-        encoderButtonEdgePending = false;
-    }
-    interrupts();
+    unsigned long now = millis();
 
-    if (edgePending && rawBtn != stableBtn && edgeTime - lastBtnTime >= ENCODER_BUTTON_DEBOUNCE) {
+    bool rawBtn = digitalRead(ENC_SW);
+    if (rawBtn != lastRawBtn) { lastRawBtn = rawBtn; lastRawEdge = now; }
+
+    if (rawBtn != stableBtn && now - lastRawEdge >= ENCODER_BUTTON_DEBOUNCE) {
         bool oldStableBtn = stableBtn;
-        stableBtn   = rawBtn;
-        lastBtnTime = edgeTime;
+        stableBtn = rawBtn;
+        if (encoderDiagEnabled) Serial.printf("ENC btn: %s\n", stableBtn == LOW ? "down" : "up");
 
         if (oldStableBtn == HIGH && stableBtn == LOW) {
-            // ---- pressed (falling edge) ----
-            pressStart = edgeTime;
+            // ---- pressed ----
+            pressStart = now;
             longFired  = false;
         } else {
-            // ---- released (rising edge) ----
+            // ---- released ----
             if (!longFired) {
                 if (displayMode == DISP_MENU) {
                     // defer: a long press may follow to toggle the advanced menu
                     pendingShortClick     = true;
-                    shortClickReleaseTime = edgeTime;
+                    shortClickReleaseTime = now;
                 } else {
                     menuButtonPressed = true;
                 }
             }
         }
     }
-
-    unsigned long now = millis();
 
     // Long press while held: on the main menu a short-click-then-long-press toggles the
     // advanced menu; on a sub-screen a long press means "Back to menu".
@@ -1382,7 +1401,14 @@ void readEncoder() {
                 menuDrawState = -1;
                 Serial.printf("Advanced menu %s\n", advancedMenuUnlocked ? "shown" : "hidden");
             }
-            // a plain long press on the menu otherwise does nothing
+            else if (menuIndex == 0 && (currentState != STATE_IDLE || jobPaused)) {
+                // Plain hold on START/PAUSE = full stop. Drop any deferred short click too,
+                // or the click queued before a too-slow combo would fire a start right
+                // after the stop.
+                pendingShortClick = false;
+                requestFullStop();
+            }
+            // a plain long press elsewhere on the menu does nothing
         } else {
             longPressBack = true;
         }
@@ -1399,6 +1425,9 @@ void readEncoder() {
 void updateStateMachine() {
     unsigned long now = millis();
     int parkSteps = degX10ToSteps(PARK_DEG_X10);
+
+    // A pause only exists while a job is live; idling or erroring out ends it.
+    if (currentState == STATE_IDLE || currentState == STATE_ERROR) jobPaused = false;
 
     // Driver fault: park first if actively sweeping (motor energised, position known),
     // otherwise latch ERROR straight away.
@@ -1468,6 +1497,9 @@ void updateStateMachine() {
         case STATE_PARKED:
             // Park is reached at the park setpoint (≤ PARK_DEG_X10, a small angle).
             if (motorPosition == parkSteps) {
+                // Paused: stay parked and energised at park-hold current. needsHoming is
+                // left false, which is what lets a resume skip the homing sweep.
+                if (jobPaused && !faultLatched) break;
                 if (faultLatched) {
                     needsHoming = true;
                     currentState = STATE_ERROR; lastStateChange = now;
@@ -1518,7 +1550,8 @@ void updateStateMachine() {
             } else if (now - lastStateChange >= SPRAY_ACTIVE_WAIT &&
                        motorPosition == sweepBackSteps()) {
                 oscillationDir = 1;
-                oscillationCount = 0;
+                oscillationCount = pausedOscCount;   // 0 unless resuming a paused job
+                pausedOscCount = 0;
                 oscillationStepCount = 0;
                 currentState = STATE_OSCILLATING; lastStateChange = now;
                 Serial.println("→ OSCILLATING");
@@ -1678,35 +1711,37 @@ void handleMenuSelect() {
     }
 
     switch (menuIndex) {
-        case 0:  // START / STOP
-            if (currentState == STATE_IDLE || currentState == STATE_ERROR) {
+        case 0:  // START / PAUSE (hold this row for a full stop - see requestFullStop)
+            if (jobPaused) {
+                // RESUME: the arm never left park and the position is still known, so go
+                // straight back to sweeping. sprayTotalMs was never cleared, so the timer
+                // continues from where the pause froze it.
+                jobPaused = false;
+                if (!SENSOR_INPUTS_ENABLED) sensorBypassCycleArmed = true;
+                Serial.println("Menu: RESUME");
+            } else if (currentState == STATE_IDLE || currentState == STATE_ERROR) {
                 // START: always home first to re-establish position, then park + run.
                 faultLatched = false; collisionLatched = false; stopRequested = false; homingToStop = false;
                 sensorBypassCycleArmed = !SENSOR_INPUTS_ENABLED;
+                pausedOscCount = 0;
                 homingTimeoutLatched = false;
                 homingStartMillis = millis();
                 homingStartPosition = motorPosition;
                 currentState = STATE_HOMING; lastStateChange = millis();
                 Serial.println("Menu: START → HOMING");
-            } else if (currentState == STATE_PARKED && !needsHoming) {
-                // Already parked with known position: start the cleaning cycle.
-                if (!SENSOR_INPUTS_ENABLED) {
-                    sensorBypassCycleArmed = true;
-                    oscillationCount = 0; oscillationDir = -1; oscillationStepCount = 0;
-                    currentState = STATE_SPRAY_ACTIVE; lastStateChange = millis();
-                    Serial.println("Menu: START → SPRAY_ACTIVE (sensor bypass)");
-                } else {
-                    Serial.println("Menu: already parked");
-                }
             } else {
-                // STOP: park the arm, then disable the motor.
-                homingToStop = false;
+                // PAUSE: park the arm and hold it there. Nothing is disabled and nothing is
+                // reset, so this is idempotent - a doubled input can only pause twice, it
+                // can no longer restart the cycle the way the old "start from park" arm did.
+                pausedOscCount = oscillationCount;
+                jobPaused = true;
                 sensorBypassCycleArmed = false;
-                stopRequested = true;
+                stopRequested = false;
+                homingToStop = false;
                 if (currentState != STATE_HOMING) {
                     currentState = STATE_PARKED; lastStateChange = millis();
                 }
-                Serial.println("Menu: STOP → PARK then disable");
+                Serial.println("Menu: PAUSE → park and hold");
             }
             break;
 
@@ -1724,6 +1759,21 @@ void handleMenuSelect() {
             aboutNeedsRedraw = true; displayMode = DISP_ABOUT;
             break;
     }
+}
+
+// Full stop: park the arm, then disable the motor and drop to IDLE. Reached by holding the
+// START/PAUSE row (encoder or touch). Ending at IDLE is what lets the next START clear the
+// spray timer, so this - not PAUSE - is how one job is finished before the next begins.
+void requestFullStop() {
+    jobPaused = false;
+    pausedOscCount = 0;
+    sensorBypassCycleArmed = false;
+    homingToStop = false;
+    stopRequested = true;
+    if (currentState != STATE_HOMING) {
+        currentState = STATE_PARKED; lastStateChange = millis();
+    }
+    Serial.println("Hold START/PAUSE: STOP → park then disable");
 }
 
 // Long press on a sub-screen: save and return to the main menu (replaces the old
@@ -2337,7 +2387,13 @@ void updateSprayTimer() {
     if (st == STATE_HOMING && prevState == STATE_IDLE) sprayTotalMs = 0;
     prevState = st;
 
-    bool running = sprayActive || st == STATE_SPRAY_ACTIVE || st == STATE_OSCILLATING;
+    // Only the two states where the arm is actually sweeping under flow count. An open
+    // spray valve on its own does not: in WAIT the valve is open precisely because there
+    // is no flow yet, and it used to run the clock through the whole wait. Both active
+    // states already require spray + flow in sensor mode, so this reads the same there
+    // and still works in Debug mode, where the sensors are bypassed.
+    // A paused job stops the clock too, even if the valve is still open.
+    bool running = !jobPaused && (st == STATE_SPRAY_ACTIVE || st == STATE_OSCILLATING);
     if (running && !sprayTimerRunning) spraySegStartMs = now;
     if (!running && sprayTimerRunning) sprayTotalMs += now - spraySegStartMs;
     sprayTimerRunning = running;
@@ -2347,11 +2403,22 @@ unsigned long sprayElapsedMs() {
     return sprayTotalMs + (sprayTimerRunning ? millis() - spraySegStartMs : 0);
 }
 
+// Spray is running but the flow sensor says nothing is flowing: the operator has to see
+// this, so the status column blinks the value rather than showing a static red "NO".
+bool flowAlarm() {
+    return SENSOR_INPUTS_ENABLED && sprayActive && !flowDetected;
+}
+
+// ~1.25 Hz blink phase, shared by every alarm that flashes.
+bool alarmPhase() {
+    return (millis() / 400) & 1;
+}
+
 const char* stateLabel(SystemState state) {
     switch (state) {
         case STATE_IDLE:          return "IDLE";
         case STATE_HOMING:        return "HOME";
-        case STATE_PARKED:        return "PARK";
+        case STATE_PARKED:        return jobPaused ? "PAUSE" : "PARK";
         case STATE_WAITING_SPRAY: return "WAIT";
         case STATE_SPRAY_ACTIVE:  return "SPRAY";
         case STATE_OSCILLATING:   return "OSC";
@@ -2368,6 +2435,7 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     static int  drawnPosDeg = -9999;
     static bool drawnSpray = false;
     static bool drawnFlow  = false;
+    static bool drawnFlowBlink = false;
     static int  drawnSweepAng = -1, drawnTime = -1, drawnWafer = -1, drawnType = -1, drawnProfile = -1;
     static bool drawnSensorEnabled = true;
     static bool drawnCollision = false;
@@ -2489,17 +2557,20 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
         drawnSpray = sprayActive;
     }
 
-    if (forceRedraw || flowDetected != drawnFlow || sensorChanged) {
-        tft.fillRect(x + 38, 158, valueW - 38, 8, TFT_BLACK);
+    bool flowBlink = flowAlarm() && alarmPhase();
+    if (forceRedraw || flowDetected != drawnFlow || sensorChanged || flowBlink != drawnFlowBlink) {
+        tft.fillRect(x + 38, 158, valueW - 38, 8, flowBlink ? TFT_RED : TFT_BLACK);
         tft.setTextSize(1);
         if (SENSOR_INPUTS_ENABLED) {
-            tft.setTextColor(flowDetected ? TFT_GREEN : TFT_RED, TFT_BLACK);
+            tft.setTextColor(flowBlink ? TFT_BLACK : (flowDetected ? TFT_GREEN : TFT_RED),
+                             flowBlink ? TFT_RED : TFT_BLACK);
             tft.setCursor(x + 38, 158); tft.print(flowDetected ? "YES" : "NO");
         } else {
             tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
             tft.setCursor(x + 38, 158); tft.print("DIS");
         }
         drawnFlow = flowDetected;
+        drawnFlowBlink = flowBlink;
     }
 }
 
@@ -2612,6 +2683,7 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
     static int  drawnPosDeg = -9999;
     static bool drawnSpray = false;
     static bool drawnFlow  = false;
+    static bool drawnFlowBlink = false;
     static int  drawnSweepAng = -1, drawnTime = -1, drawnWafer = -1, drawnType = -1, drawnProfile = -1;
     static bool drawnSensorEnabled = true;
     static bool drawnCollision = false;
@@ -2775,13 +2847,17 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
         drawnSpray = sprayActive;
     }
 
-    if (forceRedraw || flowDetected != drawnFlow || sensorChanged) {
-        tft.fillRect(x, 292, valueW, 18, BG);
-        tft.setTextColor(UI_MUTED, BG);
+    // While spray runs without flow the whole row flashes on a red field, so it reads as
+    // an alarm from across the bench rather than as one small red word.
+    bool flowBlink = flowAlarm() && alarmPhase();
+    if (forceRedraw || flowDetected != drawnFlow || sensorChanged || flowBlink != drawnFlowBlink) {
+        uint16_t fbg = flowBlink ? UI_ALARM : BG;
+        tft.fillRect(x, 292, valueW, 18, fbg);
+        tft.setTextColor(flowBlink ? BG : UI_MUTED, fbg);
         tft.drawString("FLOW", x, 292);
         tft.setTextDatum(TR_DATUM);
         if (SENSOR_INPUTS_ENABLED) {
-            tft.setTextColor(flowDetected ? UI_OK : UI_ALARM, BG);
+            tft.setTextColor(flowBlink ? BG : (flowDetected ? UI_OK : UI_ALARM), fbg);
             tft.drawString(flowDetected ? "YES" : "NO", xr, 292);
         } else {
             tft.setTextColor(UI_ACCENT, BG);
@@ -2789,6 +2865,7 @@ void drawStatusColumn(SystemState state, int posDeg, bool forceRedraw) {
         }
         tft.setTextDatum(TL_DATUM);
         drawnFlow = flowDetected;
+        drawnFlowBlink = flowBlink;
     }
 
     // Other screens (menu/settings/setup/about) assume the default GLCD font — restore it.
@@ -2846,6 +2923,24 @@ void drawMenuRow(int i, int y, bool selected) {
     tft.setTextFont(1);   // back to the bitmap fonts for everything drawn after this
 }
 
+// The advanced rows (Setup, About) are unlocked by tapping the title bar, and while they
+// are shown they take the space the arm animation lives in. Nothing on screen used to say
+// the menu was still unlocked, so after a trip into Setup the animation looked broken and
+// only a reboot brought it back. This badge names the state and shows where to tap.
+void drawAdvBadge() {
+    const int bw = 76, bh = 24, bx = CONTENT_W - bw - 6, by = 3;
+    uint16_t fill = advancedMenuUnlocked ? UI_ACCENT : UI_BG;
+    tft.fillRoundRect(bx, by, bw, bh, 6, fill);
+    tft.drawRoundRect(bx, by, bw, bh, 6, advancedMenuUnlocked ? UI_ACCENT : UI_MUTED);
+    useFont(&FreeSansBold9pt7b);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(advancedMenuUnlocked ? UI_BG : UI_MUTED, fill);
+    // Labelled with what a tap does next, not with the current state.
+    tft.drawString(advancedMenuUnlocked ? "LOCK" : "ADV", bx + bw / 2, by + bh / 2);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(1);
+}
+
 void drawMenu() {
     // Layout (landscape 480×320):
     //   Wave + title  y=4   (textSize 3)
@@ -2879,6 +2974,7 @@ void drawMenu() {
         tft.setTextColor(UI_ACCENT, UI_BG);
         tft.drawString("MEGASONIC CLEANER", 36, 2);
         tft.setTextFont(1);
+        drawAdvBadge();
 
         for (int i = 0; i < visibleCount; i++)
             drawMenuRow(i, MENU_ROW_Y0 + i * MENU_ROW_DY, i == mi);
@@ -3682,8 +3778,9 @@ void updateDisplay() {
     bool menuChanged  = (mi    != lastMenu);
     bool forceStatusRedraw = (menuChanged && menuDrawState == -1);
 
-    // Keep ticking while the generator is on so the lightning sign can blink.
-    bool pulseTick = !advancedMenuUnlocked && ultrasonicActive;
+    // Keep ticking while the generator is on so the lightning sign can blink, and while
+    // the flow alarm is up so the status column can flash it.
+    bool pulseTick = (!advancedMenuUnlocked && ultrasonicActive) || flowAlarm();
     if (!menuChanged && !statusChanged && !forceStatusRedraw && !pulseTick) return;
 
     mutex_enter_blocking(&spi_mutex);
@@ -3700,7 +3797,7 @@ void updateDisplay() {
         drawArmAnim(animFull, posDegX10);
     }
 
-    if (statusChanged || forceStatusRedraw) {
+    if (statusChanged || forceStatusRedraw || flowAlarm()) {
         drawStatusColumn(state, posDeg, forceStatusRedraw);
 
         // Only echo to serial on a real state/sensor change, not on every
