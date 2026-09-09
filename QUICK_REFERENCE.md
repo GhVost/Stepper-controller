@@ -20,8 +20,9 @@
 ```bash
 pio pkg install                     # Install dependencies (first time)
 pio init --ide vscode               # Generate IntelliSense config
-pio run                             # Build only
+pio run                             # Build the default env (pico-st7796)
 pio run --target upload             # Build and flash (BOOTSEL mode)
+pio run -e pico -t upload           # ST7789 fallback panel instead
 pio device monitor --baud 115200    # Serial monitor
 pio run --target clean              # Remove build artefacts
 ```
@@ -62,6 +63,10 @@ Two separate SPI buses: **TMC2130 on SPI1**, **LCD on SPI0**.
 
 - **Rotate** = navigate / change value, **Click** = select / edit / confirm.
 - **Long press** = back to the menu from Sweep Settings / Setup (no "< Back" row).
+- **Touch** (ST7796): tap a row to select, tap it again to edit; while editing the row
+  splits into thirds — left = −, right = +, middle = confirm — and holding a ± zone
+  repeats. Tap the ▲/▼ markers to page Setup, the header to go back, and the **title** to
+  toggle the advanced menu (the encoder's click-then-hold combo has no touch equivalent).
 - **Basic menu**: START/STOP, Settings (+ arm-position animation).
 - **Advanced menu** (Setup, About): short-click then long-press to toggle.
 - **Sweep Settings**: Sweep time, Wafer diam., Sweep type, Speed prof. — each row shows
@@ -185,6 +190,7 @@ Type a key in the serial monitor (115200):
 | `f` / `b` | 400 steps forward / back |
 | `r` | One full shaft revolution |
 | `k` | Toggle encoder diagnostics (per-transition + per-step serial log) |
+| `t` | Toggle touch diagnostics — logs raw + mapped coords per tap, scans the whole I2C bus, and (when the bus is empty) re-reads SDA/SCL with the pull-ups off to tell "not wired" from "controller silent" |
 | `[` / `]` | Decrease / increase the encoder poll interval (1-20 ms) |
 | `a` / `A` | Decrease / increase endpoint accel (1-2000 deg/s², persisted) |
 | `j` / `J` | Decrease / increase endpoint jerk (20-20000 deg/s³, persisted) |

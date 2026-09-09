@@ -13,8 +13,10 @@ selected wafer diameter and the arm length.
 - **RP2040 microcontroller** – dual-core ARM, 133 MHz, 264 KB RAM
 - **Dual-core architecture** – Core 0 runs the state machine and I/O; Core 1 renders the LCD at ~20 fps
 - **TMC2130 stepper driver** – SPI-controlled, selectable StealthChop/SpreadCycle chopper, current limiting, adjustable run/park hold-current %, live fault detection (overtemperature, short-to-ground, charge-pump UV) and **StallGuard collision detection** (blocked arm → park + red COLLISION)
-- **Hardware SPI LCD** – GMT147SPI 1.47" 172×320 ST7789 at 20 MHz on its own SPI bus
+- **Two display variants** – GMT147SPI 1.47" 172×320 ST7789 (env `pico`), or a Hosyond 4.0" 480×320 ST7796S with FT6336 capacitive touch (env `pico-st7796`, the default build)
 - **Rotary encoder UI** – KY-040 quadrature + push-button; full menu, in-place value editing, and a basic/advanced menu unlock
+- **Touch UI** (ST7796 variant) – every encoder action has a touch equivalent: tap to select, ± zones with hold-to-repeat for value editing, tappable scroll arrows, and a title tap to unlock the advanced menu
+- **Cleanroom-legible theme** (ST7796 variant) – bold proportional type on a light ground, with a palette chosen for **yellow non-actinic safelight**: no meaning is carried by blue or cyan, which collapse toward black under that lighting
 - **Angle-based motion** – park and centre angles in degrees; sweep angle computed from wafer Ø and arm length
 - **Configurable sweep** – sweep time, wafer diameter, path (back-centre / back-front), and velocity profile (linear / harmonic / inverse-distance)
 - **Persistent settings** – all parameters stored in flash EEPROM emulation and reloaded at boot; loading is **forward/backward compatible**, so a firmware update keeps your existing settings and only defaults newly-added ones
@@ -31,9 +33,15 @@ See [HARDWARE.md](HARDWARE.md) for:
 
 ### 2. Build & Upload
 ```bash
-pio run                    # Build
+pio run                    # Build the default env (pico-st7796)
 pio run --target upload    # Flash to Pico (BOOTSEL/bootloader mode)
+
+pio run -e pico -t upload  # ST7789 fallback panel instead
 ```
+
+The build **must** match the fitted panel. `platformio.ini` sets
+`default_envs = pico-st7796`; flashing the ST7789 build to the ST7796 panel leaves it
+lit but blank, since the init sequences are not interchangeable.
 
 ### 3. Monitor Serial Output
 ```bash
@@ -49,9 +57,15 @@ SPI0 LCD initialized: SCK=18 MOSI=19
 SPI1 TMC initialized: SCK=10 MOSI=11 MISO=12
 TMC2130 configured: 600 mA, run hold 25%, park hold 10%, 256x microsteps, interpolation, StealthChop
 Encoder initialized: CLK=26 DT=27 SW=22 (polled rotation, interrupt button)
-Display initialized (GMT147SPI 1.47" 172x320)
+Display initialized (ST7796S 4.0" 480x320)
+Touch FT6336 @0x38 found (SDA=16 SCL=17 INT=0)
 Initialization complete!
 ```
+
+`setup()` waits up to 5 s for the host to open the port before printing, which is long
+enough to attach a monitor after a flash — USB CDC re-enumerates on reset, and the
+monitor reattaches well after a shorter window would have closed. It is a maximum, not a
+delay: boot continues immediately once the port opens, or when nothing is listening.
 
 State/position changes are echoed to serial by Core 1 (only on change):
 ```
@@ -86,8 +100,27 @@ the first, and vice versa.
   the **Debug** toggle (`ON` = spray/flow ignored, `OFF` = spray/flow safety inputs active),
   and **Stall** / **StallSG** (StallGuard collision detection on/off + sensitivity).
 - **About**: firmware version and live TMC2130 driver status.
-- **Status bar** (right side of every screen): live state, arm angle, the sweep summary
-  (sweep angle, time, wafer, type, profile), and spray/flow.
+- **Status bar** (right side of every screen), in four evenly-spaced groups: mode
+  (`Status Work` / `Status Debug`) and the spray **TIMER**; live `STATE` and `ANGLE`;
+  the `SWEEP` summary (sweep angle, time, wafer, type, profile); and the `SPRAY` / `FLOW`
+  sensor readouts.
+- **Spray timer**: total time the spray has been on for the current job. It accumulates
+  in segments, so an error part-way through a run and the operator's restart do **not**
+  discard the time already sprayed — only a run started from `IDLE` counts as a new job
+  and zeroes it. It runs in Debug mode too (driven by the cycle state, since the spray
+  sensor is bypassed there), and holds the last run's duration in grey once spraying stops.
+
+### Touch controls (ST7796 variant)
+
+| Gesture | Action |
+|---------|--------|
+| Tap a menu row | Select / activate it |
+| Tap the title | Toggle the advanced menu (`Setup`, `About`) — the encoder's click-then-hold combo has no touch equivalent |
+| Tap a settings row | Select it; tap the selected row again to enter edit mode |
+| Tap left / right third of a row being edited | Step the value down / up; **hold to repeat** |
+| Tap the middle third of a row being edited | Confirm and leave edit mode |
+| Tap the ▲ / ▼ markers (Setup) | Page the selection — the only way touch can reach the rows below the visible window |
+| Tap the header | Back to the menu |
 
 Settings are stored in RP2040 flash EEPROM emulation and reloaded at boot. Empty or
 corrupt flash is initialized with defaults; compatible older records are accepted and
@@ -124,15 +157,23 @@ The TMC2130 and the LCD are on **separate** SPI buses (no shared bus).
 | DIR | 15   | Direction |
 | EN  | 1    | Enable (LOW = active) |
 
-### LCD Display — GMT147SPI 1.47" 172×320 ST7789 on SPI0
+### LCD Display on SPI0 — same pins for both variants
+| ST7789 label | ST7796 label | GPIO | Function |
+|--------------|--------------|------|----------|
+| CS  | LCD_CS  | 9  | Chip select |
+| DC  | LCD_RS  | 5  | Data/Command |
+| RES | LCD_RST | 6  | Reset — **also jumper to `CTP_RST`** on the ST7796 module |
+| SCL | SCK     | 18 | SPI0 clock |
+| SDA | SDI     | 19 | SPI0 data (MOSI) |
+| BL  | LED     | 20 | Backlight (HIGH = on) |
+
+### Capacitive Touch — FT6336 on I2C0 (ST7796 variant only)
 | Board Label | GPIO | Function |
 |-------------|------|----------|
-| CS  | 9  | Chip select |
-| DC  | 5  | Data/Command |
-| RES | 6  | Reset |
-| SCL | 18 | SPI0 clock |
-| SDA | 19 | SPI0 data (MOSI) |
-| BL  | 20 | Backlight (HIGH = on) |
+| CTP_SDA | 16 | I2C0 data |
+| CTP_SCL | 17 | I2C0 clock |
+| CTP_INT | 0  | Touch interrupt — optional; the driver polls `TD_STATUS` instead |
+| CTP_RST | 6  | Shares `LCD_RST`; without it the controller never leaves reset |
 
 ### Rotary Encoder (KY-040)
 | Board Label | GPIO | Function |

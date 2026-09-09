@@ -119,6 +119,24 @@ State:PARKED | Pos:78 steps (7.0 deg) | Spray:... | Flow:...
 All-ones (`0xFFFFFFFF`) or all-zero reads indicate a wiring/power problem — check SPI1
 on GPIO 10/11/12/13, VCC_IO, and `R_SENSE`.
 
+### Phase 4b: Capacitive Touch (ST7796 variant only)
+
+Touch is on I2C0 and fails silently — the display works regardless — so verify it
+explicitly. Startup prints `Touch FT6336 @0x38 found (SDA=16 SCL=17 INT=0)`.
+
+1. Send `t` to enable touch diagnostics. It also scans the bus and prints what it finds.
+2. Tap the screen — each contact logs `TOUCH: raw=(…) screen=(…) mode=…`.
+3. Tap **top-left** and **bottom-right**: they should read roughly `screen=(0,0)` and
+   `screen=(479,319)`. A few pixels off is finger precision, not axis error.
+
+| Symptom | Meaning | Fix |
+|---------|---------|-----|
+| `no devices`, SDA/SCL both HIGH with pull-ups off | Wires reach a powered module, controller silent | `CTP_RST` jumper missing, or the touch FPC is not seated |
+| `no devices`, either line LOW | Wires are not reaching the module | Check GPIO 16 → `CTP_SDA`, GPIO 17 → `CTP_SCL` |
+| `0x5D` or `0x14` found | It is a GT911, not an FT6336 | Different protocol — the driver needs rewriting |
+| Chip answers, taps log nothing | — | Should not happen: polling does not depend on `CTP_INT` |
+| Taps land mirrored/rotated | Panel batch differs | Flip the axis mapping in `readTouchPoint()` |
+
 ### Phase 5: State-Machine Walkthrough
 
 **DEBUG mode (no sensors)** — drive from the menu:

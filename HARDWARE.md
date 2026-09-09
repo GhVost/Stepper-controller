@@ -128,14 +128,38 @@ GPIO 19 ────────── SDI      (SPI0 MOSI)
 GPIO 20 ────────── LED      (Backlight — HIGH = on)
 GPIO 16 ────────── CTP_SDA  (I2C0 SDA, touch)
 GPIO 17 ────────── CTP_SCL  (I2C0 SCL, touch)
-GPIO 0  ────────── CTP_INT  (touch interrupt, LOW = finger down)
+GPIO 0  ────────── CTP_INT  (touch interrupt — optional, see below)
 VSYS/5V ────────── VCC      (5 V recommended; 3.3 V works, dimmer backlight)
 GND     ────────── GND
                    SDO, SD_CS — not connected (no MISO / SD card use)
 ```
 
+> **The `CTP_RST` jumper is not optional.** It is the one connection whose absence has
+> no visible symptom: the display comes up perfectly, because the LCD half of the module
+> is wired independently. But the FT6336 sits in reset forever and never answers on I2C,
+> so touch is simply dead. If `t` reports `no devices`, check this jumper first.
+
+> `CTP_INT` is optional. `readTouchPoint()` polls the `TD_STATUS` register directly
+> rather than gating on the interrupt line, because depending on the `G_MODE` register
+> the FT6336 may only emit a pulse far shorter than the 30 ms touch poll — which looks
+> exactly like a dead panel. `initTouch()` still sets `G_MODE = 0` (level, not pulse) so
+> the line is usable if you want to re-enable the gate as an optimisation.
+
 > If taps land mirrored/rotated on the real panel, adjust the axis mapping in
 > `readTouchPoint()` in `main.cpp` — panel batches differ in touch orientation.
+
+**Bring-up order.** Backlight on but a white field means the controller never got a valid
+init sequence: either the wrong firmware is running (see the env note below) or one of
+`LCD_CS` / `LCD_RS` / `LCD_RST` / `SCK` / `SDI` is wrong. Backlight lit proves only VCC,
+GND and LED. The `t` serial command scans the whole I2C bus and, when it finds nothing,
+re-reads SDA/SCL with the internal pull-ups off — both lines HIGH means the wires reach a
+powered module and the controller itself is silent (reset jumper, or an unseated touch
+FPC); either line LOW means the wires are not reaching the module at all.
+
+> **Build the matching environment.** `platformio.ini` sets
+> `default_envs = pico-st7796`. Without that, a bare `pio run -t upload` or the IDE's
+> upload button builds `[env:pico]` — the ST7789 firmware — which drives an ST7789 init
+> sequence at the ST7796 panel and leaves it a blank white field.
 
 ---
 
